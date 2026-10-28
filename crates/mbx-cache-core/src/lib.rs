@@ -42,6 +42,7 @@ mod client;
 mod imds;
 mod local;
 mod path_mapping;
+mod prediction_inputs;
 mod remote_http;
 mod remote_s3;
 mod sigv4;
@@ -53,8 +54,8 @@ pub use agent::{
     AgentRequest, AgentResponse, AgentStats, CacheAgent, CompilerStats, FileDigestCache,
     FileDigestResolution, FileDigestScope, FileIdentity, FileObjectIdentity, FileSnapshot,
     NoFileDigestCache, PinnedFile, PinnedState, RecordedFileDigest, RestoreStats,
-    ValidatedFileDigest, WrapperSpan, WrapperTiming, digest_file, digest_file_validated,
-    is_task_identity, merge_task_action_predictions, task_manifest_actions,
+    TaskManifestOverflow, ValidatedFileDigest, WrapperSpan, WrapperTiming, digest_file,
+    digest_file_validated, is_task_identity, merge_task_action_predictions, task_manifest_actions,
 };
 pub use client::BlockingAgentClient;
 pub use imds::{InstanceRoleCredentials, TemporaryCredentials};
@@ -75,6 +76,9 @@ pub use mbx_cache_protocol::{
 pub use path_mapping::{
     PathAliases, PathMapping, PathNormalizationError, normalize_mapped_path,
     normalize_resolved_mapped_path, normalize_resolved_mapped_path_with, resolve_path_mappings,
+};
+pub use prediction_inputs::{
+    CompactInputsError, compact_prediction_inputs, expand_prediction_inputs,
 };
 use remote_http::HttpRemoteCache;
 #[cfg(feature = "fuzzing")]

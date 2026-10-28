@@ -37,7 +37,7 @@ pub use file_digest::{
     digest_file_validated,
 };
 pub use manifest::{
-    is_task_identity, task_manifest_actions,
+    TaskManifestOverflow, is_task_identity, task_manifest_actions,
     update_task_predictions_in_order as merge_task_action_predictions,
 };
 use manifest::{
@@ -2925,7 +2925,10 @@ impl CacheAgent {
             .contains_key(&prediction.invocation)
             && state.pending_predictions.len() >= MAX_TASK_ACTION_PREDICTIONS
         {
-            bail!("this task run contains too many action predictions");
+            bail!(TaskManifestOverflow::Count {
+                protected: state.pending_predictions.len() + 1,
+                limit: MAX_TASK_ACTION_PREDICTIONS,
+            });
         }
         let current = state.predictions.get(&prediction.invocation);
         if current != Some(&prediction) {

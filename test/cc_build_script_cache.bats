@@ -450,3 +450,100 @@ RS
   assert_success
   assert_output --partial hello.d
 }
+
+
+@test "hundreds of C++ compiles leave predictions that a new checkout loads" {
+  if ! command -v c++ >/dev/null 2>&1; then
+    skip "a C++ compiler is required"
+  fi
+  # A large -sys crate, BoringSSL under btls-sys say, compiles hundreds of C++
+  # translation units that each name the same long list of headers. Spelled
+  # out in full, the predictions of such a run outgrew the task manifest: the
+  # run recorded none of them, and the next checkout had nothing to look up.
+  # The headers sit as deep as an SDK's, so every predicted input is about as
+  # long as a real system header path on every platform.
+  local units=200 headers=800
+  local source="$BATS_TEST_TMPDIR/many-cpp"
+  mkdir -p "$source/src"
+  cat >"$source/Cargo.toml" <<'TOML'
+[package]
+name = "many-cpp"
+version = "0.1.0"
+edition = "2021"
+TOML
+  echo 'pub fn value() -> u32 { 7 }' >"$source/src/lib.rs"
+  cat >"$source/build.rs" <<RUST
+use std::{env, fs, path::PathBuf, process::Command, thread};
+
+const UNITS: usize = $units;
+const HEADERS: usize = $headers;
+
+fn main() {
+    let out = PathBuf::from(env::var_os("OUT_DIR").unwrap());
+    let include = out.join("include/platform/developer/sdks/fixture.sdk/usr/include/c++/v1");
+    fs::create_dir_all(&include).unwrap();
+    let mut all = String::new();
+    for index in 0..HEADERS {
+        let name = format!("header_{index:04}.h");
+        fs::write(include.join(&name), format!("inline int header_{index:04}() {{ return {index}; }}\n")).unwrap();
+        all.push_str(&format!("#include \"{name}\"\n"));
+    }
+    fs::write(include.join("all.h"), all).unwrap();
+    // Every source exists before the first compile starts, and objects go to
+    // a directory of their own: mbx publishes no result whose inputs or
+    // search path changed while it compiled.
+    let sources = out.join("src");
+    let objects = out.join("obj");
+    fs::create_dir_all(&sources).unwrap();
+    fs::create_dir_all(&objects).unwrap();
+    let units: Vec<usize> = (0..UNITS).collect();
+    for unit in &units {
+        fs::write(sources.join(format!("unit{unit:03}.cc")), format!("#include \"all.h\"\nint unit{unit:03}() {{ return header_0000() + {unit}; }}\n")).unwrap();
+    }
+    let compiler = env::var("HOST_CXX").unwrap_or_else(|_| "c++".into());
+    let workers = thread::available_parallelism().map_or(4, usize::from);
+    thread::scope(|scope| {
+        for chunk in units.chunks(UNITS.div_ceil(workers)) {
+            let (compiler, include, sources, objects) = (&compiler, &include, &sources, &objects);
+            scope.spawn(move || {
+                for unit in chunk {
+                    let source = sources.join(format!("unit{unit:03}.cc"));
+                    let status = Command::new(compiler)
+                        .arg("-I")
+                        .arg(include)
+                        .arg("-c")
+                        .arg("-o")
+                        .arg(objects.join(format!("unit{unit:03}.o")))
+                        .arg(&source)
+                        .status()
+                        .expect("the C++ compiler should run");
+                    assert!(status.success());
+                }
+            });
+        }
+    });
+}
+RUST
+  cp -R "$source" "$BATS_TEST_TMPDIR/first"
+  run cargo generate-lockfile --offline --manifest-path "$BATS_TEST_TMPDIR/first/Cargo.toml"
+  assert_success
+  cp -R "$source" "$BATS_TEST_TMPDIR/second"
+  cp "$BATS_TEST_TMPDIR/first/Cargo.lock" "$BATS_TEST_TMPDIR/second/"
+
+  run env MBX_STATS_REPORT="$BATS_TEST_TMPDIR/first.json" \
+    "$MBX_BIN" build --offline --manifest-path "$BATS_TEST_TMPDIR/first/Cargo.toml"
+  assert_success
+  refute_output --partial "not fully recorded"
+
+  # Another checkout of the same lockfile at another path, against the same
+  # store: it starts from the first build's task manifest.
+  run env MBX_STATS_REPORT="$BATS_TEST_TMPDIR/second.json" \
+    "$MBX_BIN" build --offline --manifest-path "$BATS_TEST_TMPDIR/second/Cargo.toml"
+  assert_success
+  local report
+  report="$(cat "$BATS_TEST_TMPDIR/second.json")"
+  [[ "$report" =~ \"predictions_loaded\"[[:space:]]*:[[:space:]]*([0-9]+) ]]
+  local loaded="${BASH_REMATCH[1]}"
+  echo "predictions loaded by the second checkout: $loaded"
+  ((loaded >= units))
+}

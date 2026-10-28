@@ -6209,7 +6209,35 @@ fn task_predictions_protected_beyond_the_byte_budget_are_refused() {
         .map(|prediction| prediction.invocation.clone())
         .collect();
 
-    assert!(merge_task_action_predictions(predictions, Vec::new(), &protected).is_err());
+    let error = merge_task_action_predictions(predictions, Vec::new(), &protected).unwrap_err();
+    assert!(
+        matches!(
+            error.downcast_ref::<TaskManifestOverflow>(),
+            Some(TaskManifestOverflow::Bytes {
+                protected: 5000,
+                bytes,
+                limit: MAX_TASK_MANIFEST_BYTES,
+            }) if *bytes > MAX_TASK_MANIFEST_BYTES
+        ),
+        "{error}"
+    );
+}
+
+#[test]
+fn task_predictions_protected_beyond_the_entry_limit_are_refused() {
+    let protected: BTreeSet<_> = (0..=MAX_TASK_ACTION_PREDICTIONS)
+        .map(|index| CacheDigest::blake3(&index.to_le_bytes()))
+        .collect();
+
+    let error = merge_task_action_predictions(Vec::new(), Vec::new(), &protected).unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<TaskManifestOverflow>(),
+        Some(&TaskManifestOverflow::Count {
+            protected: MAX_TASK_ACTION_PREDICTIONS + 1,
+            limit: MAX_TASK_ACTION_PREDICTIONS,
+        }),
+        "{error}"
+    );
 }
 
 #[test]

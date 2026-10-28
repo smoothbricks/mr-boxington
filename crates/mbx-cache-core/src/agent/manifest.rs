@@ -2,6 +2,7 @@ use super::{MAX_TASK_ACTION_PREDICTIONS, MAX_TASK_MANIFEST_BYTES, TASK_ACTION_MA
 use crate::{ActionPrediction, CacheDigest, TaskActionManifest, canonical_json};
 use eyre::{Context, Result, bail};
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -70,6 +71,50 @@ pub(super) fn validate_task_manifest(manifest: &TaskActionManifest, task: &str) 
     }
 }
 
+/// A task run whose protected predictions do not fit one task manifest.
+///
+/// Every prediction a run records is protected from pruning, so a run that
+/// records more than a manifest holds publishes none of them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaskManifestOverflow {
+    /// More predictions are protected than a manifest may list.
+    Count {
+        /// Predictions that must be kept.
+        protected: usize,
+        /// Most predictions a manifest lists.
+        limit: usize,
+    },
+    /// The protected predictions serialize past the manifest's byte budget.
+    Bytes {
+        /// Predictions that must be kept.
+        protected: usize,
+        /// Serialized size of the manifest that keeps them.
+        bytes: usize,
+        /// The manifest's byte budget.
+        limit: usize,
+    },
+}
+
+impl fmt::Display for TaskManifestOverflow {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Count { protected, limit } => write!(
+                formatter,
+                "this task run contains too many action predictions: {protected} must be kept, and a task manifest lists at most {limit}"
+            ),
+            Self::Bytes {
+                protected,
+                bytes,
+                limit,
+            } => write!(
+                formatter,
+                "this task run contains too many action predictions: the {protected} it must keep serialize to {bytes} bytes, over the {limit}-byte task manifest budget"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for TaskManifestOverflow {}
 /// Refresh preferred values at the back of the durable LRU, then retire the
 /// oldest unprotected history needed to keep the manifest bounded.
 pub(super) fn update_task_predictions(
@@ -87,14 +132,17 @@ pub(super) fn update_task_predictions(
 /// update's position in the supplied order. If `updates` repeats an invocation,
 /// its last value and position win. Invocations in `protected` are not retired;
 /// protecting more entries than the manifest limit, or than fit in
-/// [`MAX_TASK_MANIFEST_BYTES`], returns an error.
+/// [`MAX_TASK_MANIFEST_BYTES`], returns [`TaskManifestOverflow`].
 pub fn update_task_predictions_in_order(
     predictions: Vec<ActionPrediction>,
     mut updates: Vec<ActionPrediction>,
     protected: &BTreeSet<CacheDigest>,
 ) -> Result<Vec<ActionPrediction>> {
     if protected.len() > MAX_TASK_ACTION_PREDICTIONS {
-        bail!("this task run contains too many action predictions");
+        bail!(TaskManifestOverflow::Count {
+            protected: protected.len(),
+            limit: MAX_TASK_ACTION_PREDICTIONS,
+        });
     }
     let mut update_invocations = BTreeSet::new();
     updates = updates
@@ -138,7 +186,11 @@ pub fn update_task_predictions_in_order(
             }
         }
         if total > MAX_TASK_MANIFEST_BYTES {
-            bail!("this task run contains too many action predictions");
+            bail!(TaskManifestOverflow::Bytes {
+                protected: retained.len(),
+                bytes: total,
+                limit: MAX_TASK_MANIFEST_BYTES,
+            });
         }
         kept = retained;
     }
