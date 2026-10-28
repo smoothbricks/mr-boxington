@@ -909,7 +909,7 @@ fn predictions_round_trip_through_normalized_names() {
         },
     ];
     let prediction = invocation.prediction(&context, 42).expect("prediction");
-    assert_eq!(prediction.version, 1);
+    assert_eq!(prediction.version, COMPACT_PREDICTION_VERSION);
     assert_eq!(prediction.compiler_duration_ns, 42);
     assert_eq!(prediction.source_name, "a.c");
     assert!(
@@ -922,6 +922,58 @@ fn predictions_round_trip_through_normalized_names() {
             .inputs
             .contains(&format!("{INCLUDE_MANIFEST_PREFIX}${{workspace}}/src"))
     );
+}
+
+/// A C++ build names the same few hundred SDK headers in every translation
+/// unit, as BoringSSL under a -sys crate does. Spelled out in full, two hundred
+/// such predictions serialize past the task manifest's byte budget, the run
+/// records none of them, and the next checkout has nothing to look up.
+#[test]
+fn a_cpp_build_records_every_prediction_in_one_task_manifest() {
+    const SDK: &str = "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX26.5.sdk/usr/include/c++/v1";
+    let (workspace, target) = checkout("one");
+    let headers: Vec<_> = (0..800)
+        .map(|index| CcActionInput {
+            path: PathBuf::from(format!("{SDK}/__algorithm/header_{index:04}.h")),
+            digest: digest_of("header"),
+        })
+        .collect();
+    let predictions: Vec<_> = (0..200)
+        .map(|unit| {
+            let source = format!("src/unit{unit:03}.cc");
+            let arguments = argv(&["-std=c++17", "-c", "-o", "unit.o", &source]);
+            let invocation = CcInvocation::parse(&arguments).expect("admitted");
+            let mut context = context(&workspace, &target);
+            context.inputs = headers
+                .iter()
+                .cloned()
+                .chain([CcActionInput {
+                    path: workspace.join(&source),
+                    digest: digest_of(&source),
+                }])
+                .collect();
+            let prediction = invocation.prediction(&context, 42).expect("prediction");
+            let payload = serde_json::to_string(&prediction).expect("payload");
+            assert_eq!(
+                serde_json::from_str::<CcInputPrediction>(&payload).expect("payload decodes"),
+                prediction
+            );
+            mbx_cache_core::ActionPrediction {
+                invocation: digest_of(&source),
+                action: digest_of(&payload),
+                adapter: "cc-path-binding-v1".into(),
+                payload,
+            }
+        })
+        .collect();
+    let protected = predictions
+        .iter()
+        .map(|prediction| prediction.invocation.clone())
+        .collect();
+    let kept =
+        mbx_cache_core::merge_task_action_predictions(Vec::new(), predictions.clone(), &protected)
+            .expect("every prediction of the run fits one task manifest");
+    assert_eq!(kept, predictions);
 }
 
 #[cfg(unix)]
@@ -949,7 +1001,7 @@ fn predicted_system_paths_only_denormalize_under_admitted_roots() {
 fn a_prediction_from_a_future_schema_bypasses() {
     let prediction = CcInputPrediction {
         path_specific: false,
-        version: 2,
+        version: COMPACT_PREDICTION_VERSION + 1,
         inputs: Vec::new(),
         environment: Vec::new(),
         compiler_duration_ns: 0,
@@ -966,6 +1018,36 @@ fn a_prediction_from_a_future_schema_bypasses() {
             .kind(),
         "unsupported-prediction"
     );
+}
+
+/// Stores written before inputs were front-coded hold version-1 predictions.
+/// They still read as written, and a build can still use them.
+#[test]
+fn a_version_one_prediction_reads_and_serializes_as_written() {
+    let payload = r#"{"version":1,"inputs":["/usr/include/stdio.h","/usr/include/stdlib.h"],"environment":[]}"#;
+    let prediction: CcInputPrediction = serde_json::from_str(payload).unwrap();
+    assert_eq!(
+        prediction.inputs,
+        ["/usr/include/stdio.h", "/usr/include/stdlib.h"]
+    );
+    assert_eq!(serde_json::to_string(&prediction).unwrap(), payload);
+    assert_ne!(
+        prediction
+            .discover(
+                Path::new("/work/one"),
+                &[],
+                &mbx_cache_core::NoFileDigestCache
+            )
+            .err()
+            .map(|error| error.kind()),
+        Some("unsupported-prediction")
+    );
+}
+
+#[test]
+fn a_compact_prediction_whose_inputs_are_not_front_coded_is_refused() {
+    let payload = r#"{"version":2,"inputs":["/usr/include/stdio.h"],"environment":[]}"#;
+    assert!(serde_json::from_str::<CcInputPrediction>(payload).is_err());
 }
 
 /// Flags observed on real sys-crate builds, which the first cut of the

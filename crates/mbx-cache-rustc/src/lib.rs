@@ -30,7 +30,8 @@
 
 use mbx_cache_core::{
     CacheDigest, FileDigestCache, PathAliases, PathMapping as SharedPathMapping,
-    PathNormalizationError, canonical_json, normalize_mapped_path as normalize_shared_path,
+    PathNormalizationError, canonical_json, compact_prediction_inputs, expand_prediction_inputs,
+    normalize_mapped_path as normalize_shared_path,
     normalize_resolved_mapped_path_with as normalize_resolved_shared_path_with,
     resolve_path_mappings,
 };
@@ -143,10 +144,6 @@ const SUPPORTED_CODEGEN_OPTIONS: &[&str] = &[
 
 const NATIVE_DIRECTORY_PREDICTION_PREFIX: &str = "@native-directory:";
 const MAX_PREDICTED_INPUTS: usize = 16 * 1024;
-// A compact payload is capped on the wire by the protocol. Bound its expanded
-// form too, so a hostile prefix chain cannot turn a small manifest into an
-// unreasonable allocation while it is being decoded.
-const MAX_DECODED_PREDICTION_BYTES: usize = 16 * 1024 * 1024;
 const MAX_NATIVE_INPUT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 /// Built-in WebAssembly targets whose default linkers and CRT inputs ship in
@@ -1099,59 +1096,6 @@ impl<'de> Deserialize<'de> for RustcInputPrediction {
             crate_name: wire.crate_name,
         })
     }
-}
-
-fn compact_prediction_inputs(inputs: &[String]) -> Vec<String> {
-    let mut previous = "";
-    inputs
-        .iter()
-        .map(|input| {
-            let mut shared = previous
-                .bytes()
-                .zip(input.bytes())
-                .take_while(|(left, right)| left == right)
-                .count();
-            while !input.is_char_boundary(shared) {
-                shared -= 1;
-            }
-            let compact = format!("{shared}:{}", &input[shared..]);
-            previous = input;
-            compact
-        })
-        .collect()
-}
-
-fn expand_prediction_inputs(inputs: &[String]) -> Result<Vec<String>, &'static str> {
-    let mut expanded: Vec<String> = Vec::with_capacity(inputs.len());
-    let mut decoded_bytes = 0_usize;
-    for input in inputs {
-        let (shared_text, suffix) = input
-            .split_once(':')
-            .ok_or("compact rustc prediction input has no prefix length")?;
-        let shared: usize = shared_text
-            .parse()
-            .map_err(|_| "compact rustc prediction prefix length is invalid")?;
-        if shared.to_string() != shared_text
-            || shared > expanded.last().map_or(0, String::len)
-            || expanded
-                .last()
-                .is_some_and(|previous| !previous.is_char_boundary(shared))
-        {
-            return Err("compact rustc prediction prefix is not canonical");
-        }
-        let mut path = expanded
-            .last()
-            .map_or_else(String::new, |previous| previous[..shared].to_string());
-        path.push_str(suffix);
-        decoded_bytes = decoded_bytes
-            .checked_add(path.len())
-            .ok_or("compact rustc prediction is too large")?;
-        if decoded_bytes > MAX_DECODED_PREDICTION_BYTES {
-            return Err("compact rustc prediction is too large");
-        }
-        expanded.push(path);
-    }
-    Ok(expanded)
 }
 
 fn is_zero(value: &u64) -> bool {
