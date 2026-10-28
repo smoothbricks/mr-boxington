@@ -19,9 +19,11 @@
 
 use mbx_cache_core::{
     CacheDigest, FileDigestCache, PathAliases, PathMapping, PathNormalizationError, canonical_json,
-    normalize_resolved_mapped_path_with, resolve_path_mappings,
+    compact_prediction_inputs, expand_prediction_inputs, normalize_resolved_mapped_path_with,
+    resolve_path_mappings,
 };
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
@@ -786,11 +788,15 @@ struct CcPathBinding {
 
 /// Normalized input names from the last successful execution of one modeled
 /// compile.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+///
+/// From [`COMPACT_PREDICTION_VERSION`] on, the serialized form front-codes
+/// `inputs` ([`compact_prediction_inputs`]): a C++ compilation names hundreds
+/// of system headers under one long SDK directory, and spelled out in full a
+/// build of a few hundred of them outgrows the task manifest that carries its
+/// predictions to the next checkout.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CcInputPrediction {
     /// The output retained literal paths and requires a path-specific action key.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub path_specific: bool,
     /// Prediction schema version.
     pub version: u8,
@@ -800,11 +806,72 @@ pub struct CcInputPrediction {
     pub environment: Vec<String>,
     /// Compiler wall time from the successful invocation that produced this
     /// prediction. Zero means no timing hint was recorded.
-    #[serde(default, skip_serializing_if = "is_zero")]
     pub compiler_duration_ns: u64,
     /// Source file name associated with the timing hint.
-    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub source_name: String,
+}
+
+/// The prediction schema version this adapter writes, the first whose inputs
+/// are front-coded. Version 1, inputs spelled out, is still read.
+pub const COMPACT_PREDICTION_VERSION: u8 = 2;
+
+/// [`CcInputPrediction`] as serialized; `inputs` is front-coded at
+/// [`COMPACT_PREDICTION_VERSION`].
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CcInputPredictionWire<'a> {
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    path_specific: bool,
+    version: u8,
+    inputs: Cow<'a, [String]>,
+    environment: Cow<'a, [String]>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    compiler_duration_ns: u64,
+    #[serde(default, skip_serializing_if = "str::is_empty")]
+    source_name: Cow<'a, str>,
+}
+
+impl Serialize for CcInputPrediction {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        CcInputPredictionWire {
+            path_specific: self.path_specific,
+            version: self.version,
+            inputs: if self.version == COMPACT_PREDICTION_VERSION {
+                Cow::Owned(compact_prediction_inputs(&self.inputs))
+            } else {
+                Cow::Borrowed(&self.inputs)
+            },
+            environment: Cow::Borrowed(&self.environment),
+            compiler_duration_ns: self.compiler_duration_ns,
+            source_name: Cow::Borrowed(&self.source_name),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for CcInputPrediction {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = CcInputPredictionWire::deserialize(deserializer)?;
+        let inputs = if wire.version == COMPACT_PREDICTION_VERSION {
+            expand_prediction_inputs(&wire.inputs).map_err(serde::de::Error::custom)?
+        } else {
+            wire.inputs.into_owned()
+        };
+        Ok(Self {
+            path_specific: wire.path_specific,
+            version: wire.version,
+            inputs,
+            environment: wire.environment.into_owned(),
+            compiler_duration_ns: wire.compiler_duration_ns,
+            source_name: wire.source_name.into_owned(),
+        })
+    }
 }
 
 fn is_zero(value: &u64) -> bool {
@@ -1073,7 +1140,7 @@ impl CcInvocation {
         inputs.dedup();
         Ok(CcInputPrediction {
             path_specific: false,
-            version: 1,
+            version: COMPACT_PREDICTION_VERSION,
             inputs,
             environment: context.environment.keys().cloned().collect(),
             compiler_duration_ns,
@@ -1091,7 +1158,7 @@ impl CcInputPrediction {
         path_mappings: &[PathMapping],
         digests: &dyn FileDigestCache,
     ) -> Result<CcDiscoveredInputs, CcBypassReason> {
-        if self.version != 1 {
+        if !matches!(self.version, 1..=COMPACT_PREDICTION_VERSION) {
             return Err(CcBypassReason::UnsupportedPrediction);
         }
         if self.inputs.len() > MAX_PREDICTED_INPUTS || self.environment.len() > 4 * 1024 {
