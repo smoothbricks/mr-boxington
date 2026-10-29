@@ -78,6 +78,15 @@ the first `cargo` on `PATH`. The check does not recognize
 integration a `setup` warning alone does not mean wrapping is inactive;
 [check Cargo's path](/setup#verify-plain-cargo) instead.
 
+Set `MBX_SESSION_ROOT` to an existing writable directory to place mbx's private
+session directories there instead of the system temporary directory. Sessions
+hold their shims, staging files and local cache-agent endpoint until the build
+ends, then remove the directory. On Unix, a sandbox with a long `TMPDIR` should
+supply its existing short runtime directory or alias so the socket path fits
+the platform's limit (103 pathname bytes on macOS). The alias is not
+canonicalized. An invalid requested root fails rather than falling back to a
+different location. Without this variable, temporary-directory selection is
+unchanged.
 On Unix, compiler shims normally reach the cache agent over a Unix-domain
 socket. When a sandbox blocks Unix socket listeners but permits filesystem
 FIFOs, mbx automatically uses FIFO transport and keeps caching enabled. If
