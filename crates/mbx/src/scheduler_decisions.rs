@@ -853,7 +853,10 @@ mod tests {
         for scope in ["global", "domain"] {
             let slack = waiter.slack.iter().find(|s| s.scope == scope).unwrap();
             assert_eq!(slack.dimensions["cpu"], 12);
-            assert_eq!(slack.dimensions["memory_bytes"], 10 * MEMORY_QUANTUM + 2);
+            // The older request starts only once a 54-core lease completes,
+            // which frees 54 permits of memory: the cross-axis bound is exact
+            // where the quantized subset sum gave up its rounding.
+            assert_eq!(slack.dimensions["memory_bytes"], 12 * MEMORY_QUANTUM);
         }
         assert_eq!(
             waiter
