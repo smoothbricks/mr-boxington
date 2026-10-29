@@ -322,8 +322,14 @@ fn copy_build_script_shims(
         let entry = entry?;
         let name = entry.file_name();
         let pinned = shims_destination.join(&name);
-        if pinned.exists() {
+        if pinned.join("mbx").is_file() {
             continue;
+        }
+        if !entry.path().join("mbx").is_file() {
+            return Err(std::io::Error::other(format!(
+                "build-script pin {} has no mbx binary",
+                entry.path().display()
+            )));
         }
         let staging = destination.join(format!(
             ".mbx-build-script-shims-{}{STAGING_SUFFIX}{}",
@@ -356,6 +362,8 @@ fn copy_unit(
     hash: &std::ffi::OsStr,
     donor: &Donor,
 ) -> std::io::Result<()> {
+    #[cfg(unix)]
+    validate_build_script_pins(unit)?;
     if let Some(path) = foreign_path_in_output(unit, donor) {
         return Err(std::io::Error::other(format!(
             "its build-script output names {path}"
@@ -380,6 +388,44 @@ fn copy_unit(
         let _ = std::fs::remove_dir_all(&staging);
     }
     copied
+}
+
+/// An older interrupted seed may already have left a donor's launcher
+/// without its pin. Do not copy that damage into another fresh unit.
+#[cfg(unix)]
+fn validate_build_script_pins(unit: &Path) -> std::io::Result<()> {
+    let out = unit.join("out");
+    let entries = match std::fs::read_dir(&out) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.starts_with("build_script_") && !name.starts_with("build-script-") {
+            continue;
+        }
+        let executable = entry.path();
+        if !crate::session::build_script_real_path(&executable).is_file() {
+            continue;
+        }
+        let launcher = std::fs::read_to_string(&executable)?;
+        let relative = launcher
+            .strip_prefix("#!/bin/sh\nMBX_BUILD_SCRIPT_SHIM_PATH=\"$0\" exec \"$(dirname \"$0\")/")
+            .and_then(|path| path.strip_suffix("\" \"$@\"\n"))
+            .ok_or_else(|| std::io::Error::other("unrecognized build-script launcher"))?;
+        let pinned = out.join(relative);
+        if !pinned.is_file() {
+            return Err(std::io::Error::other(format!(
+                "build-script launcher {} names missing pin {}",
+                executable.display(),
+                pinned.display()
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// A path into the donor's target directory in a build script's recorded
