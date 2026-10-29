@@ -647,8 +647,8 @@ fn test_binaries_weigh_their_threads_and_their_own_history() {
     assert_eq!(pool.plan(&Demand::test("suite", Some(3))), (3, None));
     assert_eq!(
         pool.plan(&Demand::test("suite", Some(64))),
-        (8, None),
-        "threads clamp to the capacity"
+        (4, None),
+        "an unmeasured suite never reserves more than half the CPU budget"
     );
 
     // The compile of `suite` measured light and the run measured heavy; each
@@ -691,8 +691,8 @@ fn test_binaries_are_weighed_by_the_cores_they_were_measured_using() {
     );
     assert_eq!(
         pool.plan(&Demand::test("suite", Some(6))),
-        (6, None),
-        "a stated thread count has its own history"
+        (4, None),
+        "an unmeasured thread setting has a separate half-pool cold bound"
     );
     assert_eq!(
         pool.plan(&Demand::new("suite", false)),
@@ -708,6 +708,68 @@ fn test_binaries_are_weighed_by_the_cores_they_were_measured_using() {
         (8, None),
         "a higher reading raises it, clamped to the capacity"
     );
+}
+
+#[test]
+fn cold_test_binary_resources_are_bounded_and_measurements_replace_both_guesses() {
+    let directory = tempfile::tempdir().unwrap();
+    let share = 6_490_172_799;
+    for memory_share in [0, share] {
+        let pool = pool_at(directory.path(), 18, memory_share);
+        for (threads, cpu) in [
+            (None, 9),
+            (Some(1), 1),
+            (Some(3), 3),
+            (Some(18), 9),
+            (Some(64), 9),
+        ] {
+            let demand = Demand::test("cold-case", threads);
+            assert_eq!(
+                pool.demand_vector(&demand).resources,
+                Resources {
+                    cpu,
+                    memory_bytes: memory_share
+                },
+                "cold binary with {threads:?} threads and memory share {memory_share}"
+            );
+        }
+    }
+    let pool = pool_at(directory.path(), 18, share);
+    let measured = Demand::test("measured-case", Some(18));
+    pool.record_cpu(&measured.name, 14).unwrap();
+    pool.record_peak(&measured.name, 18_448_384, false).unwrap();
+    assert_eq!(
+        pool.demand_vector(&measured).resources,
+        Resources {
+            cpu: 14,
+            memory_bytes: 18_448_384
+        },
+        "measured CPU and memory replace the independent cold guesses"
+    );
+}
+
+#[test]
+fn a_cold_test_binary_starts_beside_a_live_compilation() {
+    let directory = tempfile::tempdir().unwrap();
+    let pool = pool_at(directory.path(), 18, 6_490_172_799);
+    let held = pool.try_admit(1, None).unwrap().unwrap();
+    let demand = Demand::test("cold-suite", Some(18));
+    let plan = pool.demand_vector(&demand);
+    let mut state = AdmissionState::new((pool.clock)(), pool.events);
+    let admitted = pool
+        .try_admit_state(
+            plan.resources,
+            plan.weight,
+            plan.predicted,
+            &mut state,
+            Some(&demand),
+        )
+        .unwrap();
+    assert!(
+        admitted.is_some(),
+        "a cold 18-thread harness must not wait for the entire machine to empty"
+    );
+    drop((admitted, held));
 }
 
 #[test]
@@ -3478,7 +3540,6 @@ fn demand_vectors_keep_legacy_weights_and_unmeasured_memory_guesses() {
     for demand in [
         Demand::new("cold", false),
         Demand::new("cold-link", true),
-        Demand::test("cold-suite", None),
         Demand::nextest("cold-bin", "case"),
     ] {
         let plan = pool.demand_vector(&demand);
@@ -3488,6 +3549,15 @@ fn demand_vectors_keep_legacy_weights_and_unmeasured_memory_guesses() {
             pool.prediction(&demand)
         );
     }
+    assert_eq!(
+        pool.demand_vector(&Demand::test("cold-suite", None))
+            .resources,
+        Resources {
+            cpu: 4,
+            memory_bytes: GIB
+        },
+        "a cold test binary charges one memory share independently of its CPU guess"
+    );
     pool.record_peak("crate", GIB, false).unwrap();
     let mut demand = Demand::new("crate", false);
     demand.threads = Some(4);
@@ -4023,7 +4093,10 @@ fn legacy_lease_and_waiter_schema_is_preserved_across_estimator_demands_and_limi
             ] {
                 let expected = legacy::prediction(&pool, &demand);
                 let plan = pool.demand_vector(&demand);
-                if demand.compile_mode.is_none() && !demand.links {
+                if demand.compile_mode.is_none()
+                    && !demand.links
+                    && !(demand.learns_cpu && plan.predicted.is_none())
+                {
                     assert_eq!((plan.weight, plan.predicted), (expected.0, expected.1));
                 }
                 assert_legacy_record_fields(&pool, Some(&demand), plan.weight, plan.resources);
