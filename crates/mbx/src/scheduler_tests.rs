@@ -1,5 +1,29 @@
 use super::*;
 
+type SnapshotProbe = fn(&Path);
+
+thread_local! {
+    static SNAPSHOT_AFTER_READ: std::cell::Cell<Option<SnapshotProbe>> = const { std::cell::Cell::new(None) };
+    static RECORD_AFTER_WRITE: std::cell::Cell<Option<SnapshotProbe>> = const { std::cell::Cell::new(None) };
+}
+
+pub(super) fn snapshot_after_read(path: &Path) {
+    SNAPSHOT_AFTER_READ.with(|probe| {
+        if let Some(probe) = probe.get() {
+            probe(path);
+        }
+    });
+}
+
+pub(super) fn record_after_write(path: &Path) {
+    RECORD_AFTER_WRITE.with(|probe| {
+        if let Some(probe) = probe.get() {
+            probe(path);
+        }
+    });
+}
+
+
 fn wait_until(description: &str, mut ready: impl FnMut() -> bool) {
     // Wait for the event itself; the deadline only catches a stuck worker.
     let started = Instant::now();
@@ -2398,6 +2422,23 @@ fn scheduler_stats_read_old_records_without_locking_or_reclaiming_them() {
     let json = serde_json::to_value(&snapshot).unwrap();
     assert_eq!(json["entries"][1]["source"], "window");
     assert_eq!(json["activity"].as_array().unwrap().len(), 4);
+    for row in json["activity"].as_array().unwrap() {
+        for field in ["pid", "ticket", "queue_position", "live"] {
+            assert!(row.get(field).is_some(), "missing {field}: {row}");
+        }
+        if row["kind"] == "lease" {
+            for field in ["pid", "ticket", "queue_position", "live"] {
+                assert!(row[field].is_null(), "lease has no {field}: {row}");
+            }
+        } else if row["name"] == "unknown" {
+            assert!(row["pid"].is_null());
+            assert_eq!(row["ticket"], 1);
+            assert!(row["queue_position"].is_null());
+            assert_eq!(row["live"], false);
+        }
+    }
+    assert_eq!(std::fs::read(leases.join("stale")).unwrap(), old_lease);
+    assert_eq!(std::fs::read(waiters.join("stale")).unwrap(), old_waiter);
     let cpu = scheduler_snapshot(directory.path(), 100, 0, true);
     assert_eq!(cpu.entries[1].charge_permits, None);
     assert_eq!(cpu.entries[1].charge_bytes, None);
@@ -2407,6 +2448,255 @@ fn scheduler_stats_read_old_records_without_locking_or_reclaiming_them() {
     std::fs::write(pool.ledger_path(), serde_json::to_vec(&ledger).unwrap()).unwrap();
     let fallback = scheduler_snapshot(directory.path(), 100, 100, true);
     assert!(fallback.text().contains("charge=1 cores + 1000 B (legacy)"));
+}
+
+#[test]
+fn scheduler_stats_rank_live_waiters_by_ticket_and_exclude_grants() {
+    let directory = tempfile::tempdir().unwrap();
+    let pool = pool_at(directory.path(), 1, 0);
+    let leases = directory.path().join(LEASES_DIR);
+    let waiters = directory.path().join(WAITERS_DIR);
+    std::fs::create_dir_all(&leases).unwrap();
+    std::fs::create_dir_all(&waiters).unwrap();
+    let mut locks = Vec::new();
+    for (file, name, ticket, pid) in [
+        ("a-last", "last", 30, 42003),
+        ("z-first", "first", 10, 42001),
+        ("m-second", "second", 20, 42002),
+    ] {
+        let mut record = pool.waiting_record(
+            Resources {
+                cpu: 1,
+                memory_bytes: 0,
+            },
+            1,
+            None,
+            0,
+            ticket,
+        );
+        record.pid = Some(pid);
+        record.name = Some(name.into());
+        let path = waiters.join(file);
+        std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+        let mut lock = fslock::LockFile::open(&path).unwrap();
+        assert!(lock.try_lock().unwrap());
+        locks.push(lock);
+    }
+    let old_waiter = br#"{"ticket":15,"weight":1,"priority":"normal","domain":"old-domain","domain_capacity":1,"bytes_per_permit":0,"build":null}"#;
+    let legacy = waiters.join("y-legacy");
+    std::fs::write(&legacy, old_waiter).unwrap();
+    let mut lock = fslock::LockFile::open(&legacy).unwrap();
+    assert!(lock.try_lock().unwrap());
+    locks.push(lock);
+    let mut abandoned = pool.waiting_record(
+        Resources {
+            cpu: 1,
+            memory_bytes: 0,
+        },
+        1,
+        None,
+        0,
+        5,
+    );
+    abandoned.name = Some("abandoned".into());
+    // Even a record naming this still-live PID is abandoned without its lock.
+    abandoned.pid = Some(std::process::id());
+    let abandoned_bytes = serde_json::to_vec(&abandoned).unwrap();
+    let abandoned_path = waiters.join("b-abandoned");
+    std::fs::write(&abandoned_path, &abandoned_bytes).unwrap();
+    let mut granted = Lease::from(&abandoned);
+    granted.name = Some("granted-before-rename".into());
+    let grant_path = waiters.join("c-granted");
+    std::fs::write(&grant_path, serde_json::to_vec(&granted).unwrap()).unwrap();
+    let mut lock = fslock::LockFile::open(&grant_path).unwrap();
+    assert!(lock.try_lock().unwrap());
+    locks.push(lock);
+    let empty = waiters.join("d-released");
+    std::fs::write(&empty, b"").unwrap();
+    let mut lock = fslock::LockFile::open(&empty).unwrap();
+    assert!(lock.try_lock().unwrap());
+    locks.push(lock);
+
+    let json = serde_json::to_value(scheduler_snapshot(directory.path(), 1, 0, true)).unwrap();
+    let activity = json["activity"].as_array().unwrap();
+    assert_eq!(activity.len(), 5, "granted and released rows are not pending");
+    let row = |name: &str| activity.iter().find(|row| row["name"] == name).unwrap();
+    for (name, ticket, position, pid) in [
+        ("first", 10, 1, 42001),
+        ("second", 20, 3, 42002),
+        ("last", 30, 4, 42003),
+    ] {
+        assert_eq!(row(name)["pid"], pid);
+        assert_eq!(row(name)["ticket"], ticket);
+        assert_eq!(row(name)["queue_position"], position, "{name}");
+        assert_eq!(row(name)["live"], true);
+    }
+    assert!(row("unknown")["pid"].is_null());
+    assert_eq!(row("unknown")["ticket"], 15);
+    assert_eq!(row("unknown")["queue_position"], 2);
+    assert_eq!(row("unknown")["live"], true);
+    assert_eq!(row("abandoned")["pid"], std::process::id());
+    assert_eq!(row("abandoned")["ticket"], 5);
+    assert!(row("abandoned")["queue_position"].is_null());
+    assert_eq!(row("abandoned")["live"], false);
+    assert_eq!(std::fs::read(&abandoned_path).unwrap(), abandoned_bytes);
+    assert_eq!(std::fs::read(&legacy).unwrap(), old_waiter);
+
+    let first_path = waiters.join("z-first");
+    let first = read_waiter(&first_path).unwrap().unwrap();
+    assert!(hand_off(&first_path, &leases, &Lease::from(&first)).unwrap());
+    let json = serde_json::to_value(scheduler_snapshot(directory.path(), 1, 0, true)).unwrap();
+    let activity = json["activity"].as_array().unwrap();
+    let row = |name: &str| activity.iter().find(|row| row["name"] == name).unwrap();
+    assert_eq!(row("first")["kind"], "lease");
+    for field in ["pid", "ticket", "queue_position", "live"] {
+        assert!(row("first")[field].is_null(), "granted lease has no {field}");
+    }
+    assert_eq!(row("unknown")["queue_position"], 1);
+    assert_eq!(row("second")["queue_position"], 2);
+    assert_eq!(row("last")["queue_position"], 3);
+    assert!(!first_path.exists(), "the grant left the queue");
+    assert_eq!(std::fs::read(&abandoned_path).unwrap(), abandoned_bytes);
+    drop(locks);
+}
+
+#[test]
+fn scheduler_stats_observe_queued_identity_with_events_disabled() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut pool = pool_at(directory.path(), 1, 0);
+    pool.events = false;
+    let held = pool.try_admit(1, None).unwrap().unwrap();
+    let mut queued = None;
+    assert!(pool.try_admit_queued(1, None, &mut queued).unwrap().is_none());
+    let json = serde_json::to_value(scheduler_snapshot(directory.path(), 1, 0, true)).unwrap();
+    let row = json["activity"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["kind"] == "waiter")
+        .unwrap();
+    assert_eq!(row["pid"], std::process::id());
+    assert_eq!(row["ticket"], 1);
+    assert_eq!(row["queue_position"], 1);
+    assert_eq!(row["live"], true);
+    drop(queued);
+    let json = serde_json::to_value(scheduler_snapshot(directory.path(), 1, 0, true)).unwrap();
+    assert!(
+        json["activity"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row["kind"] != "waiter")
+    );
+    drop(held);
+}
+
+#[test]
+fn scheduler_stats_observe_a_new_waiter_only_under_its_publication_lock() {
+    thread_local! {
+        static OBSERVED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+    fn inspect_after_write(path: &Path) {
+        RECORD_AFTER_WRITE.with(|probe| probe.set(None));
+        let directory = path.parent().unwrap().parent().unwrap();
+        let bytes = std::fs::read(path).unwrap();
+        let json = serde_json::to_value(scheduler_snapshot(directory, 1, 0, true)).unwrap();
+        let row = json["activity"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["kind"] == "waiter")
+            .unwrap();
+        assert_eq!(row["pid"], std::process::id());
+        assert_eq!(row["ticket"], 1);
+        assert_eq!(row["queue_position"], 1);
+        assert_eq!(row["live"], true, "published bytes must already be owned: {json}");
+        assert_eq!(std::fs::read(path).unwrap(), bytes);
+        OBSERVED.with(|observed| observed.set(true));
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    let mut pool = pool_at(directory.path(), 1, 0);
+    pool.events = false;
+    let held = pool.try_admit(1, None).unwrap().unwrap();
+    let mut queued = None;
+    RECORD_AFTER_WRITE.with(|probe| probe.set(Some(inspect_after_write)));
+    assert!(pool.try_admit_queued(1, None, &mut queued).unwrap().is_none());
+    RECORD_AFTER_WRITE.with(|probe| probe.set(None));
+    assert!(OBSERVED.with(|observed| observed.replace(false)));
+    assert!(queued.is_some(), "observation must not refuse queue publication");
+    drop(queued);
+    drop(held);
+}
+
+#[test]
+fn scheduler_stats_omit_a_waiter_granted_after_its_record_was_read() {
+    fn grant_after_read(path: &Path) {
+        if path.parent().and_then(Path::file_name) != Some(std::ffi::OsStr::new(WAITERS_DIR)) {
+            return;
+        }
+        SNAPSHOT_AFTER_READ.with(|probe| probe.set(None));
+        let record = read_waiter(path).unwrap().unwrap();
+        let leases = path.parent().unwrap().parent().unwrap().join(LEASES_DIR);
+        assert!(hand_off(path, &leases, &Lease::from(&record)).unwrap());
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    let pool = pool_at(directory.path(), 1, 0);
+    let held = pool.try_admit(1, None).unwrap().unwrap();
+    let mut queued = None;
+    assert!(pool.try_admit_queued(1, None, &mut queued).unwrap().is_none());
+    drop(held);
+    SNAPSHOT_AFTER_READ.with(|probe| probe.set(Some(grant_after_read)));
+    let json = serde_json::to_value(scheduler_snapshot(directory.path(), 1, 0, true)).unwrap();
+    SNAPSHOT_AFTER_READ.with(|probe| probe.set(None));
+    assert!(
+        json["activity"].as_array().unwrap().is_empty(),
+        "a renamed waiter must be absent, not live:null: {json}"
+    );
+    let json = serde_json::to_value(scheduler_snapshot(directory.path(), 1, 0, true)).unwrap();
+    let activity = json["activity"].as_array().unwrap();
+    assert_eq!(activity.len(), 1);
+    assert_eq!(activity[0]["kind"], "lease");
+    for field in ["pid", "ticket", "queue_position", "live"] {
+        assert!(activity[0][field].is_null(), "granted lease has no {field}");
+    }
+    drop(queued);
+}
+#[test]
+fn scheduler_stats_activity_only_excludes_history_and_full_report_fields() {
+    let directory = tempfile::tempdir().unwrap();
+    let config = Config::for_test(directory.path());
+    let pool = pool_at(&config.cache_dir.join(SCHEDULER_DIR), 1, 0);
+    let held = pool.try_admit(1, None).unwrap().unwrap();
+    let mut queued = None;
+    assert!(pool.try_admit_queued(1, None, &mut queued).unwrap().is_none());
+    let ledger_reads = LEDGER_READS.with(|reads| reads.get());
+    let summary_reads = REPORT_SUMMARY_READS.with(|reads| reads.get());
+
+    let json = serde_json::to_value(scheduler_activity_report(&config)).unwrap();
+    assert_eq!(LEDGER_READS.with(|reads| reads.get()), ledger_reads);
+    assert_eq!(REPORT_SUMMARY_READS.with(|reads| reads.get()), summary_reads);
+    assert_eq!(json.as_object().unwrap().len(), 2);
+    assert_eq!(json["version"], 2);
+    assert_eq!(json["scheduler"].as_object().unwrap().len(), 1);
+    let activity = json["scheduler"]["activity"].as_array().unwrap();
+    assert_eq!(activity.len(), 2);
+    let waiter = activity.iter().find(|row| row["kind"] == "waiter").unwrap();
+    assert_eq!(waiter["pid"], std::process::id());
+    assert_eq!(waiter["ticket"], 1);
+    assert_eq!(waiter["queue_position"], 1);
+    assert_eq!(waiter["live"], true);
+    let lease = activity.iter().find(|row| row["kind"] == "lease").unwrap();
+    for field in ["pid", "ticket", "queue_position", "live"] {
+        assert!(lease[field].is_null(), "lease has no {field}");
+    }
+
+    let _full_report = scheduler_report(&config);
+    assert!(LEDGER_READS.with(|reads| reads.get()) > ledger_reads);
+    assert_eq!(REPORT_SUMMARY_READS.with(|reads| reads.get()), summary_reads + 2);
+    drop(queued);
+    drop(held);
 }
 
 #[test]
