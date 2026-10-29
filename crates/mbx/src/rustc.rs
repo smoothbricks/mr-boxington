@@ -3834,9 +3834,10 @@ fn query_compiler_identity(rustc: &OsStr) -> Result<SelectedCompiler> {
         bail!("cache agent did not return the rustc identity");
     };
     let stdout = if let Some(stdout) = stdout.filter(|bytes| {
+        // Version 2 retains the selected spelling in the backend pins.
         String::from_utf8_lossy(bytes)
             .lines()
-            .any(|line| line.starts_with("mbx-default-sysroot-v1: "))
+            .any(|line| line.starts_with("mbx-default-sysroot-v2: "))
     }) {
         stdout
     } else {
@@ -3884,8 +3885,11 @@ fn query_compiler_identity(rustc: &OsStr) -> Result<SelectedCompiler> {
             stdout.extend_from_slice(output.stdout.trim_ascii());
             stdout.push(b'\n');
         }
-        let sysroot = compiler_sysroot(rustc).and_then(|root| std::fs::canonicalize(root).ok());
+        // Pins follow the selected spelling so retargeting a toolchain alias
+        // invalidates identities even when compiler and driver share inodes.
+        let sysroot = compiler_sysroot(rustc);
         let (backend_pins, backends) = codegen_backends(sysroot.as_deref(), &host)?;
+        let sysroot = sysroot.and_then(|root| std::fs::canonicalize(root).ok());
         // An unpinned compiler is probed every session, so it stays unpinned.
         if !pins.is_empty() {
             pins.extend(backend_pins);
@@ -3895,7 +3899,7 @@ fn query_compiler_identity(rustc: &OsStr) -> Result<SelectedCompiler> {
         // This metadata is deliberately excluded from the version fields in the key.
         stdout.extend_from_slice(
             format!(
-                "\nmbx-default-sysroot-v1: {}\n",
+                "\nmbx-default-sysroot-v2: {}\n",
                 serde_json::to_string(&sysroot)?
             )
             .as_bytes(),
@@ -3916,7 +3920,7 @@ fn query_compiler_identity(rustc: &OsStr) -> Result<SelectedCompiler> {
     };
     let verbose = std::str::from_utf8(&stdout).wrap_err("rustc identity is not UTF-8")?;
     let sysroot: Option<PathBuf> =
-        serde_json::from_str(identity_field(verbose, "mbx-default-sysroot-v1")?)
+        serde_json::from_str(identity_field(verbose, "mbx-default-sysroot-v2")?)
             .wrap_err("rustc identity has an invalid default sysroot")?;
     let release = identity_field(verbose, "release")?;
     let host = identity_field(verbose, "host")?;
