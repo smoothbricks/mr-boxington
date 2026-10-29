@@ -196,6 +196,9 @@ pub(super) struct Event {
     overtook_logged: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     overtook: Option<Vec<Overtake>>,
+    /// The process that granted this admission on the waiter's behalf.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    granted_by: Option<u32>,
 }
 
 impl Event {
@@ -243,6 +246,7 @@ impl Event {
             overtook_total: None,
             overtook_logged: None,
             overtook: None,
+            granted_by: None,
         }
     }
 }
@@ -306,12 +310,14 @@ impl Pool {
         live: &[Lease],
         decision: AdmissionDecision,
         mut trace: Trace,
+        granted_by: Option<u32>,
         events: &mut Vec<Event>,
     ) {
         if !self.events {
             return;
         }
         let mut event = Event::new(self, "admitted", request);
+        event.granted_by = granted_by;
         event.rule = Some(
             match decision {
                 AdmissionDecision::Ordered => "ordered",
@@ -656,13 +662,14 @@ mod tests {
         trace: Trace,
     ) {
         let mut pending = Vec::new();
-        pool.admitted_event(request, live, decision, trace, &mut pending);
+        pool.admitted_event(request, live, decision, trace, None, &mut pending);
         pool.write_decisions(pending);
     }
 
     fn scan_logged(pool: &Pool, directory: &Path) -> Result<Vec<Waiting>> {
         let mut pending = Vec::new();
-        let result = scan_waiters_logged(directory, Some(pool), &mut pending);
+        let result = scan_waiters_logged(directory, Some(pool), &mut pending)
+            .map(|records| records.into_iter().map(|(_, record)| record).collect());
         pool.write_decisions(pending);
         result
     }
@@ -960,7 +967,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let mut pool = pool(dir.path(), 4);
             let held = pool.try_admit(3, None).unwrap().unwrap();
-            let mut state = AdmissionState::new(100);
+            let mut state = AdmissionState::new(100, true);
             let resources = Resources {
                 cpu: 2,
                 memory_bytes: 2 * MEMORY_QUANTUM,
@@ -1264,7 +1271,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut pool = pool(dir.path(), 4);
         let held = pool.try_admit(3, None).unwrap().unwrap();
-        let mut state = AdmissionState::new(100);
+        let mut state = AdmissionState::new(100, true);
         let resources = Resources {
             cpu: 1,
             memory_bytes: 2 * MEMORY_QUANTUM,
@@ -1400,7 +1407,7 @@ mod tests {
         let mut pool = pool(dir.path(), 4);
         pool.events = false;
         let held = pool.try_admit(3, None).unwrap().unwrap();
-        let mut state = AdmissionState::new(0);
+        let mut state = AdmissionState::new(0, true);
         let mut pending = Vec::new();
         let resources = Resources {
             cpu: 2,
