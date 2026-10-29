@@ -264,6 +264,7 @@ fn seed_profile(
         None
     };
     let mut units = 0;
+    let mut shims_copied = false;
     for package in subdirectories(&source.join("build")) {
         let Some(name) = package.file_name().and_then(|name| name.to_str()) else {
             continue;
@@ -282,37 +283,61 @@ fn seed_profile(
             let Some(hash) = unit.file_name() else {
                 continue;
             };
+            // A published unit can already be fresh to Cargo after an
+            // interrupted seed. Publish every launcher dependency first.
+            if !shims_copied {
+                copy_build_script_shims(donor, source, destination)?;
+                shims_copied = true;
+            }
             match copy_unit(&unit, destination, name, hash, donor) {
                 Ok(()) => units += 1,
                 Err(error) => log::debug!("did not copy {}: {error}", unit.display()),
             }
         }
     }
-    // Build-script launchers in the copied units exec the mbx binary pinned
-    // beside the profile, so a script Cargo later reruns needs it here too.
+    Ok(Copied::Units(units))
+}
+
+/// Publish pinned identities individually, so a seed can resume or merge
+/// with existing pins without exposing a partial binary.
+fn copy_build_script_shims(
+    donor: &Donor,
+    source: &Path,
+    destination: &Path,
+) -> std::io::Result<()> {
     let shims = source.join(".mbx-build-script-shims");
-    if units > 0 && shims.is_dir() {
+    let entries = match std::fs::read_dir(&shims) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let shims_destination = destination.join(".mbx-build-script-shims");
+    std::fs::create_dir_all(&shims_destination)?;
+    let links = Links {
+        source: &shims,
+        destination: &shims_destination,
+        donor,
+    };
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        let pinned = shims_destination.join(&name);
+        if pinned.exists() {
+            continue;
+        }
         let staging = destination.join(format!(
-            ".mbx-build-script-shims{STAGING_SUFFIX}{}",
+            ".mbx-build-script-shims-{}{STAGING_SUFFIX}{}",
+            name.to_string_lossy(),
             std::process::id()
         ));
-        let shims_destination = destination.join(".mbx-build-script-shims");
-        let links = Links {
-            source: &shims,
-            destination: &shims_destination,
-            donor,
-        };
-        match copy_tree(&shims, &staging, &links)
-            .and_then(|()| std::fs::rename(&staging, &shims_destination))
-        {
-            Ok(()) => {}
-            Err(error) => {
-                let _ = std::fs::remove_dir_all(&staging);
-                log::debug!("did not copy the build-script shims: {error}");
-            }
+        let copied = copy_tree(&entry.path(), &staging, &links)
+            .and_then(|()| std::fs::rename(&staging, &pinned));
+        if copied.is_err() {
+            let _ = std::fs::remove_dir_all(&staging);
         }
+        copied?;
     }
-    Ok(Copied::Units(units))
+    Ok(())
 }
 
 fn try_lock(path: &Path) -> std::io::Result<Option<fslock::LockFile>> {
