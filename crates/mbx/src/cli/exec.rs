@@ -46,7 +46,7 @@ pub(super) fn run(config: &Config, settings: &CliSettings, args: &ExecArgs) -> R
 
     crate::storage::check_cache(config)?;
     let _interrupt = SurviveInterrupt::install();
-    let session_dir = tempfile::Builder::new().prefix("mbx-session-").tempdir()?;
+    let session_dir = session::temporary_directory()?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;

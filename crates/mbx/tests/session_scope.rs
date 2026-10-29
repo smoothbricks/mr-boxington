@@ -711,6 +711,100 @@ fn nextest_test_threads_do_not_limit_build_permits_through_an_alias() {
 
 #[cfg(unix)]
 #[test]
+fn long_tmpdir_session_uses_explicit_root() {
+    use mbx_cache_core::{AGENT_PROTOCOL_VERSION, AgentRequest, AgentResponse};
+    use std::io::{BufRead, Write};
+    if let Some(expected_parent) = std::env::var_os("MBX_TEST_SESSION_PROBE") {
+        let socket = std::env::var_os("MBX_SOCKET").unwrap();
+        assert_eq!(
+            Path::new(&socket).parent().unwrap().parent(),
+            Some(Path::new(&expected_parent)),
+            "{socket:?}"
+        );
+        assert!(socket.len() < 104, "{socket:?}");
+        let staging = std::env::var_os("MBX_STAGING_DIR").unwrap();
+        assert_eq!(
+            Path::new(&staging).parent().unwrap().parent(),
+            Some(Path::new(&expected_parent))
+        );
+        assert!(Path::new(&staging).is_dir());
+        let mut stream = std::os::unix::net::UnixStream::connect(socket).unwrap();
+        serde_json::to_writer(
+            &mut stream,
+            &AgentRequest::Hello {
+                protocol: AGENT_PROTOCOL_VERSION,
+                client_version: env!("CARGO_PKG_VERSION").into(),
+            },
+        )
+        .unwrap();
+        stream.write_all(b"\n").unwrap();
+        let mut response = String::new();
+        std::io::BufReader::new(stream)
+            .read_line(&mut response)
+            .unwrap();
+        assert!(matches!(
+            serde_json::from_str::<AgentResponse>(&response).unwrap(),
+            AgentResponse::Hello {
+                protocol: AGENT_PROTOCOL_VERSION,
+                ..
+            }
+        ));
+        return;
+    }
+    let parent = std::env::var_os("XDG_RUNTIME_DIR").unwrap_or_else(|| "/tmp".into());
+    let directory = tempfile::Builder::new()
+        .prefix("mbx-test-")
+        .tempdir_in(parent)
+        .unwrap();
+    let padding = 90usize
+        .checked_sub(directory.path().as_os_str().len() + 1)
+        .unwrap();
+    let temporary = directory.path().join("t".repeat(padding));
+    std::fs::create_dir(&temporary).unwrap();
+    for session_root in [Some(directory.path()), None, Some(Path::new(""))] {
+        let mut command = mbx(directory.path());
+        command
+            .env("MBX_CC", "1")
+            .env("MBX_TEST_SESSION_PROBE", directory.path())
+            .args(["exec", "--"])
+            .arg(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "long_tmpdir_session_uses_explicit_root",
+                "--nocapture",
+            ]);
+        let explicit_root = session_root.is_some_and(|root| !root.as_os_str().is_empty());
+        command.env(
+            "TMPDIR",
+            if explicit_root {
+                &temporary
+            } else {
+                directory.path()
+            },
+        );
+        match session_root {
+            Some(root) => command.env("MBX_SESSION_ROOT", root),
+            None => command.env_remove("MBX_SESSION_ROOT"),
+        };
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "session root {session_root:?}: {output:?}"
+        );
+        assert!(
+            std::fs::read_dir(directory.path())
+                .unwrap()
+                .all(|entry| !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("mbx-session-")),
+            "session directory survived shutdown"
+        );
+    }
+}
+#[cfg(unix)]
+#[test]
 fn launch_preserves_non_unicode_environment_and_temporary_paths_with_spaces() {
     use std::os::unix::ffi::OsStringExt;
     let root = tempfile::tempdir().unwrap();
