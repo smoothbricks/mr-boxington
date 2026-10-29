@@ -12,8 +12,9 @@ struct Fixture {
 }
 
 impl Fixture {
-    fn compile(&self, compiler: &Path, sysroot: &Path) {
-        let output = Command::new(&self.shim)
+    fn compile(&self, compiler: &Path, sysroot: Option<&Path>) {
+        let mut command = Command::new(&self.shim);
+        command
             .current_dir(&self.workspace)
             .env_clear()
             .env("PATH", std::env::var_os("PATH").unwrap())
@@ -32,16 +33,15 @@ impl Fixture {
                 "--crate-type=lib",
                 "--emit=dep-info,metadata",
                 "--out-dir=target",
-                "--sysroot",
-            ])
-            .arg(sysroot)
-            .arg("lib.rs")
-            .output()
-            .unwrap();
+            ]);
+        if let Some(sysroot) = sysroot {
+            command.arg("--sysroot").arg(sysroot);
+        }
+        let output = command.arg("lib.rs").output().unwrap();
         assert!(
             output.status.success(),
             "compiler failed for {}: {}",
-            sysroot.display(),
+            compiler.display(),
             String::from_utf8_lossy(&output.stderr)
         );
     }
@@ -133,21 +133,21 @@ fn selected_physical_sysroot_stores_and_restores_without_conflating_roots() {
     };
 
     // The selected compiler is lexical, while --print sysroot gives its physical root.
-    fixture.compile(&selected.join("bin/rustc"), first_sysroot);
+    fixture.compile(&selected.join("bin/rustc"), Some(first_sysroot));
     fixture.assert_artifact("first-rustc", 1);
     fixture.wipe_outputs();
-    fixture.compile(&selected.join("bin/rustc"), first_sysroot);
+    fixture.compile(&selected.join("bin/rustc"), Some(first_sysroot));
     fixture.assert_artifact("first-rustc", 1);
     fixture.wipe_outputs();
-    fixture.compile(&selected.join("bin/rustc"), &selected);
+    fixture.compile(&selected.join("bin/rustc"), Some(&selected));
     fixture.assert_artifact("first-rustc", 1);
 
     // Equal -vV text does not prove two installations have the same standard library.
     fixture.wipe_outputs();
-    fixture.compile(&second, second_sysroot);
+    fixture.compile(&second, Some(second_sysroot));
     fixture.assert_artifact("second-rustc", 2);
     fixture.wipe_outputs();
-    fixture.compile(&second, second_sysroot);
+    fixture.compile(&second, Some(second_sysroot));
     fixture.assert_artifact("second-rustc", 2);
 
     // Explicit overrides are not aliases for the selected compiler's default root.
@@ -156,9 +156,72 @@ fn selected_physical_sysroot_stores_and_restores_without_conflating_roots() {
         std::fs::create_dir_all(&custom).unwrap();
         std::fs::write(custom.join("marker"), name).unwrap();
         fixture.wipe_outputs();
-        fixture.compile(&first, &custom);
+        fixture.compile(&first, Some(&custom));
         fixture.assert_artifact(name, 3 + index);
     }
+}
+
+#[test]
+fn persisted_compiler_identity_follows_selected_sysroot_alias() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let workspace = root.join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::create_dir_all(root.join("home")).unwrap();
+    std::fs::create_dir_all(root.join("shims")).unwrap();
+    std::fs::write(workspace.join("lib.rs"), "pub fn fixture() {}\n").unwrap();
+    let shim = mbx::session::install_shim(
+        Path::new(env!("CARGO_BIN_EXE_mbx")),
+        &root.join("shims"),
+        mbx::session::ShimLink::Tracking,
+    )
+    .unwrap();
+    let first = compiler(&root, "first-rustc");
+    let second = compiler(&root, "second-rustc");
+    let first_sysroot = first.parent().unwrap().parent().unwrap();
+    let second_sysroot = second.parent().unwrap().parent().unwrap();
+
+    // Create every hardlink before probing: adding one later changes ctime
+    // and would invalidate the compiler pins without testing the alias.
+    std::fs::remove_file(&second).unwrap();
+    std::fs::hard_link(&first, &second).unwrap();
+    let driver = first_sysroot.join("lib/librustc_driver-fixture.so");
+    std::fs::write(&driver, b"shared compiler driver").unwrap();
+    let second_driver = second_sysroot.join("lib/librustc_driver-fixture.so");
+    std::fs::hard_link(&driver, second_driver).unwrap();
+    for (sysroot, contents) in [
+        (first_sysroot, "first backend"),
+        (second_sysroot, "second backend"),
+    ] {
+        let backends = sysroot.join("lib/rustlib/x86_64-unknown-linux-gnu/codegen-backends");
+        std::fs::create_dir_all(&backends).unwrap();
+        std::fs::write(backends.join("librustc_codegen_fixture.so"), contents).unwrap();
+    }
+
+    let selected = root.join("selected-toolchain");
+    symlink(first_sysroot, &selected).unwrap();
+    let fixture = Fixture {
+        root,
+        workspace,
+        shim,
+    };
+    let selected_compiler = selected.join("bin/rustc");
+    fixture.compile(&selected_compiler, None);
+    fixture.assert_artifact("first-rustc", 1);
+    fixture.wipe_outputs();
+    fixture.compile(&selected_compiler, None);
+    fixture.assert_artifact("first-rustc", 1);
+
+    // Leave the old physical backend pins intact. An explicit --sysroot
+    // could merely bypass a stale mapping, hiding a wrong implicit-root hit.
+    fixture.wipe_outputs();
+    std::fs::remove_file(&selected).unwrap();
+    symlink(second_sysroot, &selected).unwrap();
+    fixture.compile(&selected_compiler, None);
+    fixture.assert_artifact("second-rustc", 2);
+    fixture.wipe_outputs();
+    fixture.compile(&selected_compiler, None);
+    fixture.assert_artifact("second-rustc", 2);
 }
 
 #[test]
