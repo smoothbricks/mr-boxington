@@ -77,7 +77,9 @@ worktrees share an action even though their absolute paths differ.
 For Rust compilers installed outside those roots, mbx also maps the selected
 compiler's physical default sysroot. Aliases of that root share its mapping,
 but distinct installations keep distinct path identities even when their
-version text matches. Existing home and rustup mappings are unchanged. An
+version text matches. Cached backend identities follow the selected toolchain
+spelling, so retargeting an alias revalidates its backend selection. Existing
+home and rustup mappings are unchanged. An
 arbitrary `--sysroot` override does not become the selected compiler's default:
 it must already fall under a known mapping or the action bypasses the cache.
 
