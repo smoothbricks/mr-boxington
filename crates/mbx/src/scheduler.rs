@@ -2465,7 +2465,8 @@ impl Pool {
         // own grant and would hold capacity without using it. It waits for the
         // lock only when no pass ran lately, as when every holder is a version
         // that admits only itself.
-        if state.queued.is_some() && self.queue_served(SERVED_FRESHNESS) {
+        if state.queued.is_some() && stamp_is_fresh(&self.dir.join(SERVED_STAMP), SERVED_FRESHNESS)
+        {
             if !registrar.try_lock()? {
                 return Ok(None);
             }
@@ -2727,16 +2728,42 @@ impl Pool {
         stamp_is_fresh(&self.dir.join(PRIORITY_WAIT_STAMP), PRIORITY_WAIT_FRESHNESS)
     }
 
-    /// Whether an admission pass ran lately, so the queue is being served
-    /// without this request holding the registrar itself.
+    /// Only a pass in this pressure domain can grant this queued request.
     fn queue_served(&self, freshness: Duration) -> bool {
-        stamp_is_fresh(&self.dir.join(SERVED_STAMP), freshness)
+        use std::io::Read as _;
+        let served = || -> std::io::Result<bool> {
+            let mut file = File::open(self.dir.join(SERVED_STAMP))?;
+            if !file
+                .metadata()?
+                .modified()?
+                .elapsed()
+                .is_ok_and(|age| age < freshness)
+            {
+                return Ok(false);
+            }
+            // Compare without allocating, including domains longer than one
+            // buffer. An older mbx writes an empty stamp: it does not prove
+            // this domain was served, so it cannot suppress a recovery scan.
+            let mut domain = self.pressure_domain.as_bytes();
+            let mut buffer = [0_u8; 128];
+            loop {
+                let count = file.read(&mut buffer)?;
+                if count == 0 {
+                    return Ok(domain.is_empty());
+                }
+                let Some(rest) = domain.strip_prefix(&buffer[..count]) else {
+                    return Ok(false);
+                };
+                domain = rest;
+            }
+        };
+        served().unwrap_or(false)
     }
 
     fn mark_served(&self) {
         // A lost touch costs only time: queued requests then wait for the
         // registrar to serve themselves.
-        if let Err(error) = std::fs::write(self.dir.join(SERVED_STAMP), b"") {
+        if let Err(error) = std::fs::write(self.dir.join(SERVED_STAMP), self.pressure_domain) {
             debug!("the admission pass stamp was not touched: {error}");
         }
     }

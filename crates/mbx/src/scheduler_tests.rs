@@ -310,6 +310,39 @@ fn a_waiting_reservation_recovers_a_silently_unlocked_lease() {
 }
 
 #[test]
+fn a_foreign_domain_pass_cannot_defer_periodic_recovery() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut local = pool_at(directory.path(), 1, 0);
+    local.pressure_domain = "local";
+    let mut held = local.try_admit(1, None).unwrap().expect("initial lease");
+    let resources = Resources {
+        cpu: 1,
+        memory_bytes: 0,
+    };
+    let mut state = AdmissionState::new((local.clock)(), local.events);
+    assert!(
+        local
+            .try_admit_state(resources, 1, None, &mut state, None)
+            .unwrap()
+            .is_none()
+    );
+    let mut foreign = pool_at(directory.path(), 1, 0);
+    foreign.pressure_domain = "foreign";
+    assert!(foreign.try_admit(1, None).unwrap().is_none());
+    // A foreign pass cannot grant this domain. Its stamp must not postpone
+    // recovery after a silent lock release (or a local priority change).
+    drop(held.lock.take());
+    state.periodic = true;
+    let permit = local
+        .try_admit_state(resources, 1, None, &mut state, None)
+        .unwrap();
+    assert!(
+        permit.is_some(),
+        "a foreign-domain pass must not suppress a local recovery scan"
+    );
+}
+
+#[test]
 fn a_build_limit_counts_only_that_builds_leases() {
     let directory = tempfile::tempdir().unwrap();
     let mut other = pool_at(directory.path(), 6, 0);
