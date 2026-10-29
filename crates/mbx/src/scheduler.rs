@@ -19,7 +19,7 @@
 //! every queued request the ordering rule admits, in ticket order, not only
 //! its own: a granted waiter's queue record becomes its lease, renamed into
 //! the leases directory under the lock its holder already keeps, and the
-//! holder finds it on its next poll. A queued request therefore starts as
+//! holder finds it when a lease-directory notification wakes it. It starts as
 //! soon as any participant sees room for it.
 //!
 //! CPU cores and predicted memory bytes are independent budgets. A request
@@ -56,6 +56,8 @@ mod decisions;
 pub(crate) mod grant;
 #[path = "scheduler_memory.rs"]
 mod memory;
+#[path = "scheduler_wait.rs"]
+mod wait;
 
 use crate::config::{Config, SchedulerPriority};
 use eyre::{Context, Result};
@@ -169,37 +171,6 @@ const UNMEASURED_TEST_WEIGHT: u64 = 2;
 const TEST_HISTORY_REFRESH: Duration = Duration::from_secs(24 * 60 * 60);
 /// Most test names retained for one nextest binary.
 const MAX_TEST_HISTORY_ENTRIES: usize = 16_384;
-/// First delay after a refused admission.
-const POLL_INITIAL: Duration = Duration::from_millis(2);
-/// Longest delay between admission attempts.
-///
-/// A permit is released the instant its compiler exits and nothing wakes the
-/// waiters, so this bounds how long a core sits idle with work queued for
-/// it. Kept short for that reason: one attempt is a readdir and a handful of
-/// `try_lock`s, which even a full pool of waiters can afford at this rate.
-///
-/// Waking waiters on the release itself -- watching the leases directory, so
-/// the wait ends when a lease disappears -- was built and measured and did
-/// not pay, so it is deliberately not here. The reason is not that the win
-/// was small enough to lose in the noise: this interval is not what a waiter
-/// is waiting on. Waiters poll at independent jittered phases, so a released
-/// permit is found by whichever of them wakes first -- and granted to the
-/// oldest request it fits, whichever process that is -- and the more waiters
-/// there are the sooner that is.
-///
-/// Measured on hk, which is the shape that makes this look worst -- one
-/// build, permits deliberately scarce so the pool really is the constraint:
-///
-/// - at the default permit count, the whole build spends 0.2 s waiting for
-///   permits across ten admissions, so nothing here is worth reaching for;
-/// - at two permits, where admissions wait 1100 s in aggregate, cutting this
-///   interval by twelve and a half times -- to 2 ms, past what any wake could
-///   save -- moved the build from 62.5 s to 63.0 s, and the aggregate wait
-///   from 1105 s to 1073 s. Both are inside the run-to-run spread.
-///
-/// What that aggregate wait is, then, is capacity that genuinely was not
-/// free. No mechanism for noticing sooner can return it.
-const POLL_MAX: Duration = Duration::from_millis(25);
 /// How recently the stamp must have been touched to hold low priority back.
 const PRIORITY_WAIT_FRESHNESS: Duration = Duration::from_secs(2);
 /// How often one waiter refreshes that stamp, well inside its freshness.
@@ -207,6 +178,8 @@ const PRIORITY_STAMP_INTERVAL: Duration = Duration::from_millis(500);
 /// How recently an admission pass must have run for a queued request to
 /// leave the registrar to whoever holds it rather than wait to hold it.
 const SERVED_FRESHNESS: Duration = Duration::from_secs(1);
+/// Periodic waiters share a scan for two seconds; lease events bypass this.
+const RECHECK_FRESHNESS: Duration = Duration::from_secs(2);
 /// How long one compilation waits before saying so in the debug log.
 const SLOW_WAIT_NOTICE: Duration = Duration::from_secs(60);
 /// How long the available-memory gate may defer one compilation.
@@ -558,6 +531,8 @@ struct AdmissionState {
     last_gate: Option<&'static str>,
     /// The charge a pass granted this request, once it has claimed it.
     claimed: Option<(Resources, u64)>,
+    /// A timeout may share a recent admission pass; a lease event must not.
+    periodic: bool,
 }
 
 impl AdmissionState {
@@ -569,6 +544,7 @@ impl AdmissionState {
                 .saturating_add(u64::try_from(GATE_DEADLINE.as_millis()).unwrap_or(u64::MAX)),
             last_gate: None,
             claimed: None,
+            periodic: false,
         }
     }
 }
@@ -2086,13 +2062,13 @@ impl Pool {
         demand.observation.set(None);
         let started = Instant::now();
         let mut state = AdmissionState::new((self.clock)(), self.events);
-        let mut delay = POLL_INITIAL;
+        let mut wake: Option<wait::Wait> = None;
         let mut stamped: Option<Instant> = None;
         let mut complained = false;
         let mut ledger_cache = None;
         loop {
-            // Polls run every 2 to 25 ms. Reuse the plan until history reloads;
-            // its calibration features remain paired with the cached charge.
+            // Reuse the plan until history reloads; its calibration features
+            // remain paired with the cached charge.
             let Plan {
                 resources,
                 weight,
@@ -2153,8 +2129,13 @@ impl Pool {
                     resources.cpu, resources.memory_bytes, demand.name
                 );
             }
-            std::thread::sleep(jittered(delay));
-            delay = (delay * 2).min(POLL_MAX);
+            if let Some(wake) = &mut wake {
+                state.periodic = wake.pause();
+            } else {
+                // Register before the next scan, so a release between the
+                // refused attempt and registration cannot be lost.
+                wake = Some(wait::Wait::new(&self.dir));
+            }
         }
     }
 
@@ -2189,7 +2170,7 @@ impl Pool {
 
         let started = Instant::now();
         let mut state = AdmissionState::new((self.clock)(), self.events);
-        let mut delay = POLL_INITIAL;
+        let mut wake: Option<wait::Wait> = None;
         let mut stamped: Option<Instant> = None;
         loop {
             // Like compiler admission, a persistently low available-memory
@@ -2213,8 +2194,11 @@ impl Pool {
                 let _ = std::fs::write(self.dir.join(PRIORITY_WAIT_STAMP), b"");
                 stamped = Some(Instant::now());
             }
-            std::thread::sleep(jittered(delay));
-            delay = (delay * 2).min(POLL_MAX);
+            if let Some(wake) = &mut wake {
+                state.periodic = wake.pause();
+            } else {
+                wake = Some(wait::Wait::new(&self.dir));
+            }
         }
     }
 
@@ -2466,11 +2450,14 @@ impl Pool {
         events: &mut Vec<decisions::Event>,
     ) -> Result<Option<Permit>> {
         let leases = self.dir.join(LEASES_DIR);
-        std::fs::create_dir_all(&leases)
-            .wrap_err_with(|| format!("failed to create {}", leases.display()))?;
         if let Some(permit) = claim(state, &leases) {
             return Ok(Some(permit));
         }
+        if state.periodic && state.queued.is_some() && self.queue_served(RECHECK_FRESHNESS) {
+            return Ok(None);
+        }
+        std::fs::create_dir_all(&leases)
+            .wrap_err_with(|| format!("failed to create {}", leases.display()))?;
         let registrar_path = self.dir.join(POOL_LOCK);
         let mut registrar = fslock::LockFile::open(&registrar_path)?;
         // A queued request is granted by whichever process runs the next pass.
@@ -2478,7 +2465,7 @@ impl Pool {
         // own grant and would hold capacity without using it. It waits for the
         // lock only when no pass ran lately, as when every holder is a version
         // that admits only itself.
-        if state.queued.is_some() && self.queue_served() {
+        if state.queued.is_some() && self.queue_served(SERVED_FRESHNESS) {
             if !registrar.try_lock()? {
                 return Ok(None);
             }
@@ -2487,6 +2474,11 @@ impl Pool {
         }
         if let Some(permit) = claim(state, &leases) {
             return Ok(Some(permit));
+        }
+        // Only one periodic participant needs to scan the whole queue. Check
+        // again under the registrar after racing another timeout's pass.
+        if state.periodic && state.queued.is_some() && self.queue_served(RECHECK_FRESHNESS) {
+            return Ok(None);
         }
         let live = scan_leases(&leases)?;
         let now = (self.clock)();
@@ -2737,8 +2729,8 @@ impl Pool {
 
     /// Whether an admission pass ran lately, so the queue is being served
     /// without this request holding the registrar itself.
-    fn queue_served(&self) -> bool {
-        stamp_is_fresh(&self.dir.join(SERVED_STAMP), SERVED_FRESHNESS)
+    fn queue_served(&self, freshness: Duration) -> bool {
+        stamp_is_fresh(&self.dir.join(SERVED_STAMP), freshness)
     }
 
     fn mark_served(&self) {
@@ -4104,7 +4096,7 @@ fn claim(state: &mut AdmissionState, leases: &Path) -> Option<Permit> {
 /// Grant a queued request on its holder's behalf: its record becomes its
 /// lease, renamed into the leases directory. The holder keeps its lock
 /// across the rename, so the lease lives exactly as long as the process that
-/// will run under it, which finds it on its next poll. `false` means the
+/// will run under it, woken by the directory change. `false` means the
 /// holder left before its grant reached it.
 fn hand_off(record: &Path, leases: &Path, lease: &Lease) -> Result<bool> {
     let name = record

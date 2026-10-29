@@ -107,7 +107,7 @@ samples; fewer than ten qualifying keys use 0.5. This allows the bound to
 exceed the measured peak even for a key with just one measurement. The key's reported `q` expresses this
 bound as a log ratio to its window maximum.
 
-Waiting requests that use the compiler ledger check it on every poll and
+Waiting requests that use the compiler ledger check it on each admission attempt and
 re-predict their charge when the cached ledger reloads. The parsed ledger and prediction are reused until
 the file changes, for at most one second.
 On Unix, file identity also detects replacements with matching timestamps and sizes. When a request is admitted,
@@ -254,12 +254,23 @@ position.
 
 Each admission attempt serves the whole queue. Whichever process takes the
 pool's lock admits, in queue order, every waiting request these rules admit,
-not only its own, and each waiter finds its grant on its next poll. A request
-therefore never waits for free room behind an older request that fits; it waits
-only for capacity, or behind an older request that does not fit yet. Requests
+not only its own. On macOS and Linux, waiters block on lease-directory changes:
+a release wakes admission scans, and a grant's rename wakes its holder. The
+watch is registered before rechecking admission, so a release cannot be lost
+between the check and the wait. Notifications never decide admission; the
+existing registrar and queue order do. A request therefore waits only for
+capacity, or behind an older request that does not fit yet. Requests
 from another container are left to that container's processes, since each
 container measures its own memory pressure, and a waiter from an older mbx
 keeps admitting only itself.
+
+A jittered one-to-one-and-a-half-second recheck notices memory-pressure changes
+and refreshes normal-priority demand. Periodic waiters share admission passes
+for two seconds rather than each rescanning the whole queue. A holder that dies
+without removing its lease is therefore reclaimed within three and a half seconds;
+lease-change notifications bypass this delay. If notifications are unavailable
+or fail, waiters log the failure at debug level and use the same bounded recheck;
+other platforms use that recheck too. No daemon or notification socket is needed.
 
 Cache hits do not need compiler permits. If a process dies, the kernel
 releases its permits. For the weighting and recovery details, see

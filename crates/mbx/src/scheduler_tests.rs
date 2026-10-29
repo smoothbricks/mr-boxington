@@ -215,6 +215,101 @@ fn a_waiting_normal_reservation_holds_low_priority_work_back() {
 }
 
 #[test]
+fn blocked_reservations_sleep_and_wake_in_fifo_order() {
+    static SCANS: AtomicU64 = AtomicU64::new(0);
+    const WAITERS: usize = 8;
+    let directory = tempfile::tempdir().unwrap();
+    let pool = pool_at(directory.path(), 1, 0);
+    let held = pool.try_admit(1, None).unwrap().expect("initial lease");
+    let (admitted, admissions) = std::sync::mpsc::channel();
+    let mut workers = Vec::new();
+    for index in 0..WAITERS {
+        let dir = directory.path().to_path_buf();
+        let admitted = admitted.clone();
+        workers.push(std::thread::spawn(move || {
+            let mut pool = pool_at(&dir, 1, 0);
+            pool.clock = || {
+                SCANS.fetch_add(1, Ordering::Relaxed);
+                crate::pressure::now_ms()
+            };
+            let permit = pool.reserve(Some(1), None).unwrap();
+            admitted.send((index, permit)).unwrap();
+        }));
+        wait_until("the next FIFO reservation to enqueue", || {
+            std::fs::read_dir(directory.path().join(WAITERS_DIR))
+                .is_ok_and(|entries| entries.count() == index + 1)
+        });
+    }
+    SCANS.store(0, Ordering::Relaxed);
+    eprintln!(
+        "blocked scheduler fixture: {} pid={} waiters={WAITERS}",
+        directory.path().display(),
+        std::process::id()
+    );
+    let blocked = Instant::now();
+    std::thread::sleep(Duration::from_secs(5));
+    let scans = SCANS.load(Ordering::Relaxed);
+    let blocked_seconds = blocked.elapsed().as_secs_f64();
+    drop(held);
+    let mut order = Vec::new();
+    let mut longest_wake = Duration::ZERO;
+    for _ in 0..WAITERS {
+        let released = Instant::now();
+        let (index, permit) = admissions.recv_timeout(Duration::from_secs(10)).unwrap();
+        longest_wake = longest_wake.max(released.elapsed());
+        order.push(index);
+        drop(permit);
+    }
+    for worker in workers {
+        worker.join().unwrap();
+    }
+    assert_eq!(order, (0..WAITERS).collect::<Vec<_>>(), "FIFO admission");
+    assert!(
+        longest_wake
+            < if cfg!(any(target_os = "macos", target_os = "linux")) {
+                Duration::from_millis(750)
+            } else {
+                Duration::from_secs(4)
+            },
+        "release wake took {longest_wake:?}"
+    );
+    let rate = scans as f64 / WAITERS as f64 / blocked_seconds;
+    eprintln!("blocked reservation scans: {scans}, {rate:.3}/waiter/s");
+    assert!(
+        rate < 2.0,
+        "blocked reservations busy-poll: {rate:.3} scans/waiter/s"
+    );
+}
+
+#[test]
+fn a_waiting_reservation_recovers_a_silently_unlocked_lease() {
+    let directory = tempfile::tempdir().unwrap();
+    let pool = pool_at(directory.path(), 1, 0);
+    let mut held = pool.try_admit(1, None).unwrap().expect("initial lease");
+    let dir = directory.path().to_path_buf();
+    let (admitted, admission) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        admitted
+            .send(pool_at(&dir, 1, 0).reserve(Some(1), None).unwrap())
+            .unwrap();
+    });
+    wait_until("the reservation to enqueue", || {
+        std::fs::read_dir(directory.path().join(WAITERS_DIR))
+            .is_ok_and(|entries| entries.count() == 1)
+    });
+    // No unlink or rename: this is the state a killed lease holder leaves.
+    let released = Instant::now();
+    drop(held.lock.take());
+    let permit = admission.recv_timeout(Duration::from_secs(4)).unwrap();
+    assert!(
+        released.elapsed() < Duration::from_secs(4),
+        "silent release recovery was not bounded"
+    );
+    drop(permit);
+    worker.join().unwrap();
+}
+
+#[test]
 fn a_build_limit_counts_only_that_builds_leases() {
     let directory = tempfile::tempdir().unwrap();
     let mut other = pool_at(directory.path(), 6, 0);
