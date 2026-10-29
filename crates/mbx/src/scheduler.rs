@@ -2653,7 +2653,7 @@ impl Pool {
     ) -> Waiting {
         Waiting {
             first_arrival_ms: self.events.then_some(first_arrival_ms),
-            pid: self.events.then(std::process::id),
+            pid: Some(std::process::id()),
             name: demand.map(|d| d.name.clone()),
             mode_key: demand.map(|d| {
                 d.compile_mode
@@ -2678,9 +2678,10 @@ impl Pool {
         }
     }
 
-    /// Create and lock one of this process's records, a lease or a queue
-    /// entry. Runs under the registrar lock, which is what keeps the moment
-    /// between creation and locking private.
+    /// Create and exclusively lock an empty lease or queue file before writing
+    /// its record. The registrar serializes publishers; locking before valid
+    /// bytes appear also keeps a read-only observer from taking the file's
+    /// lock between publication and ownership.
     ///
     /// The name has to be unique against processes this one cannot see. A pid
     /// is only unique within its namespace, and two containers sharing a cache
@@ -2705,13 +2706,15 @@ impl Pool {
                 .open(&path)
             {
                 Ok(mut file) => {
-                    std::io::Write::write_all(&mut file, record)
-                        .wrap_err_with(|| format!("failed to write {}", path.display()))?;
-                    drop(file);
                     let mut lock = fslock::LockFile::open(&path)?;
                     if !lock.try_lock()? {
                         eyre::bail!("a freshly created lease was already locked");
                     }
+                    std::io::Write::write_all(&mut file, record)
+                        .wrap_err_with(|| format!("failed to write {}", path.display()))?;
+                    #[cfg(test)]
+                    tests::record_after_write(&path);
+                    drop(file);
                     return Ok(Permit {
                         lock: Some(lock),
                         path,
@@ -3362,6 +3365,18 @@ pub(crate) struct SchedulerReport {
     decisions: decisions::Summary,
 }
 
+/// The activity-only statistics projection, separate from the full version-one report.
+#[derive(Debug, Serialize)]
+pub(crate) struct SchedulerActivityReport {
+    version: u8,
+    scheduler: SchedulerActivitySnapshot,
+}
+
+#[derive(Debug, Serialize)]
+struct SchedulerActivitySnapshot {
+    activity: Vec<SchedulerActivity>,
+}
+
 #[derive(Debug, Serialize)]
 struct SchedulerEntry {
     key: String,
@@ -3400,8 +3415,21 @@ struct SchedulerActivity {
     charged_memory_bytes: u64,
     charged_bytes: u64,
     age_secs: Option<u64>,
+    pid: Option<u32>,
+    ticket: Option<u64>,
+    queue_position: Option<usize>,
+    live: Option<bool>,
 }
 
+// Probe only waiter records, using a plain file so closing an acquired lock
+// neither truncates an abandoned record (as fslock would) nor reclaims it.
+fn waiter_is_live(file: &File) -> std::io::Result<bool> {
+    match file.try_lock_shared() {
+        Ok(()) => Ok(false),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(true),
+        Err(std::fs::TryLockError::Error(error)) => Err(error),
+    }
+}
 /// Charges under the global scheduler settings. A workspace `.mbx.toml` can
 /// change them for its own builds, and only `mbx cargo` resolves which
 /// workspace that is; lease and waiter records keep what was really charged.
@@ -3416,6 +3444,17 @@ pub(crate) fn scheduler_report(config: &Config) -> SchedulerReport {
     report.memory_capacity = config.scheduler.memory_bytes.unwrap_or(0);
     report
 }
+
+/// Collect only current activity, without store statistics or scheduler histories.
+pub(crate) fn scheduler_activity_report(config: &Config) -> SchedulerActivityReport {
+    SchedulerActivityReport {
+        version: 2,
+        scheduler: SchedulerActivitySnapshot {
+            activity: activity_snapshot(&config.cache_dir.join(SCHEDULER_DIR)),
+        },
+    }
+}
+
 
 fn scheduler_snapshot(
     dir: &Path,
@@ -3446,66 +3485,7 @@ fn scheduler_snapshot(
             calibrated: ledger.sibling_residuals.len() >= 50,
         }))
         .collect();
-    let mut activity = Vec::new();
-    for (subdir, kind) in [(LEASES_DIR, "lease"), (WAITERS_DIR, "waiter")] {
-        let Ok(files) = std::fs::read_dir(dir.join(subdir)) else {
-            continue;
-        };
-        let mut paths: Vec<_> = files
-            .filter_map(|entry| entry.ok().map(|e| e.path()))
-            .collect();
-        paths.sort();
-        for path in paths {
-            let Ok(bytes) = std::fs::read(&path) else {
-                continue;
-            };
-            let age_secs = std::fs::metadata(&path)
-                .ok()
-                .and_then(|m| m.modified().ok())
-                .and_then(|t| t.elapsed().ok())
-                .map(|d| d.as_secs());
-            let record = if kind == "lease" {
-                serde_json::from_slice::<Lease>(&bytes).ok().map(|l| {
-                    (
-                        l.resources(),
-                        l.name,
-                        l.mode_key,
-                        l.build_id,
-                        l.domain,
-                        l.weight,
-                        l.bytes_per_permit,
-                    )
-                })
-            } else {
-                serde_json::from_slice::<Waiting>(&bytes).ok().map(|w| {
-                    (
-                        w.resources(),
-                        w.name,
-                        w.mode_key,
-                        w.build.map(|(id, _)| id),
-                        Some(w.domain),
-                        w.weight,
-                        w.bytes_per_permit,
-                    )
-                })
-            };
-            if let Some((resources, name, mode, build, domain, weight, unit)) = record {
-                let unknown = || "unknown".to_owned();
-                activity.push(SchedulerActivity {
-                    kind,
-                    name: name.unwrap_or_else(unknown),
-                    mode_key: mode.unwrap_or_else(unknown),
-                    build_id: build.unwrap_or_else(unknown),
-                    pressure_domain: domain.unwrap_or_else(unknown),
-                    charged_permits: weight,
-                    charged_cpu: resources.cpu,
-                    charged_memory_bytes: resources.memory_bytes,
-                    charged_bytes: weight.saturating_mul(unit),
-                    age_secs,
-                });
-            }
-        }
-    }
+    let activity = activity_snapshot(dir);
     let keys: std::collections::BTreeSet<_> = ledger
         .crates
         .keys()
@@ -3736,6 +3716,7 @@ impl LedgerCache {
 #[cfg(test)]
 thread_local! {
     static LEDGER_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static REPORT_SUMMARY_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 fn read_ledger(path: &Path) -> MemoryLedger {
@@ -4302,6 +4283,122 @@ fn oom_killed(_status: &ExitStatus) -> bool {
 fn jittered(delay: Duration) -> Duration {
     use rand::RngExt as _;
     delay + delay.mul_f64(rand::rng().random_range(0.0..0.5))
+}
+
+fn activity_snapshot(dir: &Path) -> Vec<SchedulerActivity> {
+    let mut activity = Vec::new();
+    for (subdir, kind) in [(LEASES_DIR, "lease"), (WAITERS_DIR, "waiter")] {
+        let first_activity = activity.len();
+        let Ok(files) = std::fs::read_dir(dir.join(subdir)) else {
+            continue;
+        };
+        let mut paths: Vec<_> = files
+            .filter_map(|entry| entry.ok().map(|e| e.path()))
+            .collect();
+        if kind == "lease" {
+            paths.sort();
+        }
+        for path in paths {
+            let Ok(mut file) = File::open(&path) else {
+                continue;
+            };
+            let mut bytes = Vec::new();
+            if std::io::Read::read_to_end(&mut file, &mut bytes).is_err() {
+                continue;
+            }
+            #[cfg(test)]
+            tests::snapshot_after_read(&path);
+            let age_secs = file
+                .metadata()
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.elapsed().ok())
+                .map(|d| d.as_secs());
+            let record = if kind == "lease" {
+                serde_json::from_slice::<Lease>(&bytes).ok().map(|l| {
+                    (
+                        l.resources(),
+                        l.name,
+                        l.mode_key,
+                        l.build_id,
+                        l.domain,
+                        l.weight,
+                        l.bytes_per_permit,
+                        None,
+                        None,
+                    )
+                })
+            } else {
+                serde_json::from_slice::<Waiting>(&bytes).ok().map(|w| {
+                    (
+                        w.resources(),
+                        w.name,
+                        w.mode_key,
+                        w.build.map(|(id, _)| id),
+                        Some(w.domain),
+                        w.weight,
+                        w.bytes_per_permit,
+                        w.pid,
+                        Some(w.ticket),
+                    )
+                })
+            };
+            if let Some((resources, name, mode, build, domain, weight, unit, pid, ticket)) = record
+            {
+                let live = if kind == "waiter" {
+                    match std::fs::symlink_metadata(&path) {
+                        Ok(_) => waiter_is_live(&file)
+                            .inspect_err(|error| {
+                                debug!(
+                                    "failed to probe scheduler waiter {}: {error}",
+                                    path.display()
+                                );
+                            })
+                            .ok(),
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                        Err(error) => {
+                            debug!(
+                                "failed to inspect scheduler waiter {}: {error}",
+                                path.display()
+                            );
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+                let unknown = || "unknown".to_owned();
+                activity.push(SchedulerActivity {
+                    kind,
+                    name: name.unwrap_or_else(unknown),
+                    mode_key: mode.unwrap_or_else(unknown),
+                    build_id: build.unwrap_or_else(unknown),
+                    pressure_domain: domain.unwrap_or_else(unknown),
+                    charged_permits: weight,
+                    charged_cpu: resources.cpu,
+                    charged_memory_bytes: resources.memory_bytes,
+                    charged_bytes: weight.saturating_mul(unit),
+                    age_secs,
+                    pid,
+                    ticket,
+                    queue_position: None,
+                    live,
+                });
+            }
+        }
+        if kind == "waiter" {
+            let waiting = &mut activity[first_activity..];
+            waiting.sort_unstable_by_key(|row| row.ticket);
+            let mut position = 0;
+            for row in waiting {
+                if row.live == Some(true) {
+                    position += 1;
+                    row.queue_position = Some(position);
+                }
+            }
+        }
+    }
+    activity
 }
 
 #[cfg(test)]

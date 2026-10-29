@@ -152,6 +152,41 @@ key, build ID, pressure domain, age, and the charge it was really admitted or
 queued with. Older records show unknown names; abandoned records can remain
 visible until an admission reclaims them.
 
+For repeated admission observation, use the lightweight activity-only projection:
+
+```sh
+mbx stats --scheduler --json --activity
+```
+
+Its version 2 JSON contains only `version` and `scheduler.activity`, using the
+same activity scan as the full report. It does not collect store, target or
+sharing statistics, or read the memory ledger, accuracy observations or decision
+histories. `--activity` requires both `--scheduler` and `--json`; other
+combinations are usage errors. Full statistics keep their version 1 format.
+In `mbx stats --scheduler --json`, each `scheduler.activity` row also includes
+`pid`, `ticket`, `queue_position`, and `live`. A waiter exposes its recorded
+process ID and ticket; the PID is recorded even with `events = false`.
+`queue_position` is its 1-based position in ticket order among live pending
+waiters, not filename order. Abandoned waiters have `live: false` and a null
+position; a lock-probe failure gives `live: null` and a null position. Legacy
+waiters without a recorded PID expose `pid: null`; their ticket is still shown.
+Leases expose all four fields as null rather than reconstructing identity from
+filenames. A waiter rewritten as a lease before being moved out of the queue
+is no longer pending and is omitted from the waiter snapshot.
+
+Publishers take their record's exclusive lifetime lock while the newly created
+file is still empty, then write the record without releasing that lock. Empty
+or incomplete records are not activity rows, so observing a new record cannot
+interfere with its publisher acquiring ownership.
+The snapshot reads and probes each waiter through one read-only file descriptor,
+without waiting, creating, truncating or reclaiming records; lease locks are
+never taken. A successful probe briefly takes a shared lock on an abandoned
+waiter and releases it when the file closes. A waiter whose queue path disappears
+during inspection is omitted: admission or release is not an inspection failure.
+Other inspection failures expose a null live status. The snapshot is not atomic
+with admission or release, and `age_secs` is the opened file's modification age,
+not a cumulative queue duration.
+
 With memory weighting enabled, completed admitted compiles, links, test binaries,
 and nextest tests append estimate-accuracy observations to
 `<cache_dir>/scheduler/observations.jsonl`. The existing `events` setting gates
@@ -199,8 +234,8 @@ logging it. Logging errors and rotation can also lose events. In an abandoned
 event, `waited_ms` is the age of the last queue stint, which a gate requeue
 resets; `first_arrival_ms` gives the request's total age, and `mbx stats` uses it
 to list abandoned waits over 15 minutes. With `events =
-false`, admission does no decision-log work; the only remaining cost is emptying
-the waiter file on release.
+false`, admission does no decision-log work. Queue records still retain their
+process ID for activity snapshots and are emptied on release.
 
 Transitions are under 1 KiB; admission records fit within 4 KiB including the
 newline and retain at most 16 overtaken waiters, oldest first. The total and
@@ -485,6 +520,14 @@ mbx closes it after `r`, so end of file without a `g` means mbx exited before
 it got capacity. A reservation nested in another is granted at once. mbx
 refuses a `--grant-fd` it cannot write to before it reserves anything, and runs
 the command only once `g` is written.
+
+A supervisor can also identify a queued request through the public activity
+snapshot above. Positive queue evidence requires `kind: "waiter"`, `live: true`,
+a recorded PID and ticket, and a positive `queue_position`. It must corroborate
+the PID against its own task's live process group or descendants, never match a
+name or infer queueing from silence. An abandoned row, a lease, an unavailable
+probe or missing PID is not evidence of admission waiting. Recheck the snapshot
+as work is admitted; the grant descriptor remains the capacity-hold signal.
 
 A holder killed by a signal writes no `r`. Its supervisor then counts a hold
 that never ends, and its clock keeps running as it would without a grant

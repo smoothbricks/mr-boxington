@@ -510,6 +510,8 @@ fn counts_text(counts: &BTreeMap<String, u64>) -> String {
 
 impl Summary {
     pub(super) fn read(dir: &Path) -> Self {
+        #[cfg(test)]
+        REPORT_SUMMARY_READS.with(|reads| reads.set(reads.get() + 1));
         let mut summary = Self::default();
         for filename in [PREVIOUS, FILE] {
             let Ok(file) = File::open(dir.join(filename)) else {
