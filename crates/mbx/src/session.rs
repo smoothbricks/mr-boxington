@@ -128,6 +128,18 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 #[cfg(unix)]
 static SHIM_STAGING_NONCE: AtomicU64 = AtomicU64::new(0);
 
+/// Create a private session under `MBX_SESSION_ROOT`, or the system temp directory.
+///
+/// A sandbox can supply its existing short runtime alias when `TMPDIR` leaves
+/// no room for a Unix socket. Keep that alias as spelled, not canonicalized.
+pub(crate) fn temporary_directory() -> std::io::Result<tempfile::TempDir> {
+    let mut builder = tempfile::Builder::new();
+    builder.prefix("mbx-session-");
+    match std::env::var_os("MBX_SESSION_ROOT").filter(|root| !root.is_empty()) {
+        Some(root) => builder.tempdir_in(root),
+        None => builder.tempdir(),
+    }
+}
 /// Encode only the resolved retention input the compiler shim needs. The
 /// share form is resolved against the disk being checked, so it cannot be
 /// turned into one byte value while the Cargo session is starting.
