@@ -184,7 +184,8 @@ waiters with exception reasons or the actual CPU/memory slack bounds (legacy
 scalar checks include their permit size). Events are collected while admission
 is locked, then encoded and appended after the registrar is released. Concurrent
 writers can therefore append events in a different order from their decisions;
-use their timestamps and tickets to follow a request.
+use their timestamps and tickets to follow a request. An admission granted to a
+waiting request by another process names that process in `granted_by`.
 
 A waiter that releases its place empties its waiter file before unlocking it, so
 a scan skips it instead of reporting it as abandoned. An abandoned event therefore
@@ -234,6 +235,15 @@ waits on its own build or container limit, the existing rule already lets
 other builds or containers start, which can rarely delay the waiting request
 after a pass. Cancelling a waiter or killing its process releases its queue
 position.
+
+Each admission attempt serves the whole queue. Whichever process takes the
+pool's lock admits, in queue order, every waiting request these rules admit,
+not only its own, and each waiter finds its grant on its next poll. A request
+therefore never waits for free room behind an older request that fits; it waits
+only for capacity, or behind an older request that does not fit yet. Requests
+from another container are left to that container's processes, since each
+container measures its own memory pressure, and a waiter from an older mbx
+keeps admitting only itself.
 
 Cache hits do not need compiler permits. If a process dies, the kernel
 releases its permits. For the weighting and recovery details, see
