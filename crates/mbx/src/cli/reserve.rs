@@ -2,6 +2,7 @@
 
 use super::cargo::exit_code;
 use crate::config::{Config, SchedulerPriority};
+use crate::scheduler::grant::Descriptor;
 use crate::scheduler::{Pool, SCHED_DISABLE_ENV};
 use bytesize::ByteSize;
 use eyre::{Result, WrapErr};
@@ -22,6 +23,17 @@ pub(super) struct ReserveArgs {
     /// Whether this reservation yields capacity to normal-priority builds.
     #[usage(long, default = "normal")]
     priority: SchedulerPriority,
+    /// Descriptor to announce the reservation on: one byte, `g`, once
+    /// capacity is granted, and `r` once it is released after the command.
+    ///
+    /// mbx closes the descriptor after `r`, and the command never inherits
+    /// it, so a reader sees end of file after `r`, or with no `g` when mbx
+    /// exited before capacity was granted. The command starts only once `g`
+    /// is written. A reservation nested in another is granted at once. For
+    /// this reservation, the descriptor takes the place of an inherited
+    /// `MBX_GRANT_FD`.
+    #[usage(long, value_name = "FD")]
+    grant_fd: Option<i32>,
     /// Command and arguments to run while capacity is reserved.
     #[usage(value_name = "COMMAND", required = true, double_dash = "automatic")]
     pub(super) command: Vec<String>,
@@ -52,17 +64,19 @@ pub(super) fn route(enclosing: Option<&OsStr>, worker: Option<&OsStr>) -> Route 
 }
 
 pub(super) fn run(config: &Config, args: ReserveArgs) -> Result<ExitCode> {
+    // Refused before any capacity is reserved, whichever route runs.
+    let grant = args.grant_fd.map(Descriptor::claim).transpose()?;
     match route(
         std::env::var_os(SCHED_DISABLE_ENV).as_deref(),
         std::env::var_os(WORKER_ENV).as_deref(),
     ) {
-        Route::Spawn => spawn_worker(&args),
-        Route::Reserve => run_direct(config, &args),
-        Route::Enclosed => run_enclosed(config, &args),
+        Route::Spawn => spawn_worker(&args, grant),
+        Route::Reserve => run_direct(config, &args, grant),
+        Route::Enclosed => run_enclosed(config, &args, grant),
     }
 }
 
-fn spawn_worker(args: &ReserveArgs) -> Result<ExitCode> {
+fn spawn_worker(args: &ReserveArgs, grant: Option<Descriptor>) -> Result<ExitCode> {
     let mut worker = Command::new(std::env::current_exe()?);
     worker.arg("reserve");
     if let Some(cpus) = args.cpus {
@@ -71,35 +85,62 @@ fn spawn_worker(args: &ReserveArgs) -> Result<ExitCode> {
     if let Some(memory) = args.memory {
         worker.args(["--memory", &format!("{}B", memory.as_u64())]);
     }
+    // The worker inherits the descriptor and announces on it.
+    if let Some(fd) = args.grant_fd {
+        worker.args(["--grant-fd", &fd.to_string()]);
+    }
     worker.args(["--priority", args.priority.as_str(), "--"]);
     worker.args(&args.command);
     worker.env(WORKER_ENV, "1");
+    let mut worker = worker.spawn().wrap_err("failed to start reserve worker")?;
+    // Only the worker holds the descriptor now, so its reader sees end of
+    // file once the worker exits.
+    drop(grant);
     Ok(exit_code(
-        worker.status().wrap_err("failed to start reserve worker")?,
+        worker
+            .wait()
+            .wrap_err("failed to wait for reserve worker")?,
     ))
 }
 
-fn run_direct(config: &Config, args: &ReserveArgs) -> Result<ExitCode> {
+fn run_direct(config: &Config, args: &ReserveArgs, grant: Option<Descriptor>) -> Result<ExitCode> {
     let (program, arguments, pool) = reservation(config, args)?;
-    let (permit, admission) =
+    let (mut permit, admission) =
         pool.reserve_observed(args.cpus, args.memory.map(|memory| memory.as_u64()))?;
-    let status = external_command(program, arguments)
-        // Nested mbx work is covered by this reservation. Letting its compiler
-        // shims take new permits would deadlock when this lease fills the pool.
-        .status()
-        .wrap_err_with(|| format!("failed to run {program}"));
+    if grant.is_none() {
+        // Without --grant-fd, an inherited grant descriptor hears of this hold.
+        permit.announce();
+    }
+    // The hold on --grant-fd ends, announcing its release, once the command has.
+    let status = grant
+        .map(Descriptor::granted)
+        .transpose()
+        .and_then(|_hold| {
+            external_command(program, arguments)
+                // Nested mbx work is covered by this reservation. Letting its compiler
+                // shims take new permits would deadlock when this lease fills the pool.
+                .status()
+                .wrap_err_with(|| format!("failed to run {program}"))
+        });
     drop(permit);
     pool.observe_reservation(admission, status.as_ref().ok());
     let status = status?;
     Ok(exit_code(status))
 }
 
-fn run_enclosed(config: &Config, args: &ReserveArgs) -> Result<ExitCode> {
+fn run_enclosed(
+    config: &Config,
+    args: &ReserveArgs,
+    grant: Option<Descriptor>,
+) -> Result<ExitCode> {
     let (program, arguments, pool) = reservation(config, args)?;
     // The refusals of a reservation of its own: nesting never turns a
     // malformed request into a silently accepted one.
     pool.reservation_weight(args.cpus, args.memory.map(|memory| memory.as_u64()))?;
     log::debug!("an enclosing reservation covers {program}; it runs under that grant");
+    // That grant covers the command already, so --grant-fd hears of it now,
+    // and of its release once the command has run.
+    let _hold = grant.map(Descriptor::granted).transpose()?;
     let status = external_command(program, arguments)
         .status()
         .wrap_err_with(|| format!("failed to run {program}"))?;

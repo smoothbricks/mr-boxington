@@ -9,6 +9,7 @@ mod unix {
     use sha2::{Digest, Sha256};
     use std::collections::BTreeMap;
     use std::fs::{self, File};
+    use std::io::Read;
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::process::CommandExt;
@@ -172,6 +173,18 @@ mod unix {
         }
     }
 
+    /// `mbx reserve` with scheduling on, from a pool of `pool_cpus` cores and
+    /// no memory budget; the caller adds its options and command.
+    fn reserve(root: &Path, cache: &Path, pool_cpus: &str) -> Command {
+        let mut command = mbx(root);
+        command
+            .env("MBX_CACHE_DIR", cache)
+            .env("MBX_SCHEDULER", "1")
+            .env("MBX_SCHEDULER_CPUS", pool_cpus)
+            .env("MBX_SCHEDULER_MEMORY", "none")
+            .arg("reserve");
+        command
+    }
     struct Reservation {
         child: Option<Child>,
         release: PathBuf,
@@ -182,14 +195,9 @@ mod unix {
             let ready = root.join(format!("{name}.ready"));
             let release = root.join(format!("{name}.release"));
             let cpus = cpus.to_string();
-            let mut command = mbx(root);
+            let mut command = reserve(root, cache, &cpus);
             command
-                .env("MBX_CACHE_DIR", cache)
-                .env("MBX_SCHEDULER", "1")
-                .env("MBX_SCHEDULER_CPUS", &cpus)
-                .env("MBX_SCHEDULER_MEMORY", "none")
                 .args([
-                    "reserve",
                     "--cpus",
                     &cpus,
                     "--",
@@ -300,13 +308,9 @@ mod unix {
         let cache = temp.path().join("cache");
         // The enclosing reservation holds the whole pool, as a leaf reserving
         // its job's cores does; the command it runs reserves again.
-        let mut command = mbx(temp.path());
+        let mut command = reserve(temp.path(), &cache, "2");
         command
-            .env("MBX_CACHE_DIR", &cache)
-            .env("MBX_SCHEDULER", "1")
-            .env("MBX_SCHEDULER_CPUS", "2")
-            .env("MBX_SCHEDULER_MEMORY", "none")
-            .args(["reserve", "--cpus", "2", "--"])
+            .args(["--cpus", "2", "--"])
             .arg(env!("CARGO_BIN_EXE_mbx"))
             .args(["reserve", "--cpus", "1", "--priority", "low", "--"])
             .args(["sh", "-c", "exit 7"])
@@ -333,6 +337,273 @@ mod unix {
         );
         // The enclosing reserve exits only after its worker released its lease.
         assert_eq!(locked_lease_files(&cache), Vec::<PathBuf>::new());
+    }
+
+    /// The descriptor the grant tests name with `--grant-fd 5`, as Nx's
+    /// bounded-exec executor does.
+    const GRANT_FD: i32 = 5;
+
+    /// Run by a reserved command: reports whether descriptor 5 reached it.
+    const REPORT_GRANT_FD: &str =
+        "if { true >&5; } 2>/dev/null; then echo inherited; else echo closed; fi";
+
+    /// Give `command` the write end of a fresh pipe as [`GRANT_FD`]. Returns
+    /// the read end and the test's own write end, which the caller drops once
+    /// the command has started, so that end of file means the command tree
+    /// closed every copy.
+    fn grant_pipe(command: &mut Command) -> (std::io::PipeReader, std::io::PipeWriter) {
+        let (reader, writer) = std::io::pipe().unwrap();
+        let source = writer.as_raw_fd();
+        // SAFETY: the hook runs between fork and exec and calls only fcntl and
+        // dup2, which are async-signal-safe.
+        unsafe {
+            command.pre_exec(move || {
+                // dup2 onto its own number would leave close-on-exec set.
+                let placed = if source == GRANT_FD {
+                    libc::fcntl(GRANT_FD, libc::F_SETFD, 0)
+                } else {
+                    libc::dup2(source, GRANT_FD)
+                };
+                if placed == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        (reader, writer)
+    }
+
+    /// Run `command` with the grant pipe as both [`GRANT_FD`] and standard
+    /// output, and return what the pipe carried: one pipe orders the grant
+    /// byte against the command's own output.
+    fn grant_and_output(mut command: Command) -> String {
+        let (mut reader, writer) = grant_pipe(&mut command);
+        command.stdout(writer.try_clone().unwrap());
+        let mut child = command.spawn().unwrap();
+        // Only the command tree's copies of the write end remain.
+        drop(command);
+        drop(writer);
+        let status = wait_child(&mut child, Duration::from_secs(20));
+        let mut output = String::new();
+        reader.read_to_string(&mut output).unwrap();
+        assert!(status.success(), "reserve exited with {status}: {output:?}");
+        output
+    }
+
+    /// Wait until a request queues in the scheduler: its waiter record exists.
+    fn wait_for_queued_request(cache: &Path) {
+        let waiters = cache.join("scheduler/waiters");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if fs::read_dir(&waiters).is_ok_and(|mut entries| entries.next().is_some()) {
+                return;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        panic!("no request queued in {} within 5s", waiters.display());
+    }
+
+    /// Read the grant pipe one byte at a time on its own thread: each byte
+    /// arrives as `Some`, and end of file as `None`.
+    fn grant_events(mut reader: std::io::PipeReader) -> std::sync::mpsc::Receiver<Option<u8>> {
+        let (events, received) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let mut byte = [0; 1];
+            while reader.read(&mut byte).unwrap() == 1 {
+                if events.send(Some(byte[0])).is_err() {
+                    return;
+                }
+            }
+            // The test may have stopped listening.
+            let _ = events.send(None);
+        });
+        received
+    }
+
+    #[test]
+    fn a_reservation_announces_its_grant_and_release_around_its_command() {
+        // --grant-fd takes the place of an inherited descriptor, even the same one.
+        for inherited in [None, Some("5")] {
+            let temp = tempfile::tempdir().unwrap();
+            let mut command = reserve(temp.path(), &temp.path().join("cache"), "2");
+            if let Some(fd) = inherited {
+                command.env("MBX_GRANT_FD", fd);
+            }
+            command
+                .args([
+                    "--cpus",
+                    "1",
+                    "--grant-fd",
+                    "5",
+                    "--",
+                    "sh",
+                    "-c",
+                    REPORT_GRANT_FD,
+                ])
+                .stderr(Stdio::null());
+            // One grant ahead of the command's output and one release after
+            // it; the command never holds the descriptor.
+            assert_eq!(
+                grant_and_output(command),
+                "gclosed\nr",
+                "MBX_GRANT_FD {inherited:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_queued_reservation_announces_its_grant_only_once_capacity_frees() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = temp.path().join("cache");
+        let mut holder = Reservation::start(temp.path(), &cache, 1, "holder");
+        let mut command = reserve(temp.path(), &cache, "1");
+        command
+            .args(["--cpus", "1", "--grant-fd", "5", "--", "cat"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let (reader, writer) = grant_pipe(&mut command);
+        let mut child = command.spawn().unwrap();
+        drop(command);
+        drop(writer);
+        // The command runs until its input closes, also when an assertion fails.
+        let input = child.stdin.take();
+        let received = grant_events(reader);
+        let quiet = Duration::from_millis(500);
+        wait_for_queued_request(&cache);
+        assert_eq!(
+            received.recv_timeout(quiet),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout),
+            "the grant was announced while another reservation held the pool"
+        );
+        holder.release();
+        assert_eq!(
+            received.recv_timeout(Duration::from_secs(5)),
+            Ok(Some(b'g'))
+        );
+        // Held while the command runs: no release yet.
+        assert_eq!(
+            received.recv_timeout(quiet),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout),
+            "the hold ended before its command did"
+        );
+        drop(input);
+        assert_eq!(
+            received.recv_timeout(Duration::from_secs(5)),
+            Ok(Some(b'r'))
+        );
+        assert_eq!(received.recv_timeout(Duration::from_secs(5)), Ok(None));
+        let status = wait_child(&mut child, Duration::from_secs(5));
+        assert!(status.success(), "reserve exited with {status}");
+    }
+
+    #[test]
+    fn a_reservation_nested_in_another_announces_its_grant_at_once() {
+        let temp = tempfile::tempdir().unwrap();
+        // The enclosing reservation holds the whole pool and passes the
+        // descriptor through; the nested one runs under its grant at once.
+        let mut command = reserve(temp.path(), &temp.path().join("cache"), "2");
+        command
+            .args(["--cpus", "2", "--"])
+            .arg(env!("CARGO_BIN_EXE_mbx"))
+            .args(["reserve", "--cpus", "1", "--grant-fd", "5", "--"])
+            .args(["sh", "-c", REPORT_GRANT_FD])
+            .stderr(Stdio::null());
+        assert_eq!(grant_and_output(command), "gclosed\nr");
+    }
+
+    #[test]
+    fn a_reservation_announces_on_an_inherited_grant_descriptor() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut command = reserve(temp.path(), &temp.path().join("cache"), "2");
+        command
+            .env("MBX_GRANT_FD", "5")
+            .args(["--cpus", "1", "--", "sh", "-c", REPORT_GRANT_FD])
+            .stderr(Stdio::null());
+        // The command inherits the descriptor, as every process in the tree does.
+        assert_eq!(grant_and_output(command), "ginherited\nr");
+    }
+
+    #[test]
+    fn each_nextest_test_announces_its_admission_on_an_inherited_grant_descriptor() {
+        if !nextest_available() {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("fixture");
+        fs::create_dir_all(&root).unwrap();
+        let cache = temp.path().join("shared-cache");
+        project(
+            &root,
+            "grant-inherited",
+            "#[test] fn first() {}\n#[test] fn second() {}\n",
+        );
+        prepare_nextest(&root, &cache);
+        // The whole pool is held, so each test's runner queues first.
+        let mut holder = Reservation::start(temp.path(), &cache, 2, "holder");
+        // mbx, then cargo, cargo-nextest and one mbx test runner per test:
+        // each inherits the descriptor and the variable naming it.
+        let mut run = nextest(&root, &cache);
+        run.env("MBX_GRANT_FD", "5").args(["run", "--offline"]);
+        let (reader, writer) = grant_pipe(&mut run);
+        let running = LoggedChild::spawn(&mut run, temp.path(), "granted-run");
+        drop(run);
+        drop(writer);
+        let received = grant_events(reader);
+        wait_for_queued_request(&cache);
+        assert_eq!(
+            received.recv_timeout(Duration::from_millis(500)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout),
+            "a queued test announced a grant"
+        );
+        holder.release();
+        let (status, output) = running.wait(Duration::from_secs(20));
+        assert!(status.success(), "{output}");
+        // Every byte, until end of file or a quiet pipe.
+        let announced: Vec<u8> =
+            std::iter::from_fn(|| received.recv_timeout(Duration::from_secs(2)).ok().flatten())
+                .collect();
+        let shown = String::from_utf8_lossy(&announced);
+        let mut held = 0_i32;
+        for byte in &announced {
+            held += match byte {
+                b'g' => 1,
+                b'r' => -1,
+                _ => panic!("not a grant event in {shown:?}"),
+            };
+            assert!(held >= 0, "a release before its grant in {shown:?}");
+        }
+        assert_eq!(held, 0, "a grant never released in {shown:?}");
+        assert_eq!(
+            announced.len(),
+            4,
+            "one grant and one release per test: {shown:?}"
+        );
+    }
+
+    #[test]
+    fn a_grant_descriptor_that_is_not_open_is_refused_before_reserving() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = temp.path().join("cache");
+        let mut command = reserve(temp.path(), &cache, "1");
+        command.args(["--cpus", "1", "--grant-fd", "5", "--", "echo", "ran"]);
+        // SAFETY: the hook runs between fork and exec and calls only close,
+        // which is async-signal-safe; descriptor 5 need not be open.
+        unsafe {
+            command.pre_exec(|| {
+                libc::close(GRANT_FD);
+                Ok(())
+            });
+        }
+        let output = command.output().unwrap();
+        let text = output_text(&output);
+        assert!(!output.status.success(), "{text}");
+        assert!(output.stdout.is_empty(), "{text}");
+        assert!(
+            text.contains("--grant-fd 5 is not an open file descriptor"),
+            "{text}"
+        );
+        assert_eq!(lease_files(&cache), Vec::<PathBuf>::new());
     }
 
     #[test]
