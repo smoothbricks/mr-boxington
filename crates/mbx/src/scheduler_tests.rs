@@ -4903,6 +4903,8 @@ fn pass_record(ticket: u64, cpu: u64, memory_bytes: u64, handoff: bool) -> Waiti
     record.global_capacity = Some(PASS_BUDGET.cpu);
     record.cpu_cap = Some(PASS_BUDGET.cpu);
     record.mem_cap = Some(PASS_BUDGET.memory_bytes);
+    record.domain_cpu_cap = Some(PASS_BUDGET.cpu);
+    record.domain_memory_cap = Some(PASS_BUDGET.memory_bytes);
     record.handoff = handoff.then_some(Handoff {
         budget: PASS_BUDGET,
         gate: None,
@@ -5528,4 +5530,57 @@ fn the_recorded_wedge_replays_without_idle_capacity_behind_queued_work() {
         (0, 0),
         "a replayed request waited with room for it and nothing older short of room"
     );
+}
+
+/// A lease outside the request's build, so only the shared scopes see it.
+fn shared_lease(cpu: u64, memory_bytes: u64) -> Lease {
+    let mut record = pass_record(0, cpu, memory_bytes, true);
+    record.build = None;
+    Lease::from(&record)
+}
+
+#[test]
+fn an_older_request_short_of_memory_leaves_the_cores_its_start_will_free() {
+    let mib = 1 << 20;
+    let cases = [
+        (
+            "a one-core test passes an older test waiting for memory: what frees that memory frees cores",
+            vec![shared_lease(1, 6 * GIB); 17],
+            pass_record(1, 1, 13 * GIB, true),
+            pass_record(2, 1, 64 * mib, true),
+            AdmissionDecision::Passing,
+        ),
+        (
+            "a memory-only lease can free that memory alone, freeing no core",
+            [
+                vec![shared_lease(1, 5 * GIB); 17],
+                vec![shared_lease(0, 13 * GIB)],
+            ]
+            .concat(),
+            pass_record(1, 1, 13 * GIB, true),
+            pass_record(2, 1, 64 * mib, true),
+            AdmissionDecision::Waiting,
+        ),
+        (
+            "an older request short of cores, not memory, keeps the free core",
+            vec![shared_lease(1, GIB); 17],
+            pass_record(1, 2, GIB, true),
+            pass_record(2, 1, 64 * mib, true),
+            AdmissionDecision::Waiting,
+        ),
+        (
+            "memory-only work passes an older request waiting for a core: that core frees memory",
+            vec![shared_lease(1, 6 * GIB); 17],
+            pass_record(1, 2, 6 * GIB, true),
+            pass_record(2, 0, GIB, true),
+            AdmissionDecision::Passing,
+        ),
+    ];
+    for (name, live, older, newer, expected) in cases {
+        assert_eq!(
+            admission_decision(PASS_BUDGET.cpu, &live, [&older].into_iter(), &newer),
+            expected,
+            "{name}"
+        );
+    }
 }
