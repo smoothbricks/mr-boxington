@@ -266,6 +266,11 @@ read. The same profile below each target triple the other checkout built is
 copied too, so a target chosen in Cargo configuration is covered. Copies are
 reflinks where the filesystem supports them.
 
+The pinned mbx binaries that copied build-script launchers use are published
+before any build unit. If copying those binaries fails or is interrupted,
+Cargo never sees a fresh copied unit without its launcher dependency. A later
+build can resume the copy, retaining any pinned binaries already present.
+
 `check` and `clippy` in their [check lane](#check-lanes), and editor checks
 under `target/rust-analyzer`, are seeded the same way from that directory in
 the other checkout. The first `cargo check` in a new worktree then checks only
