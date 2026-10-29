@@ -646,11 +646,15 @@ impl Launch {
         environment.insert("PATH".into(), path.to_string_lossy().into_owned());
         environment.insert(self.runner_key.clone(), SHIM.into());
         environment.insert(CAPTURE.into(), self.capture.to_string_lossy().into_owned());
-        // Without a resolvable Cargo the launch still runs; a shim then just
-        // starts a fresh scope, as before the handoff existed.
+        // Only a Cargo that is mbx again consumes the handoff; real Cargo
+        // would pass it on to build scripts. Selection passes over the shims
+        // mbx recognizes, so this is mbx reached under Cargo's name. Without
+        // a resolvable Cargo the launch still runs; a shim then just starts a
+        // fresh scope, as before the handoff existed.
         if let Some(cargo) = which::which(cargo)
             .ok()
             .and_then(|path| path.canonicalize().ok())
+            .filter(|cargo| super::shim::starts_mbx(cargo))
         {
             environment.insert(
                 FORWARD.into(),

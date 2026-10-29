@@ -323,9 +323,13 @@ fn main() {
     );
 }
 
+/// Real-Cargo selection passes over an mbx shim (docs/setup.md, "Verify plain
+/// Cargo"), so `mbx run` starts the real Cargo itself even with a shim-mode
+/// `cargo` first on PATH, and the build runs in the run's session: build
+/// scripts see its socket and lease, and the shim never runs.
 #[cfg(unix)]
 #[test]
-fn cargo_run_through_a_cargo_shim_keeps_the_build_session() {
+fn mbx_run_passes_over_a_cargo_shim_and_builds_in_its_session() {
     use std::os::unix::fs::PermissionsExt;
     let root = tempfile::tempdir().unwrap();
     project(
@@ -346,8 +350,8 @@ fn main() {
         root.path().join("build.rs"),
         r#"
 fn main() {
-    assert_eq!(std::env::var("MBX_SOCKET").unwrap(), std::env::var("EXPECTED_SOCKET").unwrap());
-    assert_eq!(std::env::var("MBX_SESSION_LEASE").unwrap(), std::env::var("EXPECTED_LEASE").unwrap());
+    assert!(std::env::var_os("MBX_SOCKET").is_some());
+    assert!(std::env::var_os("MBX_SESSION_LEASE").is_some());
     assert!(std::env::var_os("MBX_SESSION_RESTORE").is_some());
     assert!(std::env::var_os("MBX_LAUNCH_FORWARD").is_none());
 }
@@ -357,9 +361,13 @@ fn main() {
     let bin = root.path().join("bin");
     std::fs::create_dir(&bin).unwrap();
     let shim = bin.join("cargo");
+    let ran = root.path().join("shim-ran");
     std::fs::write(
         &shim,
-        "#!/bin/sh\nexport EXPECTED_SOCKET=\"$MBX_SOCKET\" EXPECTED_LEASE=\"$MBX_SESSION_LEASE\"\nexport MBX_CARGO_SHIM_MODE=1 MBX_CARGO_SHIM_PATH=\"$0\"\nexec \"$TEST_MBX\" \"$@\"\n",
+        format!(
+            "#!/bin/sh\n: > '{}'\nexport MBX_CARGO_SHIM_MODE=1 MBX_CARGO_SHIM_PATH=\"$0\"\nexec \"$TEST_MBX\" \"$@\"\n",
+            ran.display()
+        ),
     )
     .unwrap();
     std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -385,6 +393,7 @@ fn main() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+    assert!(!ran.exists(), "mbx run selected the shim as real Cargo");
 }
 
 #[cfg(unix)]
