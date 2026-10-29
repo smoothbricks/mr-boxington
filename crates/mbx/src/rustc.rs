@@ -350,7 +350,7 @@ pub(crate) fn compile(
             &outputs,
             &discovered,
             !verify,
-            &portable.mappings,
+            portable.mappings(),
         ) {
             Ok(Some((action, mut cached))) => {
                 match refresh_prediction(&compilation, &action, &discovered) {
@@ -924,7 +924,7 @@ pub(crate) fn compile(
                     let action = if private_outputs {
                         &candidates.literal
                     } else {
-                        publish_result(&candidates, &outputs, &output, &portable.mappings)?
+                        publish_result(&candidates, &outputs, &output, portable.mappings())?
                     };
                     install_build_script_shim(&invocation, &outputs, &action.digest);
                     // The flight prediction is only left behind a *published* result:
@@ -1141,7 +1141,7 @@ fn validate_compiler_inputs(
     let discovered = invocation.discover_inputs_with_mappings(
         &dep_info,
         working_dir,
-        &portable.mappings,
+        portable.mappings(),
         session::file_digest_cache(),
     )?;
     discovered.verify_not_modified_since_with_snapshots(compilation_started, input_snapshots)?;
@@ -1668,7 +1668,7 @@ fn incremental_seed_mode(
     };
     let mode = injection_for_invocation(
         seed_mode_for(
-            &identity.rustc_version,
+            &identity.identity.rustc_version,
             enabled,
             private,
             user_remap,
@@ -2203,7 +2203,7 @@ fn discover_for_churn(
     match compilation.invocation.discover_inputs_with_mappings(
         dep_info,
         compilation.working_dir,
-        &compilation.portable.mappings,
+        compilation.portable.mappings(),
         session::file_digest_cache(),
     ) {
         Err(BypassReason::UnsupportedSearchPath(_) | BypassReason::InputRead { .. }) => {
@@ -2445,7 +2445,7 @@ fn current_manifest_inputs(
         let discovered = compilation.invocation.discover_inputs_with_mappings(
             &dep_info,
             compilation.working_dir,
-            &compilation.portable.mappings,
+            compilation.portable.mappings(),
             session::file_digest_cache(),
         )?;
         let now = compilation.invocation.prediction(&context, &discovered)?;
@@ -2738,7 +2738,7 @@ fn restore_prediction_payload(
         outputs,
         &discovered,
         restore_outputs,
-        &portable.mappings,
+        portable.mappings(),
     )?;
     match restored {
         Some((action, mut cached)) => {
@@ -2833,7 +2833,7 @@ fn compilation_action_diagnostic(
     let source = normalize_mapped_path(
         compilation.invocation.source(),
         compilation.working_dir,
-        &PathMapping::ordered(&compilation.portable.mappings),
+        &PathMapping::ordered(compilation.portable.mappings()),
     )?;
     action_diagnostic(action, &source)
 }
@@ -2995,13 +2995,13 @@ fn action_from_parsed_dep_info(
         portable,
         ..
     } = compilation;
+    let mut context = base_action_context(compilation.rustc, working_dir, portable)?;
     let discovered = invocation.discover_inputs_with_mappings(
         dep_info,
         working_dir,
-        &portable.mappings,
+        portable.mappings(),
         session::file_digest_cache(),
     )?;
-    let mut context = base_action_context(compilation.rustc, working_dir, portable)?;
     discovered.clone().apply_to(&mut context)?;
     let candidates = ActionCandidates::build(invocation, context, compilation.linker.clone())?;
     Ok((candidates, discovered))
@@ -3017,9 +3017,9 @@ fn base_action_context(
     let _phase = crate::phase_timing::phase("key");
     let compiler = compiler_identity(rustc)?;
     let mut context = ActionContext {
-        compiler,
+        compiler: compiler.identity.clone(),
         working_dir: working_dir.to_path_buf(),
-        path_mappings: portable.mappings.clone(),
+        path_mappings: portable.key_mappings(&compiler).to_vec(),
         environment: compiler_environment(|name| std::env::var(name).ok()),
         portable_environment: BTreeSet::new(),
         inputs: Vec::new(),
@@ -3798,23 +3798,42 @@ fn validated_outputs(
     Ok(files)
 }
 
-fn compiler_identity(rustc: &OsStr) -> Result<CompilerIdentity> {
+#[derive(Clone)]
+struct SelectedCompiler {
+    identity: CompilerIdentity,
+    /// The selected compiler's physical default, never an invocation's override.
+    sysroot: Option<PathMapping>,
+}
+
+fn default_sysroot_mapping(root: PathBuf) -> Option<PathMapping> {
+    let text = root.to_str().filter(|_| root.is_absolute())?;
+    // Equal version text does not prove two installations have equal libraries.
+    // Like external native roots, an uncovered sysroot keeps its location identity.
+    let placeholder = format!("sysroot_{}", CacheDigest::blake3(text.as_bytes()).hash);
+    Some(PathMapping::new(root, placeholder))
+}
+
+fn compiler_identity(rustc: &OsStr) -> Result<Cow<'static, SelectedCompiler>> {
     let _phase = crate::phase_timing::phase("key");
     // One shim process serves one compiler, but several steps of one
     // compilation each build an action context. Asking the agent every time
     // turns one identity into several round trips per compilation.
-    static IDENTITY: OnceLock<(OsString, CompilerIdentity)> = OnceLock::new();
+    static IDENTITY: OnceLock<(OsString, SelectedCompiler)> = OnceLock::new();
     if let Some((known, identity)) = IDENTITY.get()
         && known.as_os_str() == rustc
     {
-        return Ok(identity.clone());
+        return Ok(Cow::Borrowed(identity));
     }
     let identity = query_compiler_identity(rustc)?;
-    let _ = IDENTITY.set((rustc.to_os_string(), identity.clone()));
-    Ok(identity)
+    match IDENTITY.set((rustc.to_os_string(), identity)) {
+        Ok(()) => Ok(Cow::Borrowed(
+            &IDENTITY.get().expect("compiler identity was initialized").1,
+        )),
+        Err((_, identity)) => Ok(Cow::Owned(identity)),
+    }
 }
 
-fn query_compiler_identity(rustc: &OsStr) -> Result<CompilerIdentity> {
+fn query_compiler_identity(rustc: &OsStr) -> Result<SelectedCompiler> {
     let executable = resolve_executable(rustc)?;
     let clippy = Path::new(rustc).file_stem() == Some(OsStr::new("clippy-driver"));
     let environment = ["RUSTUP_HOME", "RUSTUP_TOOLCHAIN"]
@@ -3829,9 +3848,10 @@ fn query_compiler_identity(rustc: &OsStr) -> Result<CompilerIdentity> {
         bail!("cache agent did not return the rustc identity");
     };
     let stdout = if let Some(stdout) = stdout.filter(|bytes| {
-        String::from_utf8_lossy(bytes)
-            .lines()
-            .any(|line| line.starts_with("mbx-remap-cwd-dot-v1: "))
+        let verbose = String::from_utf8_lossy(bytes);
+        ["mbx-remap-cwd-dot-v1: ", "mbx-default-sysroot-v1: "]
+            .into_iter()
+            .all(|prefix| verbose.lines().any(|line| line.starts_with(prefix)))
     }) {
         stdout
     } else {
@@ -3882,12 +3902,22 @@ fn query_compiler_identity(rustc: &OsStr) -> Result<CompilerIdentity> {
             stdout.extend_from_slice(output.stdout.trim_ascii());
             stdout.push(b'\n');
         }
-        let (backend_pins, backends) = codegen_backends(rustc, &host)?;
+        let sysroot = compiler_sysroot(rustc).and_then(|root| std::fs::canonicalize(root).ok());
+        let (backend_pins, backends) = codegen_backends(sysroot.as_deref(), &host)?;
         // An unpinned compiler is probed every session, so it stays unpinned.
         if !pins.is_empty() {
             pins.extend(backend_pins);
         }
         stdout.extend_from_slice(backends.as_bytes());
+        // Keep discovery beside the cached compiler identity, not in each action.
+        // This metadata is deliberately excluded from the version fields in the key.
+        stdout.extend_from_slice(
+            format!(
+                "\nmbx-default-sysroot-v1: {}\n",
+                serde_json::to_string(&sysroot)?
+            )
+            .as_bytes(),
+        );
         let responses = session::request_agent(&[AgentRequest::StoreExecutableIdentity {
             executable,
             environment,
@@ -3907,6 +3937,9 @@ fn query_compiler_identity(rustc: &OsStr) -> Result<CompilerIdentity> {
         .lines()
         .any(|line| line == "mbx-remap-cwd-dot-v1: true");
     let _ = REMAP_CWD_SUPPORTED.set((rustc.to_os_string(), supported));
+    let sysroot: Option<PathBuf> =
+        serde_json::from_str(identity_field(verbose, "mbx-default-sysroot-v1")?)
+            .wrap_err("rustc identity has an invalid default sysroot")?;
     let release = identity_field(verbose, "release")?;
     let host = identity_field(verbose, "host")?;
     let rustc_version = verbose
@@ -3927,15 +3960,18 @@ fn query_compiler_identity(rustc: &OsStr) -> Result<CompilerIdentity> {
         .ok()
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| release.to_string());
-    Ok(CompilerIdentity {
-        toolchain,
-        rustc_version,
-        host: host.to_string(),
-        driver: verbose
-            .lines()
-            .find_map(|line| line.strip_prefix("mbx-driver: "))
-            .filter(|value| !value.is_empty())
-            .map(str::to_string),
+    Ok(SelectedCompiler {
+        identity: CompilerIdentity {
+            toolchain,
+            rustc_version,
+            host: host.to_string(),
+            driver: verbose
+                .lines()
+                .find_map(|line| line.strip_prefix("mbx-driver: "))
+                .filter(|value| !value.is_empty())
+                .map(str::to_string),
+        },
+        sysroot: sysroot.and_then(default_sysroot_mapping),
     })
 }
 
@@ -3964,10 +4000,10 @@ fn compiler_identity_pins(executable: &Path) -> Vec<PinnedFile> {
 
 /// The backend libraries rustc loads by name from its host's directory in
 /// its sysroot, each pinned before it is hashed into the identity.
-fn codegen_backends(rustc: &OsStr, host: &str) -> Result<(Vec<PinnedFile>, String)> {
+fn codegen_backends(sysroot: Option<&Path>, host: &str) -> Result<(Vec<PinnedFile>, String)> {
     let mut pins = Vec::new();
     let mut identity = String::new();
-    let Some(sysroot) = compiler_sysroot(rustc) else {
+    let Some(sysroot) = sysroot else {
         return Ok((pins, identity));
     };
     let directory = sysroot
@@ -4068,6 +4104,9 @@ const PORTABLE_ENVIRONMENT: &[&str] = &["OUT_DIR"];
 struct Portable {
     /// Path mappings for this compilation, ordered as keys need them.
     mappings: Vec<PathMapping>,
+    /// Published only after a key path successfully resolves the selected compiler.
+    /// None retains the existing semantic mappings without allocating another vector.
+    compiler_mappings: OnceLock<Option<Vec<PathMapping>>>,
     /// Flags appended to the real rustc invocation, one per remapped value.
     arguments: Vec<OsString>,
     /// Cargo's invalidation inputs, captured before OUT_DIR is stabilized.
@@ -4075,6 +4114,27 @@ struct Portable {
 }
 
 impl Portable {
+    fn mappings(&self) -> &[PathMapping] {
+        self.compiler_mappings
+            .get()
+            .and_then(|mappings| mappings.as_deref())
+            .unwrap_or(&self.mappings)
+    }
+
+    fn key_mappings(&self, compiler: &SelectedCompiler) -> &[PathMapping] {
+        self.compiler_mappings.get_or_init(|| {
+            let sysroot = uncovered_default_sysroot(&self.mappings, compiler.sysroot.as_ref())?;
+            let depth = sysroot.root.components().count();
+            let index = self
+                .mappings
+                .partition_point(|mapping| mapping.root.components().count() >= depth);
+            let mut mappings = self.mappings.clone();
+            // Preserve the existing stable, deepest-first ordering without sorting again.
+            mappings.insert(index, sysroot.clone());
+            Some(mappings)
+        });
+        self.mappings()
+    }
     fn map_external_native_paths(&mut self, invocation: &RustcInvocation, working_dir: &Path) {
         for path in invocation.native_search_paths() {
             if normalize_mapped_path(path, working_dir, &self.mappings).is_ok() {
@@ -4099,7 +4159,13 @@ impl Portable {
 
     fn detect(working_dir: &Path, target_output: Option<&Path>, target: Option<&str>) -> Self {
         let mut portable = Self {
-            mappings: PathMapping::ordered(&path_mappings(working_dir, target_output, target)),
+            mappings: PathMapping::ordered(&path_mappings(
+                working_dir,
+                target_output,
+                target,
+                None,
+            )),
+            compiler_mappings: OnceLock::new(),
             arguments: Vec::new(),
             build_script_inputs: None,
         };
@@ -4177,8 +4243,9 @@ fn path_mappings(
     working_dir: &Path,
     target_output: Option<&Path>,
     target: Option<&str>,
+    sysroot: Option<&PathMapping>,
 ) -> Vec<PathMapping> {
-    path_mappings_with_env(working_dir, target_output, target, |name| {
+    path_mappings_with_env(working_dir, target_output, target, sysroot, |name| {
         std::env::var_os(name)
     })
 }
@@ -4188,6 +4255,7 @@ fn path_mappings_with_env(
     working_dir: &Path,
     target_output: Option<&Path>,
     target: Option<&str>,
+    sysroot: Option<&PathMapping>,
     environment: impl Fn(&str) -> Option<OsString>,
 ) -> Vec<PathMapping> {
     let mut mappings = Vec::new();
@@ -4320,7 +4388,33 @@ fn path_mappings_with_env(
     for root in home_roots {
         add_mapping(&mut mappings, &mut roots, root, "home");
     }
+    if let Some(sysroot) = uncovered_default_sysroot(&mappings, sysroot) {
+        mappings.push(sysroot.clone());
+    }
     mappings
+}
+
+fn uncovered_default_sysroot<'a>(
+    mappings: &[PathMapping],
+    sysroot: Option<&'a PathMapping>,
+) -> Option<&'a PathMapping> {
+    let sysroot = sysroot?;
+    if mappings
+        .iter()
+        .any(|mapping| sysroot.root.starts_with(&mapping.root))
+    {
+        return None;
+    }
+    // Existing semantic roots win, including a rustup/home alias of the
+    // physical installation. Do not churn their mappings or existing keys.
+    let existing = mappings
+        .iter()
+        .map(|mapping| mbx_cache_core::PathMapping::new(&mapping.root, &mapping.placeholder))
+        .collect::<Vec<_>>();
+    (!mbx_cache_core::resolve_path_mappings(&existing)
+        .iter()
+        .any(|mapping| sysroot.root.starts_with(&mapping.root)))
+    .then_some(sysroot)
 }
 
 /// Infer the profile subtree shared by rustc outputs and build-script output.

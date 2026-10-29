@@ -8,6 +8,7 @@ use mbx_cache_core::{
     FileDigestCache, FileDigestResolution, FileDigestScope, FileIdentity, FileSnapshot,
     RecordedFileDigest, digest_file, digest_file_validated,
 };
+use std::cell::OnceCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -523,39 +524,39 @@ impl RustcInvocation {
         // is a source unless a native search directory holds it: there it is a
         // library resolved from that directory, which belongs in a shared key
         // but is no more a source than the directory around it.
-        let sources = dep_info.files.iter().map(absolute).collect::<BTreeSet<_>>();
+        let mut sources = dep_info.files.iter().map(absolute).collect::<BTreeSet<_>>();
         let mut paths = sources.clone();
         paths.extend(self.required_inputs.iter().map(absolute));
         let admitted_roots = native_input_roots(&working_dir, path_mappings.unwrap_or_default());
         let mut native_bytes = 0_u64;
         let mut counted = BTreeSet::new();
+        let mut native_directories = Vec::new();
         for argument in &self.arguments {
-            if path_mappings.is_some()
-                && let Argument::SearchPath { kind, path } = argument
+            if let Argument::SearchPath { kind, path } = argument
                 && kind == "native"
             {
-                let directory = if path.is_absolute() {
-                    path.clone()
+                let directory = absolute(path);
+                let physical = if path_mappings.is_some() {
+                    collect_native_directory(
+                        &directory,
+                        &admitted_roots,
+                        &mut paths,
+                        &mut native_bytes,
+                        &mut counted,
+                    )?
                 } else {
-                    working_dir.join(path)
+                    // Source-only discovery must survive unmodeled native trees,
+                    // but an existing directory still uses the same source spelling.
+                    let physical = directory
+                        .canonicalize()
+                        .unwrap_or_else(|_| directory.clone());
+                    physicalize_native_paths(&mut paths, &directory, &physical);
+                    physical
                 };
-                collect_native_directory(
-                    &directory,
-                    &admitted_roots,
-                    &mut paths,
-                    &mut native_bytes,
-                    &mut counted,
-                )?;
+                physicalize_native_paths(&mut sources, &directory, &physical);
+                native_directories.push(physical);
             }
         }
-        let native_directories = self
-            .arguments
-            .iter()
-            .filter_map(|argument| match argument {
-                Argument::SearchPath { kind, path } if kind == "native" => Some(absolute(path)),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
         let native_only = paths
             .difference(&sources)
             .filter(|path| native_directories.iter().any(|root| path.starts_with(root)))
@@ -571,15 +572,46 @@ impl RustcInvocation {
     }
 }
 
+/// Admitted native roots and their request-local, lazily resolved aliases.
+pub(super) struct NativeInputRoots {
+    normalized: Vec<PathBuf>,
+    canonical: OnceCell<Vec<PathBuf>>,
+}
+
+impl NativeInputRoots {
+    fn admits(&self, directory: &Path) -> bool {
+        self.normalized
+            .iter()
+            .any(|root| directory.starts_with(root))
+    }
+
+    fn admits_resolved(&self, directory: &Path) -> bool {
+        self.admits(directory)
+            || self
+                .canonical
+                .get_or_init(|| {
+                    self.normalized
+                        .iter()
+                        .filter_map(|root| root.canonicalize().ok())
+                        .collect()
+                })
+                .iter()
+                .any(|root| directory.starts_with(root))
+    }
+}
+
 /// Return normalized roots whose native search directories can be tracked.
 pub(super) fn native_input_roots(
     working_dir: &Path,
     path_mappings: &[PathMapping],
-) -> Vec<PathBuf> {
-    std::iter::once(working_dir)
-        .chain(path_mappings.iter().map(|mapping| mapping.root.as_path()))
-        .map(normalize_components)
-        .collect()
+) -> NativeInputRoots {
+    NativeInputRoots {
+        normalized: std::iter::once(working_dir)
+            .chain(path_mappings.iter().map(|mapping| mapping.root.as_path()))
+            .map(normalize_components)
+            .collect(),
+        canonical: OnceCell::new(),
+    }
 }
 
 /// Add regular files beneath an admitted native search directory, enforcing
@@ -588,22 +620,20 @@ pub(super) fn native_input_roots(
 /// walks charge each file once even when `paths` already names it.
 pub(super) fn collect_native_directory(
     directory: &Path,
-    admitted_roots: &[PathBuf],
+    admitted_roots: &NativeInputRoots,
     paths: &mut BTreeSet<PathBuf>,
     native_bytes: &mut u64,
     counted: &mut BTreeSet<PathBuf>,
-) -> Result<(), BypassReason> {
+) -> Result<PathBuf, BypassReason> {
     let directory = normalize_components(directory);
-    if !admitted_roots
-        .iter()
-        .any(|root| directory.starts_with(root))
-    {
-        return Err(BypassReason::UnsupportedSearchPath("native".into()));
-    }
+    let lexically_admitted = admitted_roots.admits(&directory);
 
     let canonical_root = match directory.canonicalize() {
         Ok(root) => root,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(_) if !lexically_admitted => {
+            return Err(BypassReason::UnsupportedSearchPath("native".into()));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(directory),
         Err(error) => {
             return Err(BypassReason::InputRead {
                 path: directory,
@@ -611,7 +641,11 @@ pub(super) fn collect_native_directory(
             });
         }
     };
-    let mut pending = vec![directory];
+    if !lexically_admitted && !admitted_roots.admits_resolved(&canonical_root) {
+        return Err(BypassReason::UnsupportedSearchPath("native".into()));
+    }
+    physicalize_native_paths(paths, &directory, &canonical_root);
+    let mut pending = vec![canonical_root.clone()];
     while let Some(directory) = pending.pop() {
         let entries = match std::fs::read_dir(&directory) {
             Ok(entries) => entries,
@@ -677,7 +711,30 @@ pub(super) fn collect_native_directory(
             }
         }
     }
-    Ok(())
+    Ok(canonical_root)
+}
+
+/// Keep inputs and their source classification in the spelling used by a native walk.
+pub(super) fn physicalize_native_paths(
+    paths: &mut BTreeSet<PathBuf>,
+    directory: &Path,
+    physical: &Path,
+) {
+    if directory == physical {
+        return;
+    }
+    let aliases = paths
+        .iter()
+        .filter_map(|path| {
+            path.strip_prefix(directory)
+                .ok()
+                .map(|suffix| (path.clone(), physical.join(suffix)))
+        })
+        .collect::<Vec<_>>();
+    for (alias, physical) in aliases {
+        paths.remove(&alias);
+        paths.insert(physical);
+    }
 }
 
 /// Directories that build scripts leave beside libraries but that a linker
@@ -822,6 +879,66 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn native_root_alias_cache_is_lazy_and_shared_by_directory_walks() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let physical = root.join("store");
+        let first = physical.join("first");
+        let second = physical.join("second");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        std::fs::write(first.join("libfirst.a"), b"xx").unwrap();
+        std::fs::write(second.join("libsecond.a"), b"yyy").unwrap();
+        let alias = root.join("selected");
+        symlink(&physical, &alias).unwrap();
+        let aliases = native_input_roots(&alias, &[]);
+        let direct = native_input_roots(&physical, &[]);
+        let mut paths = BTreeSet::new();
+        let mut bytes = 0;
+        let mut counted = BTreeSet::new();
+
+        collect_native_directory(
+            &alias.join("first"),
+            &aliases,
+            &mut paths,
+            &mut bytes,
+            &mut counted,
+        )
+        .unwrap();
+        assert!(
+            aliases.canonical.get().is_none(),
+            "lexical admission stays lazy"
+        );
+        collect_native_directory(
+            &alias.join("second"),
+            &direct,
+            &mut paths,
+            &mut bytes,
+            &mut counted,
+        )
+        .unwrap();
+        assert!(
+            direct.canonical.get().is_none(),
+            "a physical prefix needs no root aliases"
+        );
+
+        collect_native_directory(&first, &aliases, &mut paths, &mut bytes, &mut counted).unwrap();
+        let memo = aliases.canonical.get().unwrap();
+        assert_eq!(memo, &[physical]);
+        let memo_address = memo.as_ptr();
+        collect_native_directory(&second, &aliases, &mut paths, &mut bytes, &mut counted).unwrap();
+        assert_eq!(aliases.canonical.get().unwrap().as_ptr(), memo_address);
+        assert_eq!(paths.len(), 2);
+        assert_eq!(
+            bytes, 5,
+            "the shared root memo does not alter file accounting"
+        );
+    }
+
     #[test]
     fn native_directory_byte_limit_is_cumulative() {
         let directory = tempfile::tempdir().unwrap();
@@ -900,12 +1017,13 @@ mod tests {
         let mut native_bytes = 0;
         let mut counted = BTreeSet::new();
 
-        collect_native_directory(&native, &roots, &mut paths, &mut native_bytes, &mut counted)
-            .unwrap();
+        let physical =
+            collect_native_directory(&native, &roots, &mut paths, &mut native_bytes, &mut counted)
+                .unwrap();
 
         assert_eq!(
             paths.into_iter().collect::<Vec<_>>(),
-            vec![native.join("lib/libz.so.1"), native.join("libz.a")]
+            vec![physical.join("lib/libz.so.1"), physical.join("libz.a")]
         );
     }
 
@@ -1221,6 +1339,240 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn native_aliases_keep_physical_inputs_and_budget_limits() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let native = root.join("mapped/lib");
+        let alias = root.join("selected-lib");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&native).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(native.join("libfixture.a"), b"archive").unwrap();
+        std::fs::write(outside.join("liboutside.a"), b"outside").unwrap();
+        symlink(&native, &alias).unwrap();
+        let roots = native_input_roots(&native, &[]);
+        let mut paths = BTreeSet::from([alias.join("libfixture.a")]);
+        let mut bytes = 0;
+        let mut counted = BTreeSet::new();
+        for spelling in [&alias, &native] {
+            assert_eq!(
+                collect_native_directory(spelling, &roots, &mut paths, &mut bytes, &mut counted)
+                    .unwrap(),
+                native
+            );
+        }
+        assert_eq!(paths, BTreeSet::from([native.join("libfixture.a")]));
+        assert_eq!(bytes, 7, "aliases charge the same physical file only once");
+
+        let alias_roots = native_input_roots(&alias, &[]);
+        collect_native_directory(&native, &alias_roots, &mut paths, &mut bytes, &mut counted)
+            .unwrap();
+        assert_eq!(
+            bytes, 7,
+            "an admitted root's own alias grants no extra input"
+        );
+
+        let mut full = (0..MAX_PREDICTED_INPUTS)
+            .map(|index| root.join(format!("prior/{index}")))
+            .collect();
+        assert_eq!(
+            collect_native_directory(&alias, &roots, &mut full, &mut 0, &mut BTreeSet::new()),
+            Err(BypassReason::UnsupportedSearchPath("native".into()))
+        );
+        assert_eq!(
+            collect_native_directory(
+                &alias,
+                &roots,
+                &mut BTreeSet::new(),
+                &mut (MAX_NATIVE_INPUT_BYTES - 1),
+                &mut BTreeSet::new(),
+            ),
+            Err(BypassReason::UnsupportedSearchPath("native".into()))
+        );
+
+        let outside_alias = root.join("unmapped-lib");
+        symlink(&outside, &outside_alias).unwrap();
+        for spelling in [&outside_alias, &outside_alias.join("missing")] {
+            assert_eq!(
+                collect_native_directory(
+                    spelling,
+                    &roots,
+                    &mut BTreeSet::new(),
+                    &mut 0,
+                    &mut BTreeSet::new(),
+                ),
+                Err(BypassReason::UnsupportedSearchPath("native".into()))
+            );
+        }
+        assert_eq!(
+            collect_native_directory(
+                &native.join("missing"),
+                &roots,
+                &mut BTreeSet::new(),
+                &mut 0,
+                &mut BTreeSet::new(),
+            )
+            .unwrap(),
+            native.join("missing")
+        );
+        symlink(outside.join("liboutside.a"), native.join("libescape.a")).unwrap();
+        assert_eq!(
+            collect_native_directory(
+                &alias,
+                &roots,
+                &mut BTreeSet::new(),
+                &mut 0,
+                &mut BTreeSet::new(),
+            ),
+            Err(BypassReason::UnsupportedSearchPath("native".into()))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_alias_discovery_preserves_named_sources_on_prediction() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let workspace = root.join("workspace");
+        let native = root.join("mapped/lib");
+        let alias = root.join("selected-lib");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&native).unwrap();
+        std::fs::write(native.join("lib.rs"), "pub fn library() {}\n").unwrap();
+        std::fs::write(native.join("libfixture.a"), b"archive").unwrap();
+        symlink(&native, &alias).unwrap();
+        let mappings = vec![
+            PathMapping::new(&workspace, "workspace"),
+            PathMapping::new(&native, "native"),
+        ];
+        let invocation = library_with_native_search(&alias.join("lib.rs"), &alias);
+        let dep_info = RustcDepInfo {
+            files: vec![alias.join("lib.rs")],
+            environment: BTreeMap::new(),
+        };
+        let discovered = invocation
+            .discover_inputs_with_mappings(
+                &dep_info,
+                &workspace,
+                &mappings,
+                &mbx_cache_core::NoFileDigestCache,
+            )
+            .unwrap();
+        assert_eq!(
+            discovered.inputs.len(),
+            2,
+            "aliases must not duplicate files"
+        );
+        assert!(
+            discovered
+                .inputs
+                .iter()
+                .all(|input| input.path.starts_with(&native))
+        );
+        assert!(!discovered.is_native_only(&native.join("lib.rs")));
+        assert!(discovered.is_native_only(&native.join("libfixture.a")));
+        let source_only = invocation
+            .discover_source_inputs(&dep_info, &workspace, &mbx_cache_core::NoFileDigestCache)
+            .unwrap();
+        assert_eq!(
+            invocation.source_fingerprint(&discovered),
+            invocation.source_fingerprint(&source_only),
+            "a native directory alias must not change the crate's source fingerprint"
+        );
+        let mut context = library_context(&workspace, mappings.clone());
+        discovered.clone().apply_to(&mut context).unwrap();
+        let action = invocation.action(context.clone()).unwrap();
+        let physical = library_with_native_search(&native.join("lib.rs"), &native);
+        assert_eq!(
+            action.bytes,
+            physical.action(context.clone()).unwrap().bytes
+        );
+
+        let mut prediction = invocation.prediction(&context, &discovered).unwrap();
+        prediction.inputs.reverse();
+        let alias_mappings = vec![
+            PathMapping::new(&workspace, "workspace"),
+            PathMapping::new(&alias, "native"),
+        ];
+        let predicted = prediction
+            .discover(
+                &workspace,
+                &alias_mappings,
+                &mbx_cache_core::NoFileDigestCache,
+            )
+            .unwrap();
+        assert_eq!(predicted.inputs, discovered.inputs);
+        assert!(!predicted.is_native_only(&native.join("lib.rs")));
+        assert!(predicted.is_native_only(&native.join("libfixture.a")));
+        let mut predicted_context = library_context(&workspace, alias_mappings);
+        predicted.apply_to(&mut predicted_context).unwrap();
+        assert_eq!(
+            action.bytes,
+            physical.action(predicted_context).unwrap().bytes
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lexical_home_alias_does_not_grant_an_external_native_key() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let home = root.join("home");
+        let workspace = home.join("workspace");
+        let external = root.join("external");
+        let alias = home.join("native");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&external).unwrap();
+        let source = workspace.join("lib.rs");
+        std::fs::write(&source, "pub fn library() {}\n").unwrap();
+        std::fs::write(external.join("generated.rs"), "// named source\n").unwrap();
+        std::fs::write(external.join("libfixture.a"), b"archive").unwrap();
+        symlink(&external, &alias).unwrap();
+        let mappings = vec![
+            PathMapping::new(&workspace, "workspace"),
+            PathMapping::new(&home, "home"),
+        ];
+        let invocation = library_with_native_search(&source, &alias);
+        let mut context = library_context(&workspace, mappings.clone());
+        let before_discovery = invocation.invocation_digest(&context).unwrap_err();
+        assert!(matches!(
+            before_discovery,
+            BypassReason::UnmappedAbsolutePath(_)
+        ));
+        let dep_info = RustcDepInfo {
+            files: vec![source, alias.join("generated.rs")],
+            environment: BTreeMap::new(),
+        };
+        let discovered = invocation
+            .discover_inputs_with_mappings(
+                &dep_info,
+                &workspace,
+                &mappings,
+                &mbx_cache_core::NoFileDigestCache,
+            )
+            .unwrap();
+        let source_only = invocation
+            .discover_source_inputs(&dep_info, &workspace, &mbx_cache_core::NoFileDigestCache)
+            .unwrap();
+        assert_eq!(
+            invocation.source_fingerprint(&discovered),
+            invocation.source_fingerprint(&source_only)
+        );
+        discovered.apply_to(&mut context).unwrap();
+        assert_eq!(
+            invocation.action(context).unwrap_err(),
+            before_discovery,
+            "lexical native admission must not invent a physical root mapping"
+        );
+    }
     #[cfg(windows)]
     #[test]
     fn project_directory_with_toolchain_suffix_is_not_trusted() {

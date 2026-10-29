@@ -36,6 +36,8 @@ use mbx_cache_core::{
     resolve_path_mappings,
 };
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::borrow::Cow;
+use std::cell::OnceCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
@@ -1122,22 +1124,28 @@ impl RustcInputPrediction {
         let admitted_roots = dep_info::native_input_roots(working_dir, path_mappings);
         let mut native_bytes = 0_u64;
         let mut counted = BTreeSet::new();
+        // Name sources before walking directories, regardless of prediction order,
+        // so aliases are physicalized in both the inputs and their classification.
+        for path in &self.inputs {
+            if self.version < 3 || !path.starts_with(NATIVE_DIRECTORY_PREDICTION_PREFIX) {
+                let path = denormalize_path(path, path_mappings)?;
+                named.insert(path.clone());
+                paths.insert(path);
+            }
+        }
         for path in &self.inputs {
             if self.version >= 3
                 && let Some(path) = path.strip_prefix(NATIVE_DIRECTORY_PREDICTION_PREFIX)
             {
                 let directory = denormalize_path(path, path_mappings)?;
-                dep_info::collect_native_directory(
+                let physical = dep_info::collect_native_directory(
                     &directory,
                     &admitted_roots,
                     &mut paths,
                     &mut native_bytes,
                     &mut counted,
                 )?;
-            } else {
-                let path = denormalize_path(path, path_mappings)?;
-                named.insert(path.clone());
-                paths.insert(path);
+                dep_info::physicalize_native_paths(&mut named, &directory, &physical);
             }
         }
         let native_only = paths.difference(&named).cloned().collect();
@@ -2379,6 +2387,8 @@ struct ActionBuilder<'a> {
     /// share a few parents, and resolving each once is what keeps a crate
     /// with hundreds of them from paying a `realpath` walk per input.
     aliases: PathAliases,
+    /// Lexical and physical search roots for matching discovered input names.
+    native_directories: OnceCell<Vec<(PathBuf, PathBuf)>>,
     linker: Option<LinkerIdentity>,
 }
 
@@ -2391,6 +2401,7 @@ impl<'a> ActionBuilder<'a> {
             invocation,
             mappings,
             aliases: PathAliases::default(),
+            native_directories: OnceCell::new(),
             context,
         }
     }
@@ -2581,29 +2592,69 @@ impl<'a> ActionBuilder<'a> {
             .collect()
     }
 
+    fn resolved_native_directories(&self) -> &[(PathBuf, PathBuf)] {
+        self.native_directories.get_or_init(|| {
+            let lexical = self
+                .invocation
+                .native_search_paths()
+                .map(|directory| {
+                    SharedPathMapping::new(
+                        normalize_components(&self.context.working_dir.join(directory)),
+                        "",
+                    )
+                })
+                .collect::<Vec<_>>();
+            // Comparison prefixes only, never additional key mappings. Resolve
+            // once per action, not once per input or through a terminal file link.
+            let physical = resolve_path_mappings(&lexical);
+            lexical
+                .into_iter()
+                .zip(physical)
+                .map(|(lexical, physical)| (lexical.root, physical.root))
+                .collect()
+        })
+    }
+
     fn normalize_input_path(&self, path: &Path) -> Result<String, BypassReason> {
         let absolute = normalize_components(&self.context.working_dir.join(path));
-        for directory in self.invocation.native_search_paths() {
-            let directory = normalize_components(&self.context.working_dir.join(directory));
-            if let Ok(relative) = absolute.strip_prefix(&directory) {
-                // Preserve the searched filename. Resolving a symlink here
-                // would collapse libssl.dylib into its versioned referent, so
-                // retargeting that link between two existing files could leave
-                // the input map unchanged. Discovery rejects directory links
-                // inside the tree and hashes regular-file links by content.
-                let suffix = relative
-                    .components()
-                    .map(|component| {
-                        component
-                            .as_os_str()
-                            .to_str()
-                            .ok_or_else(|| BypassReason::NonUtf8Path(path.to_path_buf()))
+        let native = self
+            .invocation
+            .native_search_paths()
+            .find_map(|directory| {
+                let directory = normalize_components(&self.context.working_dir.join(directory));
+                absolute
+                    .strip_prefix(&directory)
+                    .ok()
+                    .map(|relative| (Cow::Owned(directory), relative))
+            })
+            .or_else(|| {
+                self.resolved_native_directories()
+                    .iter()
+                    .find_map(|(directory, physical)| {
+                        absolute
+                            .strip_prefix(physical)
+                            .ok()
+                            .map(|relative| (Cow::Borrowed(directory.as_path()), relative))
                     })
-                    .collect::<Result<Vec<_>, _>>()?
-                    .join("/");
-                if !suffix.is_empty() {
-                    return Ok(format!("{}/{}", self.normalize_path(&directory)?, suffix));
-                }
+            });
+        if let Some((directory, relative)) = native {
+            // Preserve the searched filename. Resolving a symlink here
+            // would collapse libssl.dylib into its versioned referent, so
+            // retargeting that link between two existing files could leave
+            // the input map unchanged. Discovery rejects directory links
+            // inside the tree and hashes regular-file links by content.
+            let suffix = relative
+                .components()
+                .map(|component| {
+                    component
+                        .as_os_str()
+                        .to_str()
+                        .ok_or_else(|| BypassReason::NonUtf8Path(path.to_path_buf()))
+                })
+                .collect::<Result<Vec<_>, _>>()?
+                .join("/");
+            if !suffix.is_empty() {
+                return Ok(format!("{}/{}", self.normalize_path(&directory)?, suffix));
             }
         }
         self.normalize_path(path)
