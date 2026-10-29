@@ -275,6 +275,81 @@ fn the_pinned_build_script_binary_comes_along() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn a_failed_shim_copy_never_publishes_fresh_units() {
+    let from = tempfile::tempdir().unwrap();
+    let to = tempfile::tempdir().unwrap();
+    let profile = from.path().join("debug");
+    unit(&profile, "serde", "0123456789abcdef");
+    let shims = profile.join(".mbx-build-script-shims");
+    std::fs::create_dir_all(&shims).unwrap();
+    std::os::unix::fs::symlink("../missing", shims.join("unavailable")).unwrap();
+
+    let outcome = seed(
+        to.path(),
+        &[PathBuf::from("debug")],
+        &registry(),
+        &[donor(from.path())],
+    );
+
+    assert_eq!(outcome, SeedOutcome::default());
+    assert!(
+        !to.path().join("debug/build").exists(),
+        "Cargo must not see fresh units before their build-script shims"
+    );
+
+    std::fs::remove_file(shims.join("unavailable")).unwrap();
+    std::fs::create_dir_all(shims.join("identity")).unwrap();
+    std::fs::write(shims.join("identity/mbx"), b"mbx").unwrap();
+    let retried = seed(
+        to.path(),
+        &[PathBuf::from("debug")],
+        &registry(),
+        &[donor(from.path())],
+    );
+    assert_eq!(
+        retried.units, 1,
+        "a later build can retry the complete copy"
+    );
+    assert!(
+        to.path()
+            .join("debug/.mbx-build-script-shims/identity/mbx")
+            .is_file()
+    );
+}
+
+#[test]
+fn existing_pins_survive_resuming_a_profile_seed() {
+    let from = tempfile::tempdir().unwrap();
+    let to = tempfile::tempdir().unwrap();
+    let profile = from.path().join("debug");
+    unit(&profile, "serde", "0123456789abcdef");
+    let shims = profile.join(".mbx-build-script-shims");
+    std::fs::create_dir_all(shims.join("donor")).unwrap();
+    std::fs::write(shims.join("donor/mbx"), b"donor").unwrap();
+    let destination = to.path().join("debug/.mbx-build-script-shims");
+    std::fs::create_dir_all(destination.join("existing")).unwrap();
+    std::fs::write(destination.join("existing/mbx"), b"existing").unwrap();
+
+    let outcome = seed(
+        to.path(),
+        &[PathBuf::from("debug")],
+        &registry(),
+        &[donor(from.path())],
+    );
+
+    assert_eq!(outcome.units, 1);
+    assert_eq!(
+        std::fs::read(destination.join("donor/mbx")).unwrap(),
+        b"donor"
+    );
+    assert_eq!(
+        std::fs::read(destination.join("existing/mbx")).unwrap(),
+        b"existing"
+    );
+}
+
 #[test]
 fn only_units_the_donors_last_build_read_are_copied() {
     let from = tempfile::tempdir().unwrap();

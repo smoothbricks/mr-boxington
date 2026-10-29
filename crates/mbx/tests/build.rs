@@ -6659,6 +6659,72 @@ mod target_views {
 
     #[cfg(unix)]
     #[test]
+    fn a_failed_seed_shim_copy_falls_back_to_a_working_build() {
+        let store = tempfile::tempdir().unwrap();
+        let cargo_home = tempfile::tempdir().unwrap();
+        let repository = tempfile::tempdir().unwrap();
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let reports = tempfile::tempdir().unwrap();
+        write_seeded_dependency(repository.path());
+        for checkout in [first.path(), second.path()] {
+            write_git_dependent_project(checkout, repository.path());
+        }
+        let home = cargo_home.path().to_str().unwrap();
+        let status = Command::new(cargo())
+            .current_dir(first.path())
+            .args(["generate-lockfile"])
+            .env("CARGO_HOME", home)
+            .status()
+            .expect("cargo should resolve the local Git dependency");
+        assert!(status.success());
+        std::fs::copy(
+            first.path().join("Cargo.lock"),
+            second.path().join("Cargo.lock"),
+        )
+        .unwrap();
+        build_with(
+            first.path(),
+            store.path(),
+            &reports.path().join("first.json"),
+            &[("MBX_TARGET_VIEWS", "1"), ("CARGO_HOME", home)],
+        );
+        if !managed(first.path())
+            .join("debug/build/seeded-dep")
+            .is_dir()
+        {
+            return;
+        }
+        // The donor's units are readable, but the pinned-shim copy cannot
+        // finish. No fresh unit may escape before that dependency is ready.
+        std::os::unix::fs::symlink(
+            "../missing",
+            managed(first.path()).join("debug/.mbx-build-script-shims/unavailable"),
+        )
+        .unwrap();
+        build_with(
+            second.path(),
+            store.path(),
+            &reports.path().join("second.json"),
+            &[
+                ("MBX_TARGET_VIEWS", "1"),
+                ("CARGO_HOME", home),
+                ("SEEDED_FLAVOR", "spicy"),
+            ],
+        );
+        let generated = find_files(&managed(second.path()).join("debug"), |path| {
+            file_name_is(path, |name| name == "flavor.rs")
+        });
+        assert!(
+            generated
+                .iter()
+                .any(|path| std::fs::read_to_string(path).unwrap().contains("spicy")),
+            "the rebuilt build script must run with the receiver's environment"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn a_new_checkouts_first_check_starts_with_another_checkouts_check_units() {
         let store = tempfile::tempdir().unwrap();
         let cargo_home = tempfile::tempdir().unwrap();
