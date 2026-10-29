@@ -702,13 +702,72 @@ fn can_pass_waiters(capacity: u64, live: &[u64], older: &[u64], weight: u64) -> 
 /// Protect every older prefix against every possible completion subset.
 #[cfg(test)]
 fn can_pass_quantized(capacity: u64, live: &[u64], older: &[u64], charge: u64, unit: u64) -> bool {
-    pass_quantized(capacity, live, older, charge, unit, |_, _| {})
+    pass_quantized(
+        capacity,
+        live,
+        older,
+        &vec![0; older.len()],
+        charge,
+        unit,
+        |_, _| {},
+    )
 }
 
+/// Per prefix of `heads`, a lower bound on how much of one axis completes
+/// before that prefix of older requests can start, from what it waits for on
+/// the other axis.
+///
+/// A prefix short of room on `other` starts only once completions free the
+/// shortfall. No set of completions frees it with fewer than
+/// `ceil(shortfall / largest)` holders of that axis, `largest` being the
+/// biggest such hold among the live leases and the older requests admitted
+/// before the prefix, and each of those frees at least the smallest `this`
+/// charge any holder of `other` carries. Every completion set that lets the
+/// prefix start frees its `other` shortfall, so it frees at least that much
+/// of `this` too.
+fn freed_alongside(
+    capacity: u64,
+    live: &[Resources],
+    heads: &[Resources],
+    other: fn(&Resources) -> u64,
+    this: fn(&Resources) -> u64,
+) -> Vec<u64> {
+    let free = capacity.saturating_sub(live.iter().map(other).fold(0, u64::saturating_add));
+    let mut largest = 0;
+    let mut smallest = u64::MAX;
+    let hold = |item: &Resources, largest: &mut u64, smallest: &mut u64| {
+        if other(item) > 0 {
+            *largest = (*largest).max(other(item));
+            *smallest = (*smallest).min(this(item));
+        }
+    };
+    for item in live {
+        hold(item, &mut largest, &mut smallest);
+    }
+    let mut prefix = 0_u64;
+    heads
+        .iter()
+        .map(|head| {
+            prefix = prefix.saturating_add(other(head));
+            let shortfall = prefix.saturating_sub(free);
+            let freed = if shortfall == 0 || largest == 0 {
+                0
+            } else {
+                shortfall.div_ceil(largest).saturating_mul(smallest)
+            };
+            hold(head, &mut largest, &mut smallest);
+            freed
+        })
+        .collect()
+}
+
+/// `freed[index]` bounds from below what completes on this axis before the
+/// older prefix ending at `index` can start; see `freed_alongside`.
 fn pass_quantized(
     capacity: u64,
     live: &[u64],
     older: &[u64],
+    freed: &[u64],
     charge: u64,
     unit: u64,
     mut record: impl FnMut(usize, u64),
@@ -783,6 +842,9 @@ fn pass_quantized(
             };
             slack
         };
+        // The room the prefix finds once its other axis lets it start: the
+        // completions it waits for there free at least `freed` here too.
+        let slack = slack.max(free.saturating_add(freed[index]).saturating_sub(prefix));
         record(index, slack);
         if charge > slack {
             return false;
@@ -965,17 +1027,42 @@ fn admission_decision_traced<'a>(
         // Subsets sufficient on both axes are a subset of those sufficient
         // on either one. Independent minima are therefore no larger than
         // the joint minimum; requiring both independent slack bounds is safe.
-        pass_quantized(budget.cpu, &cpus, &head_cpus, charge.cpu, 1, |i, slack| {
-            if let (Some(trace), Some(tickets)) = (trace, tickets.as_ref()) {
-                trace
-                    .borrow_mut()
-                    .slack(tickets[i], scope, budget, "cpu", slack);
-            }
-        }) && (budget.memory_bytes == 0
+        // The same containment gives each axis a second bound: a completion
+        // set that lets an older prefix start also frees the other axis's
+        // shortfall, and with it at least `freed_alongside` of this one.
+        let cores_freed = if budget.memory_bytes == 0 {
+            vec![0; heads.len()]
+        } else {
+            freed_alongside(
+                budget.memory_bytes,
+                &live,
+                &heads,
+                |r| r.memory_bytes,
+                |r| r.cpu,
+            )
+        };
+        let memory_freed =
+            freed_alongside(budget.cpu, &live, &heads, |r| r.cpu, |r| r.memory_bytes);
+        pass_quantized(
+            budget.cpu,
+            &cpus,
+            &head_cpus,
+            &cores_freed,
+            charge.cpu,
+            1,
+            |i, slack| {
+                if let (Some(trace), Some(tickets)) = (trace, tickets.as_ref()) {
+                    trace
+                        .borrow_mut()
+                        .slack(tickets[i], scope, budget, "cpu", slack);
+                }
+            },
+        ) && (budget.memory_bytes == 0
             || pass_quantized(
                 budget.memory_bytes,
                 &memory,
                 &head_memory,
+                &memory_freed,
                 charge.memory_bytes,
                 MEMORY_QUANTUM,
                 |i, slack| {
@@ -1066,6 +1153,7 @@ fn admission_decision_traced<'a>(
             capacity,
             &weights,
             &heads,
+            &vec![0; heads.len()],
             weight_in_units(request.weight, request.bytes_per_permit, unit),
             1,
             |i, slack| {

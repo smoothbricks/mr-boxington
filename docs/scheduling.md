@@ -230,7 +230,23 @@ requests may use capacity a waiting request cannot use when it next becomes
 able to start, only when both CPU and memory fit the safe slack in every
 shared scope. The memory calculation rounds completion subsets up in 16 MiB
 units and subtracts their maximum rounding error; a calculation that exceeds
-the bounded subset bitset refuses the pass. Within one scope this never delays an older request. When a request
+the bounded subset bitset refuses the pass.
+
+Each axis's slack also counts what the other axis makes complete first. An
+older request short of memory starts only once completions free that
+shortfall. No set of completions frees it with fewer leases than the shortfall
+divided by the largest memory any of them holds, rounded up, and each of those
+leases frees at least the fewest cores any lease holding memory holds. Every
+set of completions that lets the older request start therefore frees at least
+that many cores, so a newer request may use that many of the cores free now
+without delaying it. Memory freed by the completions an older request short of
+cores waits for counts the same way. Both bounds are lower bounds on the room
+every such completion set leaves, so taking the larger of either and the
+single-axis slack keeps the guarantee. A build's ceiling counts cores only and
+gains nothing from memory, and a lease that holds memory but no cores, such as
+a memory-only reservation, makes the bound zero.
+
+Within one scope this never delays an older request. When a request
 waits on its own build or container limit, the existing rule already lets
 other builds or containers start, which can rarely delay the waiting request
 after a pass. Cancelling a waiter or killing its process releases its queue
