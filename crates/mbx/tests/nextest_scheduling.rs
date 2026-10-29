@@ -295,6 +295,47 @@ mod unix {
     }
 
     #[test]
+    fn a_reservation_inside_a_reservation_runs_under_the_enclosing_grant() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = temp.path().join("cache");
+        // The enclosing reservation holds the whole pool, as a leaf reserving
+        // its job's cores does; the command it runs reserves again.
+        let mut command = mbx(temp.path());
+        command
+            .env("MBX_CACHE_DIR", &cache)
+            .env("MBX_SCHEDULER", "1")
+            .env("MBX_SCHEDULER_CPUS", "2")
+            .env("MBX_SCHEDULER_MEMORY", "none")
+            .args(["reserve", "--cpus", "2", "--"])
+            .arg(env!("CARGO_BIN_EXE_mbx"))
+            .args(["reserve", "--cpus", "1", "--priority", "low", "--"])
+            .args(["sh", "-c", "exit 7"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0);
+        let child = command.spawn().unwrap();
+        let group = -i32::try_from(child.id()).unwrap();
+        let (exited, exit) = std::sync::mpsc::channel();
+        let waiter = thread::spawn(move || {
+            let mut child = child;
+            exited.send(child.wait().unwrap()).unwrap();
+        });
+        let status = exit.recv_timeout(Duration::from_secs(20)).ok();
+        if status.is_none() {
+            // SAFETY: signals only the process group this test started.
+            unsafe { libc::kill(group, libc::SIGKILL) };
+        }
+        waiter.join().unwrap();
+        assert_eq!(
+            status.map(|status| status.code()),
+            Some(Some(7)),
+            "the nested reservation must run under the enclosing grant, not wait behind it"
+        );
+        // The enclosing reserve exits only after its worker released its lease.
+        assert_eq!(locked_lease_files(&cache), Vec::<PathBuf>::new());
+    }
+
+    #[test]
     fn independent_nextest_invocations_share_capacity_and_allow_overlap() {
         if !nextest_available() {
             return;

@@ -41,3 +41,24 @@ fn external_work_skips_nested_admission_without_leaking_the_worker_marker() {
     );
     assert_eq!(environment.get("MBX_RESERVE_WORKER"), Some(&None));
 }
+
+#[test]
+fn a_reservation_inside_a_reservation_runs_under_the_enclosing_grant() {
+    use reserve::Route;
+    let set = Some(std::ffi::OsStr::new("1"));
+    for (enclosing, worker, expected) in [
+        (None, None, Route::Spawn),
+        (None, set, Route::Reserve),
+        (set, None, Route::Enclosed),
+        // The marker's presence is the grant, as it is for compiler shims.
+        (Some(std::ffi::OsStr::new("")), None, Route::Enclosed),
+        // A worker started under an enclosing reservation still runs under it.
+        (set, set, Route::Enclosed),
+    ] {
+        assert_eq!(
+            reserve::route(enclosing, worker),
+            expected,
+            "enclosing {enclosing:?}, worker {worker:?}"
+        );
+    }
+}

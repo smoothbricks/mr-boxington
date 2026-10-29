@@ -324,7 +324,10 @@ holds it until the external command exits. Killing the invoking `mbx reserve`
 process alone does not release capacity while that worker still waits for the
 command; a crashed worker does release its lease through the operating system.
 The command must wait for work it launches: detached background processes can
-outlive the reservation and are not covered after the command exits.
+outlive the reservation and are not covered after the command exits. That
+includes a nested `mbx reserve`: run by a command a reservation already covers,
+it runs its own command under the enclosing grant at once, without a lease of
+its own, instead of queueing behind capacity its enclosing reservation holds.
 `--memory` is measured against `scheduler.memory`; omit it when memory
 scheduling is disabled. Use `--priority low` for background work that
 should yield at admission time to waiting normal-priority builds; an admitted
