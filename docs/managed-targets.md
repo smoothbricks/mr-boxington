@@ -270,6 +270,9 @@ The pinned mbx binaries that copied build-script launchers use are published
 before any build unit. If copying those binaries fails or is interrupted,
 Cargo never sees a fresh copied unit without its launcher dependency. A later
 build can resume the copy, retaining any pinned binaries already present.
+A donor unit whose launcher already names a missing pin is not copied; Cargo
+restores or compiles that unit instead. An empty identity directory is not a
+pinned binary.
 
 `check` and `clippy` in their [check lane](#check-lanes), and editor checks
 under `target/rust-analyzer`, are seeded the same way from that directory in
