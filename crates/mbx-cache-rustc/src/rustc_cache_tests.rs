@@ -221,11 +221,12 @@ fn tracks_native_search_path_contents_and_hashes_a_named_static_library() {
             &mbx_cache_core::NoFileDigestCache,
         )
         .unwrap();
+    let expected_library = native.join("fixture.lib").canonicalize().unwrap();
     assert!(
         discovered
             .inputs
             .iter()
-            .any(|input| input.path == native.join("fixture.lib"))
+            .any(|input| input.path == expected_library)
     );
 
     let action_context = ActionContext {
@@ -247,11 +248,12 @@ fn tracks_native_search_path_contents_and_hashes_a_named_static_library() {
             &mbx_cache_core::NoFileDigestCache,
         )
         .unwrap();
+    let expected_added = native.join("added.lib").canonicalize().unwrap();
     assert!(
         predicted
             .inputs
             .iter()
-            .any(|input| input.path == native.join("added.lib"))
+            .any(|input| input.path == expected_added)
     );
 
     // Naming a static library in that directory is what a `-sys` crate's
@@ -272,6 +274,90 @@ fn tracks_native_search_path_contents_and_hashes_a_named_static_library() {
             .required_inputs_in(&working_dir)
             .contains(&native.join("libbundled.a"))
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn covered_native_directories_preserve_existing_action_bytes_and_predictions() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let home = root.join("home");
+    let workspace = home.join("workspace");
+    let native = home.join("selected/lib");
+    let relocated = home.join("store/lib");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::create_dir_all(&native).unwrap();
+    let source = workspace.join("lib.rs");
+    std::fs::write(&source, "pub fn library() {}\n").unwrap();
+    std::fs::write(native.join("libfixture.a"), b"archive").unwrap();
+    let mappings = vec![PathMapping::new(&home, "home")];
+    let template = ActionContext {
+        working_dir: workspace.clone(),
+        path_mappings: mappings.clone(),
+        inputs: Vec::new(),
+        ..context(&[])
+    };
+    for is_alias in [false, true] {
+        if is_alias {
+            std::fs::create_dir_all(relocated.parent().unwrap()).unwrap();
+            std::fs::rename(&native, &relocated).unwrap();
+            std::os::unix::fs::symlink(&relocated, &native).unwrap();
+        }
+        let invocation = RustcInvocation::parse(&[
+            "--crate-name=widget".into(),
+            "--crate-type=lib".into(),
+            "--emit=metadata,link".into(),
+            format!("-Lnative={}", native.display()).into(),
+            source.clone().into_os_string(),
+        ])
+        .unwrap();
+        let archive = native.join("libfixture.a");
+        // The previous collector reported the searched spelling, not its realpath.
+        let lexical = crate::dep_info::DiscoveredInputs::from_paths(
+            &workspace,
+            [source.clone(), archive.clone()].into_iter().collect(),
+            std::collections::BTreeMap::new(),
+            &mbx_cache_core::NoFileDigestCache,
+        )
+        .unwrap()
+        .with_native_only(std::iter::once(archive).collect());
+        let mut before = template.clone();
+        lexical.clone().apply_to(&mut before).unwrap();
+        let expected = invocation.action(before.clone()).unwrap();
+        let old_prediction = invocation.prediction(&before, &lexical).unwrap();
+        let dep_info = RustcDepInfo {
+            files: vec![source.clone()],
+            environment: std::collections::BTreeMap::new(),
+        };
+        let physical = invocation
+            .discover_inputs_with_mappings(
+                &dep_info,
+                &workspace,
+                &mappings,
+                &mbx_cache_core::NoFileDigestCache,
+            )
+            .unwrap();
+        let mut after = template.clone();
+        physical.clone().apply_to(&mut after).unwrap();
+        assert_eq!(
+            invocation.action(after.clone()).unwrap().bytes,
+            expected.bytes,
+            "alias {is_alias}"
+        );
+        let new_prediction = invocation.prediction(&after, &physical).unwrap();
+        for prediction in [old_prediction, new_prediction] {
+            let discovered = prediction
+                .discover(&workspace, &mappings, &mbx_cache_core::NoFileDigestCache)
+                .unwrap();
+            let mut restored = template.clone();
+            discovered.apply_to(&mut restored).unwrap();
+            assert_eq!(
+                invocation.action(restored).unwrap().bytes,
+                expected.bytes,
+                "prediction alias {is_alias}"
+            );
+        }
+    }
 }
 
 /// A `-sys` crate compiled as a library: its build script placed the archive

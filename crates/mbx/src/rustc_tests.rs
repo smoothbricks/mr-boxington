@@ -27,17 +27,13 @@ fn compiler_pins_name_a_toolchain_rustc_and_nothing_else() {
 #[test]
 fn compiler_identity_hashes_sysroot_codegen_backends() {
     let directory = tempfile::tempdir().unwrap();
-    let bin = directory.path().join("bin");
-    std::fs::create_dir_all(&bin).unwrap();
-    let rustc = bin.join("rustc");
-    std::fs::write(&rustc, "compiler").unwrap();
     let rustlib = directory.path().join("lib/rustlib");
     let backends = rustlib.join("aarch64-apple-darwin/codegen-backends");
     // Another target's backends are never loaded, so they stay out.
     let other = rustlib.join("x86_64-pc-windows-msvc/codegen-backends");
     std::fs::create_dir_all(&other).unwrap();
     std::fs::write(other.join("librustc_codegen_other.dll"), "unused").unwrap();
-    let probe = || codegen_backends(rustc.as_os_str(), "aarch64-apple-darwin").unwrap();
+    let probe = || codegen_backends(Some(directory.path()), "aarch64-apple-darwin").unwrap();
 
     let (absent, identity) = probe();
     assert!(identity.is_empty());
@@ -531,7 +527,7 @@ fn parses_verbose_rustc_identity() {
 #[test]
 fn mappings_do_not_duplicate_home_placeholders() {
     let directory = tempfile::tempdir().unwrap();
-    let mappings = path_mappings(directory.path(), None, None);
+    let mappings = path_mappings(directory.path(), None, None, None);
     let placeholders = mappings
         .iter()
         .map(|mapping| &mapping.placeholder)
@@ -539,12 +535,234 @@ fn mappings_do_not_duplicate_home_placeholders() {
     assert_eq!(placeholders.len(), mappings.len());
 }
 
+fn sysroot_action_context(working_dir: &Path, mappings: Vec<PathMapping>) -> ActionContext {
+    ActionContext {
+        compiler: CompilerIdentity {
+            toolchain: "1.97.0".into(),
+            rustc_version: "rustc 1.97.0; commit-hash: abc".into(),
+            host: "x86_64-unknown-linux-gnu".into(),
+            driver: None,
+        },
+        working_dir: working_dir.to_path_buf(),
+        path_mappings: mappings,
+        environment: BTreeMap::new(),
+        portable_environment: BTreeSet::new(),
+        inputs: vec![ActionInput {
+            path: working_dir.join("lib.rs"),
+            digest: CacheDigest::blake3(b"pub fn fixture() {}\n"),
+        }],
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn selected_default_sysroot_maps_aliases_archives_and_distinguishes_installations() {
+    use std::os::unix::fs::symlink;
+
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let workspace = root.join("workspace");
+    let physical = root.join("nix/store/first-rustc");
+    let library = Path::new("lib/rustlib/x86_64-unknown-linux-gnu/lib");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::create_dir_all(physical.join("bin")).unwrap();
+    std::fs::create_dir_all(physical.join(library)).unwrap();
+    std::fs::write(workspace.join("lib.rs"), "pub fn fixture() {}\n").unwrap();
+    std::fs::write(physical.join("bin/rustc"), "compiler").unwrap();
+    let archive = physical.join(library).join("libfixture.a");
+    std::fs::write(&archive, b"archive").unwrap();
+    let selected = root.join("selected-toolchain");
+    symlink(&physical, &selected).unwrap();
+    let discovered_root = compiler_sysroot(selected.join("bin/rustc").as_os_str()).unwrap();
+    let mapping = default_sysroot_mapping(discovered_root.canonicalize().unwrap()).unwrap();
+    assert_eq!(mapping.root, physical, "restores use the physical root");
+
+    let invocation = |sysroot: &Path| {
+        RustcInvocation::parse(&[
+            "--crate-name=fixture".into(),
+            "--crate-type=lib".into(),
+            "--emit=dep-info,metadata,link".into(),
+            "--out-dir=target".into(),
+            format!("--sysroot={}", sysroot.display()).into(),
+            format!("-Lnative={}", sysroot.join(library).display()).into(),
+            "-lstatic=fixture".into(),
+            "lib.rs".into(),
+        ])
+        .unwrap()
+    };
+    let dep_info = RustcDepInfo::parse("target/fixture.d: lib.rs\n").unwrap();
+    let before = path_mappings_with_env(&workspace, None, None, None, |_| None);
+    assert!(matches!(
+        invocation(&physical)
+            .invocation_digest(&sysroot_action_context(&workspace, before.clone())),
+        Err(BypassReason::UnmappedAbsolutePath(_))
+    ));
+    assert_eq!(
+        invocation(&physical).discover_inputs_with_mappings(
+            &dep_info,
+            &workspace,
+            &before,
+            &mbx_cache_core::NoFileDigestCache,
+        ),
+        Err(BypassReason::UnsupportedSearchPath("native".into()))
+    );
+
+    let mappings = path_mappings_with_env(&workspace, None, None, Some(&mapping), |_| None);
+    let action = |sysroot: &Path, mappings: Vec<PathMapping>| {
+        let invocation = invocation(sysroot);
+        let discovered = invocation
+            .discover_inputs_with_mappings(
+                &dep_info,
+                &workspace,
+                &mappings,
+                &mbx_cache_core::NoFileDigestCache,
+            )
+            .unwrap();
+        assert!(discovered.inputs.iter().any(|input| {
+            input.path.file_name() == Some(OsStr::new("libfixture.a"))
+                && input.digest == CacheDigest::blake3(b"archive")
+        }));
+        let mut context = sysroot_action_context(&workspace, mappings);
+        discovered.apply_to(&mut context).unwrap();
+        invocation.action(context).unwrap()
+    };
+    let physical_action = action(&physical, mappings.clone());
+    assert_eq!(physical_action, action(&selected, mappings.clone()));
+    assert!(
+        String::from_utf8_lossy(&physical_action.bytes)
+            .contains(&format!("${{{}}}/", mapping.placeholder))
+    );
+    assert!(normalize_mapped_path(&root.join("custom-sysroot"), &workspace, &mappings).is_err());
+
+    let other = root.join("nix/store/second-rustc");
+    std::fs::create_dir_all(other.join(library)).unwrap();
+    std::fs::write(other.join(library).join("libfixture.a"), b"archive").unwrap();
+    let other_mapping = default_sysroot_mapping(other.canonicalize().unwrap()).unwrap();
+    let other_mappings =
+        path_mappings_with_env(&workspace, None, None, Some(&other_mapping), |_| None);
+    assert_ne!(
+        physical_action.digest,
+        action(&other, other_mappings).digest
+    );
+
+    let mut other_compiler = sysroot_action_context(&workspace, mappings);
+    invocation(&physical)
+        .discover_inputs_with_mappings(
+            &dep_info,
+            &workspace,
+            &other_compiler.path_mappings,
+            &mbx_cache_core::NoFileDigestCache,
+        )
+        .unwrap()
+        .apply_to(&mut other_compiler)
+        .unwrap();
+    other_compiler.compiler.rustc_version = "rustc 1.97.0; commit-hash: def".into();
+    assert_ne!(
+        physical_action.digest,
+        invocation(&physical).action(other_compiler).unwrap().digest
+    );
+}
+
+#[test]
+fn covered_default_sysroots_keep_existing_action_bytes() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let home = root.join("home");
+    let workspace = root.join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    for sysroot in [
+        home.join(".rustup/toolchains/stable"),
+        home.join("toolchains/custom"),
+    ] {
+        std::fs::create_dir_all(&sysroot).unwrap();
+        let mapping = default_sysroot_mapping(sysroot.canonicalize().unwrap()).unwrap();
+        let environment = |name: &str| match name {
+            "HOME" => Some(home.as_os_str().to_owned()),
+            _ => None,
+        };
+        let before = path_mappings_with_env(&workspace, None, None, None, environment);
+        let after = path_mappings_with_env(&workspace, None, None, Some(&mapping), environment);
+        assert_eq!(
+            before, after,
+            "existing semantic mappings must be unchanged"
+        );
+        let invocation = RustcInvocation::parse(&[
+            "--crate-type=lib".into(),
+            "--emit=dep-info,metadata".into(),
+            "--out-dir=target".into(),
+            format!("--sysroot={}", sysroot.display()).into(),
+            "lib.rs".into(),
+        ])
+        .unwrap();
+        assert_eq!(
+            invocation
+                .action(sysroot_action_context(&workspace, before))
+                .unwrap()
+                .bytes,
+            invocation
+                .action(sysroot_action_context(&workspace, after))
+                .unwrap()
+                .bytes,
+            "adding the selected default root must not churn an existing action key"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn covered_physical_sysroot_keeps_existing_rustup_alias_action_bytes() {
+    use std::os::unix::fs::symlink;
+
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let workspace = root.join("workspace");
+    let home = root.join("home");
+    let physical_rustup = root.join("toolchains");
+    let sysroot = physical_rustup.join("stable");
+    let rustup = home.join(".rustup");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&sysroot).unwrap();
+    symlink(&physical_rustup, &rustup).unwrap();
+    let mapping = default_sysroot_mapping(sysroot.canonicalize().unwrap()).unwrap();
+    let environment = |name: &str| match name {
+        "HOME" => Some(home.as_os_str().to_owned()),
+        "RUSTUP_HOME" => Some(rustup.as_os_str().to_owned()),
+        _ => None,
+    };
+    let before = path_mappings_with_env(&workspace, None, None, None, environment);
+    let after = path_mappings_with_env(&workspace, None, None, Some(&mapping), environment);
+    assert_eq!(
+        before, after,
+        "a physical root already covered through rustup is not new"
+    );
+    let invocation = RustcInvocation::parse(&[
+        "--crate-type=lib".into(),
+        "--emit=dep-info,metadata".into(),
+        "--out-dir=target".into(),
+        format!("--sysroot={}", sysroot.display()).into(),
+        "lib.rs".into(),
+    ])
+    .unwrap();
+    assert_eq!(
+        invocation
+            .action(sysroot_action_context(&workspace, before))
+            .unwrap()
+            .bytes,
+        invocation
+            .action(sysroot_action_context(&workspace, after))
+            .unwrap()
+            .bytes,
+        "resolved-root coverage must keep the existing action key byte-for-byte"
+    );
+}
+
 #[test]
 fn standalone_workspace_mapping_wins_beneath_home() {
     let directory = tempfile::tempdir().unwrap();
     let home = directory.path().join("home");
     let workspace = home.join("src/project");
-    let mappings = path_mappings_with_env(&workspace, None, None, |name| match name {
+    let mappings = path_mappings_with_env(&workspace, None, None, None, |name| match name {
         "HOME" => Some(home.as_os_str().to_owned()),
         _ => None,
     });
@@ -570,7 +788,7 @@ fn standalone_workspace_mapping_uses_the_outer_workspace_for_members() {
     std::fs::write(workspace.join("Cargo.lock"), "").unwrap();
     std::fs::write(member.join("Cargo.toml"), "[package]\nname = \"widget\"\n").unwrap();
 
-    let mappings = path_mappings_with_env(&member, None, None, |_| None);
+    let mappings = path_mappings_with_env(&member, None, None, None, |_| None);
 
     assert!(
         mappings
@@ -591,7 +809,7 @@ fn standalone_registry_mapping_uses_the_default_cargo_home() {
     )
     .unwrap();
 
-    let mappings = path_mappings_with_env(&dependency, None, None, |name| match name {
+    let mappings = path_mappings_with_env(&dependency, None, None, None, |name| match name {
         "HOME" => Some(home.as_os_str().to_owned()),
         _ => None,
     });
@@ -618,6 +836,7 @@ fn session_mappings(
 ) -> Vec<PathMapping> {
     PathMapping::ordered(&path_mappings_with_env(
         working_dir,
+        None,
         None,
         None,
         |name| match name {
@@ -705,6 +924,7 @@ fn cargo_registry_mapping_follows_a_child_symlink() {
 
     let mappings = PathMapping::ordered(&path_mappings_with_env(
         directory.path(),
+        None,
         None,
         None,
         |name| match name {
@@ -1603,7 +1823,7 @@ fn a_stable_out_dir_is_mapped_by_name_beneath_its_root() {
     let root = directory.path().join("cache/out-dirs/v1");
     let out_dir = root.join("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
     let workspace = directory.path().join("src/project");
-    let mappings = path_mappings_with_env(&workspace, None, None, |name| match name {
+    let mappings = path_mappings_with_env(&workspace, None, None, None, |name| match name {
         "OUT_DIR" => Some(out_dir.as_os_str().to_owned()),
         crate::out_dir::ROOT_ENV => Some(root.as_os_str().to_owned()),
         _ => None,
@@ -1619,7 +1839,7 @@ fn a_stable_out_dir_is_mapped_by_name_beneath_its_root() {
     // Cargo's own OUT_DIR, under the target directory, is not a root of its
     // own: it normalizes under `${target}` as it always did.
     let checkout_out_dir = workspace.join("target/debug/build/x/out");
-    let mappings = path_mappings_with_env(&workspace, None, None, |name| match name {
+    let mappings = path_mappings_with_env(&workspace, None, None, None, |name| match name {
         "OUT_DIR" => Some(checkout_out_dir.as_os_str().to_owned()),
         crate::out_dir::ROOT_ENV => Some(root.as_os_str().to_owned()),
         _ => None,
@@ -1646,6 +1866,7 @@ fn external_native_mappings_preserve_installation_identity() {
     .unwrap();
     let mut portable = Portable {
         mappings: vec![PathMapping::new(&workspace, "workspace")],
+        compiler_mappings: OnceLock::new(),
         arguments: vec![],
         build_script_inputs: None,
     };
@@ -1690,6 +1911,7 @@ fn relative_external_native_paths_are_mapped_from_the_working_directory() {
     .unwrap();
     let mut portable = Portable {
         mappings: vec![PathMapping::new(&workspace, "workspace")],
+        compiler_mappings: OnceLock::new(),
         arguments: vec![],
         build_script_inputs: None,
     };
@@ -1718,6 +1940,7 @@ fn relative_external_native_paths_are_mapped_from_the_working_directory() {
     .unwrap();
     let mut absolute_portable = Portable {
         mappings: vec![PathMapping::new(&workspace, "workspace")],
+        compiler_mappings: OnceLock::new(),
         arguments: vec![],
         build_script_inputs: None,
     };
