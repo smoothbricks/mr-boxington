@@ -62,3 +62,20 @@ fn a_reservation_inside_a_reservation_runs_under_the_enclosing_grant() {
         );
     }
 }
+
+#[test]
+fn reserve_options_stay_out_of_its_command() {
+    for options in [&["--grant-fd", "5"][..], &["--grant-fd=5"]] {
+        let argv = ["mbx", "reserve", "--cpus", "1"]
+            .iter()
+            .chain(options)
+            .chain(&["--", "sh", "-c", "exit 3"])
+            .map(std::ffi::OsString::from)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            original_reserve_arguments(&argv).unwrap(),
+            ["sh", "-c", "exit 3"],
+            "{options:?}"
+        );
+    }
+}

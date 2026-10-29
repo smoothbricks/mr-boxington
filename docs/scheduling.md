@@ -347,7 +347,9 @@ its own, instead of queueing behind capacity its enclosing reservation holds.
 `--memory` is measured against `scheduler.memory`; omit it when memory
 scheduling is disabled. Use `--priority low` for background work that
 should yield at admission time to waiting normal-priority builds; an admitted
-reservation, like an admitted compiler, is never preempted.
+reservation, like an admitted compiler, is never preempted. `--grant-fd` tells a
+supervisor when the reservation gets its capacity; see
+[Tell a supervisor when work holds capacity](#tell-a-supervisor-when-work-holds-capacity).
 
 ## Schedule test binaries
 
@@ -407,7 +409,10 @@ test that waits can be reported as SLOW, and with `terminate-after` it can be
 killed before it starts. After one second of waiting, mbx writes a note to the
 test's stderr, which nextest shows beside the report. If your nextest profile
 sets `terminate-after`, leave room in it for queueing, or lower nextest's
-`--test-threads` so fewer tests queue at once.
+`--test-threads` so fewer tests queue at once. A supervisor outside nextest,
+such as one that stops a test run making no progress, can tell queued tests
+from running ones with a
+[grant descriptor](#tell-a-supervisor-when-work-holds-capacity).
 
 Builds a test starts, such as trybuild or compile-fail suites, are charged to
 the test's permits and run without taking permits of their own.
@@ -423,6 +428,42 @@ These run unscheduled:
   than the requested or host target
 - test binaries run directly, without `cargo test` or `cargo nextest`
 - other test runners
+
+## Tell a supervisor when work holds capacity
+
+A supervisor that stops work making no progress cannot tell a process waiting
+for capacity from one that is running. A grant descriptor tells it: mbx writes
+one byte to the descriptor for each event, `g` when a hold of capacity begins
+and `r` when that hold is released.
+
+Set `MBX_GRANT_FD` to a descriptor number, open that descriptor for writing,
+and every admission mbx makes in the process tree announces itself there:
+compilers, each Cargo test binary or nextest test, and `mbx reserve` without
+`--grant-fd`. Each holder writes its own `g` and `r`, so a supervisor that
+counts them knows whether any of its processes holds capacity, and can run its
+clock only while one does:
+
+```sh
+MBX_GRANT_FD=5 mbx nextest run 5>"$SUPERVISOR_PIPE"
+```
+
+Every process in the tree inherits the descriptor, and work that runs under a
+grant, such as a test's own builds, makes no admissions of its own. mbx ignores
+the variable, logging why at debug level, when the descriptor is not open for
+writing, is standard input, output or error, or is not one the process
+inherited.
+
+`mbx reserve --grant-fd N` announces one reservation on descriptor `N` in
+place of `MBX_GRANT_FD`: `g` once capacity is granted, before the command
+starts, and `r` after the command exits. The command does not inherit `N`, and
+mbx closes it after `r`, so end of file without a `g` means mbx exited before
+it got capacity. A reservation nested in another is granted at once. mbx
+refuses a `--grant-fd` it cannot write to before it reserves anything, and runs
+the command only once `g` is written.
+
+A holder killed by a signal writes no `r`. Its supervisor then counts a hold
+that never ends, and its clock keeps running as it would without a grant
+descriptor. Grant descriptors are a Unix interface.
 
 ## Choose the scope of a limit
 
