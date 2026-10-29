@@ -160,6 +160,12 @@ shim, ordinary `cargo build`, `cargo test`, and `cargo check` commands use mbx
 automatically. Prefixing a Cargo command with `mbx`, as in `mbx build`, still
 works.
 
+Multiple mbx Cargo shims can coexist on `PATH`, for example a project-provided
+shim beside a standalone installation. The active shim skips the others when
+selecting the real Cargo, including a `CARGO` override that names another mbx
+shim. Nested Cargo commands keep using the enclosing session. Other tools in
+a shared package profile remain on `PATH`.
+
 Outside mise activation, the Cargo shim finds mbx this way:
 
 - On Unix, it runs the mbx that `mbx setup` recorded while that file exists,
