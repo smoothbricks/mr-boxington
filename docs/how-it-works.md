@@ -259,6 +259,11 @@ so its retry runs with more room. These are scheduling estimates, not operating
 system memory limits. Compiler memory use is measured only on Unix; Windows
 keeps the unmeasured guesses.
 
+A Cargo test binary starts with one default memory share and at most half
+the CPU budget, even when its harness is configured for more threads.
+Its own measured peak and CPU use replace those independent estimates on
+later runs; see [test scheduling](/scheduling#schedule-test-binaries).
+
 The pool size, memory budget, and priority are settings; see
 [machine-wide compile scheduling](/scheduling#machine-wide-compile-scheduling).
 

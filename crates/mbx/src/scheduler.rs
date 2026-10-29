@@ -216,9 +216,8 @@ pub(crate) struct Demand {
     name: String,
     /// Whether the invocation links a native program.
     links: bool,
-    /// Permits the process's threads need whatever its memory, or `None` for
-    /// half the pool: a test harness sized to the machine that has not said
-    /// how many threads it will really use.
+    /// Compiler threads, or a test harness's configured width. A cold test
+    /// reservation caps this at half the pool until CPU use is measured.
     threads: Option<u64>,
     /// Whether the ledger's record of cores this process kept busy replaces
     /// `threads`. Only test binaries are measured; a compiler is one thread.
@@ -326,12 +325,10 @@ impl Demand {
 
     /// A test binary, remembered apart from the crate that compiled it.
     ///
-    /// Half the pool by default rather than all of it. libtest starts a
-    /// thread per CPU, but most suites spend much of their time waiting, and
-    /// a demand for the whole pool is admitted only once the pool is idle --
-    /// which a stream of other builds' compilations can postpone
-    /// indefinitely. Half still keeps two suites from each running at full
-    /// width beside a third build's compiles.
+    /// A cold reservation takes at most half the pool, even when the harness
+    /// names a wider thread count. Most suites spend much of their time
+    /// waiting; reserving the whole pool would leave capacity idle behind a
+    /// large head-of-line request. Measured CPU use replaces the cold guess.
     ///
     /// A binary run with a stated thread count is remembered apart from the
     /// same binary at its default width: the two keep different numbers of
@@ -2447,9 +2444,16 @@ impl Pool {
             .learns_cpu
             .then(|| ledger.cpus.get(&demand.name).copied())
             .flatten();
+        let cold_threads = self.capacity.div_ceil(2);
+        let requested_threads = demand.threads.unwrap_or(cold_threads);
         let threads = learned
-            .or(demand.threads)
-            .unwrap_or_else(|| self.capacity.div_ceil(2))
+            .unwrap_or_else(|| {
+                if demand.learns_cpu {
+                    requested_threads.min(cold_threads)
+                } else {
+                    requested_threads
+                }
+            })
             .max(1);
         let link_floor = demand.links.then_some(LINK_WEIGHT);
         if self.bytes_per_permit == 0 {
@@ -2513,14 +2517,17 @@ impl Pool {
             .map_or(1, |bytes| bytes.div_ceil(self.bytes_per_permit))
             .max(threads)
             .clamp(1, self.capacity);
-        let memory_bytes =
-            if predicted.is_none() || matches!(source, "unmeasured" | "default" | "link-floor") {
-                predicted
-                    .unwrap_or(0)
-                    .max(weight.saturating_mul(self.bytes_per_permit))
-            } else {
-                predicted.unwrap_or(0)
-            };
+        let memory_bytes = if demand.learns_cpu {
+            // A suite's working set belongs to the binary, not each harness
+            // thread. Its own peak replaces this one-share cold estimate.
+            predicted.unwrap_or(self.bytes_per_permit)
+        } else if predicted.is_none() || matches!(source, "unmeasured" | "default" | "link-floor") {
+            predicted
+                .unwrap_or(0)
+                .max(weight.saturating_mul(self.bytes_per_permit))
+        } else {
+            predicted.unwrap_or(0)
+        };
         Plan {
             resources: Resources {
                 cpu: threads,

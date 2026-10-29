@@ -62,10 +62,11 @@ Each budget allows an oversize request when no running request consumes that
 resource: an oversize memory request still needs CPU room, and an oversize
 CPU request still needs memory room.
 
-For unmeasured work, the memory guess retains the old permit size: memory
-budget divided by the CPU budget, rounded down. Ordinary single-threaded
-compiles start at one such share, native links at two, and unmeasured nextest
-tests at two. Higher thread counts retain at least their old memory guess.
+For unmeasured work, a default memory share is the memory budget divided by the
+CPU budget, rounded down. Ordinary single-threaded compiles and Cargo test
+binaries start at one such share, native links and unmeasured nextest tests at
+two. A test binary's cold memory charge does not grow with its thread count;
+higher compiler thread counts retain at least their old memory guess.
 Measurements refine later admissions and use raw predicted bytes, without
 rounding to CPU shares. mbx measures compiler memory on Unix only, so on
 Windows, compilations keep the starting guesses. Set
@@ -386,17 +387,28 @@ For Cargo test, each test binary waits for permits before it starts:
 
 - Once a binary has been measured, it asks for the average number of cores it
   kept busy: CPU time divided by wall time, rounded to the nearest core.
-- Before that, `--test-threads=N` or `RUST_TEST_THREADS=N` asks for `N`
-  cores, and otherwise the binary asks for half the CPU budget, rounded up.
+- Before a CPU observation exists, `--test-threads=N` or `RUST_TEST_THREADS=N`
+  asks for the smaller of `N` and half the CPU budget, rounded up. Without a
+  stated count, the binary asks for that half-budget. The harness still runs
+  its configured `N` threads; this is a cold reservation estimate, not a
+  harness thread limit. A measured CPU observation replaces the estimate on
+  the next run, including when it exceeds half the CPU budget.
 - Memory is charged separately using the binary's measured peak. Before a
-  measurement exists, its memory guess preserves the old thread-based charge.
+  memory observation exists, one default memory share is charged once per
+  binary, not once per harness thread.
+
+This avoids a cold binary becoming a whole-machine head-of-line request. On
+2026-10-29, PID 21674 requested 18 CPU and 116.8 GB for an unmeasured
+18-thread binary, then waited 279 seconds behind a one-core compilation.
+The binary ran for 50 ms and peaked at 18.4 MB. The cold bounds leave room for
+other work while observations learn what that binary actually uses.
 
 For Cargo test, only complete suite runs are measured; a run narrowed by a
 test name, `--skip`, or `--ignored` is not. A run under a second is too short
 to average, so the binary is recorded as one core. A recorded core count only goes up,
 because a suite measured on a busy machine gets fewer cores than it would use.
-mbx measures CPU and memory on Unix only. On Windows, a Cargo test binary asks
-for its stated thread count or half the pool; an unmeasured nextest test asks
+mbx measures CPU and memory on Unix only. On Windows, a Cargo test binary
+keeps these cold CPU and memory estimates. An unmeasured nextest test asks
 for one core and, when memory scheduling is on, two default memory shares.
 
 History is kept per Git repository, package, and test binary. Worktrees of one
