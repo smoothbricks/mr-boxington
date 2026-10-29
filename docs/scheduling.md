@@ -266,9 +266,11 @@ keeps admitting only itself.
 
 A jittered one-to-one-and-a-half-second recheck notices memory-pressure changes
 and refreshes normal-priority demand. Periodic waiters share admission passes
-for two seconds rather than each rescanning the whole queue. A holder that dies
-without removing its lease is therefore reclaimed within three and a half seconds;
-lease-change notifications bypass this delay. If notifications are unavailable
+from their own pressure domain for two seconds rather than each rescanning the
+whole queue. A holder that dies without removing its lease is therefore reclaimed
+within three and a half seconds, apart from registrar contention and OS scheduling.
+Lease changes trigger an immediate attempt; if the registrar is busy, the bounded
+recheck still guarantees another attempt. If notifications are unavailable
 or fail, waiters log the failure at debug level and use the same bounded recheck;
 other platforms use that recheck too. No daemon or notification socket is needed.
 
