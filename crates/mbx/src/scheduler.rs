@@ -52,6 +52,8 @@
 mod accuracy;
 #[path = "scheduler_decisions.rs"]
 mod decisions;
+#[path = "scheduler_grant.rs"]
+pub(crate) mod grant;
 #[path = "scheduler_memory.rs"]
 mod memory;
 
@@ -425,6 +427,9 @@ pub(crate) struct Permit {
     path: PathBuf,
     /// The build whose permit this is, when children should be told so.
     held_for_build: Option<String>,
+    /// Whether this hold was announced on an inherited grant descriptor,
+    /// which then hears of its release too.
+    announced: bool,
 }
 
 impl Permit {
@@ -437,6 +442,12 @@ impl Permit {
             command.env(SCHED_PERMIT_HELD_ENV, build);
         }
     }
+
+    /// Announce this hold on the grant descriptor this process inherited,
+    /// if it has one.
+    pub(crate) fn announce(&mut self) {
+        self.announced = grant::announce(grant::Event::Granted);
+    }
 }
 
 impl Drop for Permit {
@@ -446,6 +457,9 @@ impl Drop for Permit {
         // concurrent scan does is remove it first.
         drop(self.lock.take());
         let _ = std::fs::remove_file(&self.path);
+        if self.announced {
+            grant::announce(grant::Event::Released);
+        }
     }
 }
 
@@ -2421,7 +2435,7 @@ impl Pool {
             // short of memory delays this compilation rather than starving it.
             let gate = predicted.filter(|_| started.elapsed() < GATE_DEADLINE);
             match self.try_admit_state(resources, weight, gate, &mut state, Some(demand)) {
-                Ok(Some(permit)) => {
+                Ok(Some(mut permit)) => {
                     // A pass grants the record this request last published,
                     // which a reloaded plan may since have changed.
                     let (resources, weight) = state.claimed.take().unwrap_or((resources, weight));
@@ -2433,6 +2447,9 @@ impl Pool {
                         wait_ms: started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
                         started: Instant::now(),
                     }));
+                    // A supervisor that handed down a grant descriptor learns
+                    // that this process now holds capacity.
+                    permit.announce();
                     return Some(permit);
                 }
                 Ok(None) => {}
@@ -3040,6 +3057,7 @@ impl Pool {
                         lock: Some(lock),
                         path,
                         held_for_build: None,
+                        announced: false,
                     });
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -4424,6 +4442,7 @@ fn claim(state: &mut AdmissionState, leases: &Path) -> Option<Permit> {
         lock,
         path: granted,
         held_for_build: None,
+        announced: false,
     })
 }
 
