@@ -99,7 +99,7 @@ fn run_cargo_shim_inner() -> Result<ExitCode> {
             reported_shim.as_deref().map(Path::as_os_str),
             std::env::var_os("PATH").as_deref(),
         );
-        exclude_shim_from_path(&shim)?;
+        exclude_mbx_shim_directories_from_path(&shim)?;
         let real_cargo = selected_cargo(&shim)?;
         blaze_shim = Some(shim);
         real_cargo
@@ -587,13 +587,19 @@ fn path_without_cargo_proxies(
     let mut first_proxy = None;
     let directories = std::env::split_paths(path).filter(|directory| {
         let candidate = directory.join(name);
+        let exists = candidate.is_file();
+        let shim = exists.then(|| mbx_cargo_shim(&candidate)).flatten();
         let is_standalone = standalone_shim.is_some_and(|shim| same_path(&candidate, shim));
-        let is_proxy =
-            candidate.is_file() && (is_standalone || is_mise_command_wrapper_path(&candidate));
+        let is_mise = is_mise_command_wrapper_path(&candidate);
+        let is_proxy = exists && (is_standalone || shim.is_some() || is_mise);
+        let remove = exists
+            && (matches!(shim, Some(MbxCargoShim::Dedicated))
+                || (is_standalone && !matches!(shim, Some(MbxCargoShim::Shared)))
+                || is_mise);
         if is_proxy {
             first_proxy.get_or_insert(candidate);
         }
-        !is_proxy
+        !remove
     });
     Ok((std::env::join_paths(directories)?, first_proxy))
 }
@@ -609,6 +615,7 @@ fn resolve_explicit_cargo(
         candidate.is_absolute()
             && candidate.is_file()
             && !is_mise_command_wrapper_path(candidate)
+            && mbx_cargo_shim(candidate).is_none()
             && standalone_shim.is_none_or(|shim| !same_path(candidate, shim))
     }) {
         return Ok(configured.as_os_str().to_owned());
@@ -616,7 +623,10 @@ fn resolve_explicit_cargo(
     let name = if cfg!(windows) { "cargo.exe" } else { "cargo" };
     for directory in std::env::split_paths(path) {
         let candidate = directory.join(name);
-        if candidate.is_file() {
+        if candidate.is_file()
+            && mbx_cargo_shim(&candidate).is_none()
+            && standalone_shim.is_none_or(|shim| !same_path(&candidate, shim))
+        {
             return Ok(candidate.into_os_string());
         }
     }
@@ -626,12 +636,12 @@ fn resolve_explicit_cargo(
     )
 }
 
-fn exclude_shim_from_path(shim: &Path) -> Result<()> {
+fn exclude_mbx_shim_directories_from_path(shim: &Path) -> Result<()> {
     let Some(path) = std::env::var_os("PATH") else {
         return Ok(());
     };
     PATH_BEFORE_SHIM_EXCLUSION.get_or_init(|| path.clone());
-    let path = path_without_shim(shim, &path)?;
+    let path = path_without_mbx_shim_directories(shim, &path)?;
     // SAFETY: CLI dispatch is single-threaded here, before any child process
     // or cache session has started.
     unsafe { std::env::set_var("PATH", path) };
@@ -645,13 +655,19 @@ pub(super) fn activation_path() -> Option<OsString> {
         .or_else(|| std::env::var_os("PATH"))
 }
 
-fn path_without_shim(shim: &Path, path: &OsStr) -> Result<OsString> {
-    let Some(shim_dir) = shim.parent() else {
-        return Ok(path.to_owned());
-    };
-    std::env::join_paths(
-        std::env::split_paths(path).filter(|directory| !same_path(directory, shim_dir)),
-    )
+fn path_without_mbx_shim_directories(shim: &Path, path: &OsStr) -> Result<OsString> {
+    let name = if cfg!(windows) { "cargo.exe" } else { "cargo" };
+    let invoking_directory = shim.parent();
+    let invoking_is_shared = matches!(mbx_cargo_shim(shim), Some(MbxCargoShim::Shared));
+    std::env::join_paths(std::env::split_paths(path).filter(|directory| {
+        if invoking_directory.is_some_and(|invoking| same_path(directory, invoking)) {
+            return invoking_is_shared;
+        }
+        !matches!(
+            mbx_cargo_shim(&directory.join(name)),
+            Some(MbxCargoShim::Dedicated)
+        )
+    }))
     .map_err(Into::into)
 }
 
@@ -673,12 +689,60 @@ fn resolve_real_cargo(current: &Path) -> Result<OsString> {
     resolve_real_cargo_from(current, None, &path)
 }
 
+/// Whether running `cargo`, a canonical path, starts mbx: a shim
+/// [`mbx_cargo_shim`] recognizes, or mbx itself under Cargo's name.
+pub(super) fn starts_mbx(cargo: &Path) -> bool {
+    mbx_cargo_shim(cargo).is_some()
+        || std::env::current_exe()
+            .and_then(|exe| exe.canonicalize())
+            .is_ok_and(|exe| exe == cargo)
+}
+
+enum MbxCargoShim {
+    Dedicated,
+    Shared,
+}
+
+fn mbx_cargo_shim(path: &Path) -> Option<MbxCargoShim> {
+    use std::io::Read as _;
+
+    if path.parent()?.join(super::CARGO_SHIM_TARGET_FILE).is_file() {
+        return Some(MbxCargoShim::Dedicated);
+    }
+    let mut file = std::fs::File::open(path).ok()?;
+    // makeWrapper exports shim mode in its script header; never scan a Cargo binary.
+    const WRAPPER_HEADER_BYTES: usize = 4096;
+    let mut header = [0; WRAPPER_HEADER_BYTES];
+    let mut length = 0;
+    let marker = CARGO_SHIM_MODE_ENV.as_bytes();
+    loop {
+        match file.read(&mut header[length..]) {
+            Ok(0) => return None,
+            Ok(read) => length += read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return None,
+        }
+        if length >= 2 && !header[..length].starts_with(b"#!") {
+            return None;
+        }
+        if header[..length]
+            .windows(marker.len())
+            .any(|bytes| bytes == marker)
+        {
+            return Some(MbxCargoShim::Shared);
+        }
+        if length == header.len() {
+            return None;
+        }
+    }
+}
 fn configured_real_cargo(current: &Path, configured: Option<&OsStr>) -> Option<OsString> {
     let configured = Path::new(configured?);
     let current_dir = current.parent();
     (configured.is_absolute()
         && configured.is_file()
         && !is_mise_cargo_proxy_path(configured)
+        && mbx_cargo_shim(configured).is_none()
         && current_dir.is_none_or(|current_dir| {
             configured
                 .parent()
@@ -758,7 +822,10 @@ fn resolve_real_cargo_from(
             continue;
         }
         let candidate = directory.join(name);
-        if candidate.is_file() && !is_mise_cargo_proxy_path(&candidate) {
+        if candidate.is_file()
+            && !is_mise_cargo_proxy_path(&candidate)
+            && mbx_cargo_shim(&candidate).is_none()
+        {
             return Ok(candidate.into_os_string());
         }
     }
@@ -998,7 +1065,7 @@ mod tests {
 
         let active = resolve_active_cargo_shim(&configured, None, Some(&path));
         assert_eq!(active, shim);
-        let path = path_without_shim(&active, &path).unwrap();
+        let path = path_without_mbx_shim_directories(&active, &path).unwrap();
         assert_eq!(
             resolve_real_cargo_from(&active, None, &path).unwrap(),
             real.into_os_string()
@@ -1084,6 +1151,32 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn invoking_binary_shim_is_removed_while_a_shared_header_directory_is_kept() {
+        let directory = tempfile::tempdir().unwrap();
+        let binary_dir = directory.path().join("binary");
+        let shared_dir = directory.path().join("shared");
+        let real_dir = directory.path().join("real");
+        for path in [&binary_dir, &shared_dir, &real_dir] {
+            std::fs::create_dir(path).unwrap();
+        }
+        let binary = binary_dir.join("cargo");
+        std::os::unix::fs::symlink(std::env::current_exe().unwrap(), &binary).unwrap();
+        let shared = shared_dir.join("cargo");
+        std::fs::write(&shared, b"#!/bin/sh\nexport MBX_CARGO_SHIM_MODE=1\n").unwrap();
+        let path = std::env::join_paths([&binary_dir, &shared_dir, &real_dir]).unwrap();
+        assert_eq!(
+            std::env::split_paths(&path_without_mbx_shim_directories(&binary, &path).unwrap())
+                .collect::<Vec<_>>(),
+            [shared_dir.clone(), real_dir.clone()]
+        );
+        let shared_path = std::env::join_paths([&shared_dir, &real_dir]).unwrap();
+        assert_eq!(
+            path_without_mbx_shim_directories(&shared, &shared_path).unwrap(),
+            shared_path
+        );
+    }
     #[test]
     fn cargo_resolution_removes_the_shim_directory_from_child_path() {
         let directory = tempfile::tempdir().unwrap();
@@ -1093,10 +1186,13 @@ mod tests {
         std::fs::create_dir_all(&real_dir).unwrap();
         let name = if cfg!(windows) { "cargo.exe" } else { "cargo" };
         let shim = shim_dir.join(name);
+        std::fs::write(&shim, b"shim").unwrap();
+        std::fs::write(shim_dir.join(super::super::CARGO_SHIM_TARGET_FILE), b"mbx").unwrap();
         let path = std::env::join_paths([&shim_dir, &real_dir]).unwrap();
 
         assert_eq!(
-            std::env::split_paths(&path_without_shim(&shim, &path).unwrap()).collect::<Vec<_>>(),
+            std::env::split_paths(&path_without_mbx_shim_directories(&shim, &path).unwrap())
+                .collect::<Vec<_>>(),
             vec![real_dir]
         );
     }
@@ -1121,6 +1217,7 @@ mod tests {
         let real = real_dir.join(name);
         std::fs::write(&wrapper, b"mise wrapper").unwrap();
         std::fs::write(&shim, b"mbx shim").unwrap();
+        std::fs::write(shim_dir.join(super::super::CARGO_SHIM_TARGET_FILE), b"mbx").unwrap();
         std::fs::write(&mise_shim, b"mise shim").unwrap();
         std::fs::write(&real, b"real").unwrap();
         let path = std::env::join_paths([
