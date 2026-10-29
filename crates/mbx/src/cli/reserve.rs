@@ -2,9 +2,14 @@
 
 use super::cargo::exit_code;
 use crate::config::{Config, SchedulerPriority};
+use crate::scheduler::{Pool, SCHED_DISABLE_ENV};
 use bytesize::ByteSize;
 use eyre::{Result, WrapErr};
+use std::ffi::OsStr;
 use std::process::{Command, ExitCode};
+
+/// Marks the worker process that holds one reservation's lease.
+const WORKER_ENV: &str = "MBX_RESERVE_WORKER";
 
 #[derive(usage_rs::Args)]
 pub(super) struct ReserveArgs {
@@ -22,11 +27,42 @@ pub(super) struct ReserveArgs {
     pub(super) command: Vec<String>,
 }
 
-pub(super) fn run(config: &Config, args: ReserveArgs) -> Result<ExitCode> {
-    if std::env::var_os("MBX_RESERVE_WORKER").is_some() {
-        return run_direct(config, args);
-    }
+/// Where one `mbx reserve` gets its capacity.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Route {
+    /// Start the worker that holds the lease for the command's life.
+    Spawn,
+    /// This process is that worker: reserve, then run the command.
+    Reserve,
+    /// An enclosing reservation already covers this process tree: run the
+    /// command under that grant. Reserving again would queue behind the
+    /// capacity the enclosing reservation itself holds, and wait forever once
+    /// that is the whole pool.
+    Enclosed,
+}
 
+/// The route the inherited environment selects: whether an enclosing
+/// reservation covers this process, and whether it is a reservation's worker.
+pub(super) fn route(enclosing: Option<&OsStr>, worker: Option<&OsStr>) -> Route {
+    match (enclosing, worker) {
+        (Some(_), _) => Route::Enclosed,
+        (None, Some(_)) => Route::Reserve,
+        (None, None) => Route::Spawn,
+    }
+}
+
+pub(super) fn run(config: &Config, args: ReserveArgs) -> Result<ExitCode> {
+    match route(
+        std::env::var_os(SCHED_DISABLE_ENV).as_deref(),
+        std::env::var_os(WORKER_ENV).as_deref(),
+    ) {
+        Route::Spawn => spawn_worker(&args),
+        Route::Reserve => run_direct(config, &args),
+        Route::Enclosed => run_enclosed(config, &args),
+    }
+}
+
+fn spawn_worker(args: &ReserveArgs) -> Result<ExitCode> {
     let mut worker = Command::new(std::env::current_exe()?);
     worker.arg("reserve");
     if let Some(cpus) = args.cpus {
@@ -37,19 +73,14 @@ pub(super) fn run(config: &Config, args: ReserveArgs) -> Result<ExitCode> {
     }
     worker.args(["--priority", args.priority.as_str(), "--"]);
     worker.args(&args.command);
-    worker.env("MBX_RESERVE_WORKER", "1");
+    worker.env(WORKER_ENV, "1");
     Ok(exit_code(
         worker.status().wrap_err("failed to start reserve worker")?,
     ))
 }
 
-fn run_direct(config: &Config, args: ReserveArgs) -> Result<ExitCode> {
-    let Some((program, arguments)) = args.command.split_first() else {
-        eyre::bail!("reserve needs a command to run")
-    };
-    let Some(pool) = crate::scheduler::reservation_pool(config, args.priority) else {
-        eyre::bail!("reserve needs scheduler.enabled")
-    };
+fn run_direct(config: &Config, args: &ReserveArgs) -> Result<ExitCode> {
+    let (program, arguments, pool) = reservation(config, args)?;
     let (permit, admission) =
         pool.reserve_observed(args.cpus, args.memory.map(|memory| memory.as_u64()))?;
     let status = external_command(program, arguments)
@@ -63,6 +94,32 @@ fn run_direct(config: &Config, args: ReserveArgs) -> Result<ExitCode> {
     Ok(exit_code(status))
 }
 
+fn run_enclosed(config: &Config, args: &ReserveArgs) -> Result<ExitCode> {
+    let (program, arguments, pool) = reservation(config, args)?;
+    // The refusals of a reservation of its own: nesting never turns a
+    // malformed request into a silently accepted one.
+    pool.reservation_weight(args.cpus, args.memory.map(|memory| memory.as_u64()))?;
+    log::debug!("an enclosing reservation covers {program}; it runs under that grant");
+    let status = external_command(program, arguments)
+        .status()
+        .wrap_err_with(|| format!("failed to run {program}"))?;
+    Ok(exit_code(status))
+}
+
+/// The command one reservation runs and the pool it reserves from.
+fn reservation<'a>(
+    config: &Config,
+    args: &'a ReserveArgs,
+) -> Result<(&'a str, &'a [String], Pool)> {
+    let Some((program, arguments)) = args.command.split_first() else {
+        eyre::bail!("reserve needs a command to run")
+    };
+    let Some(pool) = crate::scheduler::reservation_pool(config, args.priority) else {
+        eyre::bail!("reserve needs scheduler.enabled")
+    };
+    Ok((program, arguments, pool))
+}
+
 pub(super) fn external_command(program: &str, arguments: &[String]) -> Command {
     let mut command = Command::new(program);
     command
@@ -71,9 +128,9 @@ pub(super) fn external_command(program: &str, arguments: &[String]) -> Command {
         // shims take new permits would deadlock when this lease fills the pool.
         .env(crate::scheduler::SCHED_DIR_ENV, "")
         .env(crate::scheduler::SCHED_DISABLE_ENV, "1")
-        // The private worker marker applies only to this reservation. A nested
-        // `mbx reserve` must start its own worker so its lease follows its
-        // command even when this external command launches it in the background.
-        .env_remove("MBX_RESERVE_WORKER");
+        // The worker marker applies only to this reservation. A nested
+        // `mbx reserve` sees the enclosing grant through the scheduler marker
+        // above and runs under it.
+        .env_remove(WORKER_ENV);
     command
 }
