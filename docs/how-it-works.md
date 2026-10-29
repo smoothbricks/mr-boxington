@@ -83,6 +83,13 @@ compiles differently keeps its own key. Build-script runs stay per profile,
 because a script can read the profile's name from its `OUT_DIR` and emit
 something that depends on it.
 
+For Rust compilers installed outside those roots, mbx also maps the selected
+compiler's physical default sysroot. Aliases of that root share its mapping,
+but distinct installations keep distinct path identities even when their
+version text matches. Existing home and rustup mappings are unchanged. An
+arbitrary `--sysroot` override does not become the selected compiler's default:
+it must already fall under a known mapping or the action bypasses the cache.
+
 The key also covers compiler inputs and relevant environment. If mbx cannot
 model something exactly, it bypasses the action.
 
