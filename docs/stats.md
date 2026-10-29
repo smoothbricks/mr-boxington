@@ -60,12 +60,25 @@ backfill that history.
 
 ## JSON report
 
-The [versioned JSON report](/stability#json-output-is-versioned) includes
-`version`, `store`, `savings`, `cache`, and `sharing`. Sizes are integer
+The full [versioned JSON report](/stability#json-output-is-versioned), version 1,
+includes `version`, `store`, `savings`, `cache`, and `sharing`. Sizes are integer
 bytes, durations are nanoseconds, and times are Unix timestamps in seconds; an
 unknown start time is `null`. Its field names identify estimates and
 cumulative counters. JSON never contains quips.
 
+For repeated scheduler admission observation, request the activity-only projection:
+
+```sh
+mbx stats --scheduler --json --activity
+```
+
+This version 2 report contains only `version` and `scheduler.activity`; it omits
+store, savings, cache, sharing, memory estimates, calibration and historical
+summaries. It reads the same current lease and waiter records as the full
+report, without collecting store statistics or loading scheduler histories.
+The [activity fields and their evidence limits](/scheduling#machine-wide-compile-scheduling)
+are identical in both projections. `--activity` without both `--scheduler` and
+`--json` is a usage error. The existing full report remains version 1.
 ## A little personality
 
 With the default [`savings = "quips"`](/configuration#the-savings-line), the

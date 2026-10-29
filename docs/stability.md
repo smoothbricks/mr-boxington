@@ -37,6 +37,7 @@ These outputs are versioned JSON documents:
 
 - `mbx doctor --json`
 - `mbx stats --json`
+- `mbx stats --scheduler --json --activity` (version 2 activity-only projection)
 - `mbx cache stats --json`
 - `mbx cache dir --json`
 - `mbx gc --json`

@@ -354,6 +354,8 @@ struct Samples {
 
 impl Summary {
     pub(super) fn read(dir: &Path) -> Self {
+        #[cfg(test)]
+        REPORT_SUMMARY_READS.with(|reads| reads.set(reads.get() + 1));
         let mut summary = Self::default();
         let mut keys: BTreeMap<String, Samples> = BTreeMap::new();
         for name in [PREVIOUS, FILE] {
