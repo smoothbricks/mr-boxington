@@ -7453,67 +7453,74 @@ mod target_views {
     #[cfg(unix)]
     #[test]
     fn a_failed_seed_shim_copy_falls_back_to_a_working_build() {
-        let store = tempfile::tempdir().unwrap();
-        let cargo_home = tempfile::tempdir().unwrap();
-        let repository = tempfile::tempdir().unwrap();
-        let first = tempfile::tempdir().unwrap();
-        let second = tempfile::tempdir().unwrap();
-        let reports = tempfile::tempdir().unwrap();
-        write_seeded_dependency(repository.path());
-        for checkout in [first.path(), second.path()] {
-            write_git_dependent_project(checkout, repository.path());
+        for relocated in [true, false] {
+            let store = tempfile::tempdir().unwrap();
+            let cargo_home = tempfile::tempdir().unwrap();
+            let repository = tempfile::tempdir().unwrap();
+            let first = tempfile::tempdir().unwrap();
+            let second = tempfile::tempdir().unwrap();
+            let reports = tempfile::tempdir().unwrap();
+            write_seeded_dependency(repository.path());
+            for checkout in [first.path(), second.path()] {
+                write_git_dependent_project(checkout, repository.path());
+            }
+            let home = cargo_home.path().to_str().unwrap();
+            let status = Command::new(cargo())
+                .current_dir(first.path())
+                .args(["generate-lockfile"])
+                .env("CARGO_HOME", home)
+                .status()
+                .expect("cargo should resolve the local Git dependency");
+            assert!(status.success());
+            std::fs::copy(
+                first.path().join("Cargo.lock"),
+                second.path().join("Cargo.lock"),
+            )
+            .unwrap();
+            build_with(
+                first.path(),
+                store.path(),
+                &reports.path().join("first.json"),
+                &[("MBX_TARGET_VIEWS", "1"), ("CARGO_HOME", home)],
+            );
+            if !managed(first.path())
+                .join("debug/build/seeded-dep")
+                .is_dir()
+            {
+                return;
+            }
+            let profile = managed(first.path()).join("debug");
+            let shims = profile.join(".mbx-build-script-shims");
+            if relocated {
+                // An older interrupted seed can already have left a launcher
+                // whose identity is absent, while unrelated pins still exist.
+                std::fs::rename(&shims, profile.join("relocated-shims")).unwrap();
+                std::fs::create_dir_all(shims.join("unrelated")).unwrap();
+                std::fs::write(shims.join("unrelated/mbx"), b"unrelated").unwrap();
+            } else {
+                // A failed pin copy must not publish any fresh build units.
+                std::os::unix::fs::symlink("../missing", shims.join("unavailable")).unwrap();
+            }
+            build_with(
+                second.path(),
+                store.path(),
+                &reports.path().join("second.json"),
+                &[
+                    ("MBX_TARGET_VIEWS", "1"),
+                    ("CARGO_HOME", home),
+                    ("SEEDED_FLAVOR", "spicy"),
+                ],
+            );
+            let generated = find_files(&managed(second.path()).join("debug"), |path| {
+                file_name_is(path, |name| name == "flavor.rs")
+            });
+            assert!(
+                generated
+                    .iter()
+                    .any(|path| std::fs::read_to_string(path).unwrap().contains("spicy")),
+                "the rebuilt build script must run with the receiver's environment; relocated={relocated}"
+            );
         }
-        let home = cargo_home.path().to_str().unwrap();
-        let status = Command::new(cargo())
-            .current_dir(first.path())
-            .args(["generate-lockfile"])
-            .env("CARGO_HOME", home)
-            .status()
-            .expect("cargo should resolve the local Git dependency");
-        assert!(status.success());
-        std::fs::copy(
-            first.path().join("Cargo.lock"),
-            second.path().join("Cargo.lock"),
-        )
-        .unwrap();
-        build_with(
-            first.path(),
-            store.path(),
-            &reports.path().join("first.json"),
-            &[("MBX_TARGET_VIEWS", "1"), ("CARGO_HOME", home)],
-        );
-        if !managed(first.path())
-            .join("debug/build/seeded-dep")
-            .is_dir()
-        {
-            return;
-        }
-        // The donor's units are readable, but the pinned-shim copy cannot
-        // finish. No fresh unit may escape before that dependency is ready.
-        std::os::unix::fs::symlink(
-            "../missing",
-            managed(first.path()).join("debug/.mbx-build-script-shims/unavailable"),
-        )
-        .unwrap();
-        build_with(
-            second.path(),
-            store.path(),
-            &reports.path().join("second.json"),
-            &[
-                ("MBX_TARGET_VIEWS", "1"),
-                ("CARGO_HOME", home),
-                ("SEEDED_FLAVOR", "spicy"),
-            ],
-        );
-        let generated = find_files(&managed(second.path()).join("debug"), |path| {
-            file_name_is(path, |name| name == "flavor.rs")
-        });
-        assert!(
-            generated
-                .iter()
-                .any(|path| std::fs::read_to_string(path).unwrap().contains("spicy")),
-            "the rebuilt build script must run with the receiver's environment"
-        );
     }
 
     #[cfg(unix)]

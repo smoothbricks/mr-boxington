@@ -219,6 +219,36 @@ fn absolute_shebang(interpreter: &Path) -> Option<String> {
     acceptable.then(|| format!("#!{interpreter}\n"))
 }
 
+/// Where a launcher names its pin: `<profile>/.mbx-build-script-shims/<identity>/mbx`.
+#[cfg(unix)]
+const PIN_MARKER: &str = "/.mbx-build-script-shims/";
+
+/// The pin a direct shebang launcher runs, `<identity>/mbx` below its profile's
+/// pin directory.
+#[cfg(unix)]
+fn direct_launcher_pin(content: &str) -> Option<&str> {
+    let line = content.strip_prefix("#!")?;
+    if line.lines().count() != 1 || line.contains(' ') {
+        return None;
+    }
+    let (_, pin) = line.split_once(PIN_MARKER)?;
+    Some(pin.trim_end())
+}
+
+/// The pin either launcher [`install_launcher`] writes runs, `<identity>/mbx`
+/// below its profile's pin directory; `None` for any other file.
+#[cfg(unix)]
+pub(crate) fn launcher_pin(content: &str) -> Option<&str> {
+    let Some(script) = content.strip_prefix("#!/bin/sh\n") else {
+        return direct_launcher_pin(content);
+    };
+    script
+        .strip_prefix(session::BUILD_SCRIPT_SHIM_PATH_ENV)?
+        .strip_prefix("=\"$0\" exec \"$(dirname \"$0\")/")?
+        .strip_suffix("\" \"$@\"\n")?
+        .trim_start_matches("../")
+        .strip_prefix(&PIN_MARKER[1..])
+}
 /// Point a launcher copied from another target directory at the mbx pinned in
 /// `profile`, which the launcher sits `depth` levels below. A launcher that is
 /// not a direct shebang one is left alone, since its relative path already
@@ -232,7 +262,6 @@ pub(crate) fn retarget_launcher(
     profile: &Path,
     depth: usize,
 ) -> std::io::Result<()> {
-    const MARKER: &str = "/.mbx-build-script-shims/";
     let metadata = std::fs::metadata(launcher)?;
     if metadata.len() > 4096 {
         return Ok(());
@@ -240,26 +269,16 @@ pub(crate) fn retarget_launcher(
     let Ok(content) = std::fs::read_to_string(launcher) else {
         return Ok(());
     };
-    let Some(line) = content.strip_prefix("#!") else {
+    let Some(pin) = direct_launcher_pin(&content) else {
         return Ok(());
     };
-    let Some((_, rest)) = line.split_once(MARKER) else {
-        return Ok(());
-    };
-    if line.lines().count() != 1 || line.contains(' ') {
-        return Ok(());
-    }
     let interpreter = std::path::absolute(profile)?
         .join(".mbx-build-script-shims")
-        .join(rest.trim_end());
+        .join(pin);
     // The receiving profile's path may be too long for a shebang even though
     // the donor's was not, so fall back to the relative shell launcher.
-    let shebang = absolute_shebang(&interpreter).unwrap_or_else(|| {
-        shell_launcher(
-            &Path::new(".mbx-build-script-shims").join(rest.trim_end()),
-            depth,
-        )
-    });
+    let shebang = absolute_shebang(&interpreter)
+        .unwrap_or_else(|| shell_launcher(&Path::new(".mbx-build-script-shims").join(pin), depth));
     if shebang == content {
         return Ok(());
     }

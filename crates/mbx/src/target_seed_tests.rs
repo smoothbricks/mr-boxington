@@ -331,6 +331,8 @@ fn existing_pins_survive_resuming_a_profile_seed() {
     let destination = to.path().join("debug/.mbx-build-script-shims");
     std::fs::create_dir_all(destination.join("existing")).unwrap();
     std::fs::write(destination.join("existing/mbx"), b"existing").unwrap();
+    #[cfg(unix)]
+    std::fs::create_dir_all(destination.join("donor")).unwrap();
 
     let outcome = seed(
         to.path(),
@@ -347,6 +349,118 @@ fn existing_pins_survive_resuming_a_profile_seed() {
     assert_eq!(
         std::fs::read(destination.join("existing/mbx")).unwrap(),
         b"existing"
+    );
+}
+
+#[test]
+fn an_incomplete_source_pin_is_skipped_for_a_complete_donor() {
+    let incomplete = tempfile::tempdir().unwrap();
+    let complete = tempfile::tempdir().unwrap();
+    let to = tempfile::tempdir().unwrap();
+    for source in [incomplete.path(), complete.path()] {
+        let profile = source.join("debug");
+        unit(&profile, "serde", "0123456789abcdef");
+        std::fs::create_dir_all(profile.join(".mbx-build-script-shims/identity")).unwrap();
+    }
+    std::fs::write(
+        complete
+            .path()
+            .join("debug/.mbx-build-script-shims/identity/mbx"),
+        b"mbx",
+    )
+    .unwrap();
+
+    let outcome = seed(
+        to.path(),
+        &[PathBuf::from("debug")],
+        &registry(),
+        &[donor(incomplete.path()), donor(complete.path())],
+    );
+
+    assert_eq!(outcome.units, 1);
+    assert!(
+        to.path()
+            .join("debug/.mbx-build-script-shims/identity/mbx")
+            .is_file()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_donor_with_a_missing_launcher_pin_cannot_spread_broken_units() {
+    // Both launchers install_launcher writes: the relative shell one, and the
+    // direct shebang one naming the pin by absolute path.
+    let launchers: [fn(&Path) -> String; 2] = [
+        |_| {
+            "#!/bin/sh\nMBX_BUILD_SCRIPT_SHIM_PATH=\"$0\" exec \"$(dirname \"$0\")/../../../../.mbx-build-script-shims/missing/mbx\" \"$@\"\n".to_string()
+        },
+        |profile| {
+            format!(
+                "#!{}/.mbx-build-script-shims/missing/mbx\n",
+                profile.display()
+            )
+        },
+    ];
+    for launcher in launchers {
+        let from = tempfile::tempdir().unwrap();
+        let to = tempfile::tempdir().unwrap();
+        let profile = from.path().join("debug");
+        let compiled = unit(&profile, "serde", "0123456789abcdef");
+        std::fs::write(compiled.join("out/build_script_build"), launcher(&profile)).unwrap();
+        std::fs::write(compiled.join("out/build_script_build.mbx-real"), b"script").unwrap();
+        let unrelated = profile.join(".mbx-build-script-shims/unrelated");
+        std::fs::create_dir_all(&unrelated).unwrap();
+        std::fs::write(unrelated.join("mbx"), b"unrelated").unwrap();
+
+        let outcome = seed(
+            to.path(),
+            &[PathBuf::from("debug")],
+            &registry(),
+            &[donor(from.path())],
+        );
+
+        assert_eq!(outcome, SeedOutcome::default());
+        assert!(!to.path().join("debug/build").exists());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_donor_whose_direct_launcher_names_its_pin_seeds_a_launcher_naming_ours() {
+    let from = tempfile::tempdir().unwrap();
+    let to = tempfile::tempdir().unwrap();
+    let profile = from.path().join("debug");
+    let compiled = unit(&profile, "serde", "0123456789abcdef");
+    let pinned = profile.join(".mbx-build-script-shims/identity/mbx");
+    std::fs::create_dir_all(pinned.parent().unwrap()).unwrap();
+    std::fs::write(&pinned, b"mbx").unwrap();
+    std::fs::write(
+        compiled.join("out/build_script_build"),
+        format!("#!{}\n", pinned.display()),
+    )
+    .unwrap();
+    std::fs::write(compiled.join("out/build_script_build.mbx-real"), b"script").unwrap();
+
+    let outcome = seed(
+        to.path(),
+        &[PathBuf::from("debug")],
+        &registry(),
+        &[donor(from.path())],
+    );
+
+    assert_eq!(outcome.units, 1);
+    let launcher = std::fs::read_to_string(
+        to.path()
+            .join("debug/build/serde/0123456789abcdef/out/build_script_build"),
+    )
+    .unwrap();
+    assert_eq!(
+        crate::build_script::launcher_pin(&launcher),
+        Some("identity/mbx")
+    );
+    assert!(
+        !launcher.contains(&from.path().display().to_string()),
+        "{launcher}"
     );
 }
 
