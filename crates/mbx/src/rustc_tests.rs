@@ -899,6 +899,51 @@ fn standalone_registry_mapping_uses_the_default_cargo_home() {
     );
 }
 
+/// A test that runs `cargo build` on a fixture inherits the session of the
+/// Cargo running the test: its target root, its workspace root, its shim. The
+/// fixture's compilations write under the fixture's own target directory, so
+/// the session's target is not theirs, and their outputs and `OUT_DIR` must be
+/// mapped from where they are written. Measured on SmoothBricks' cowshed-core
+/// tests, 2026-10-31: "absolute path has no stable cache mapping:
+/// /private/tmp/cowshed-dtest-27768-0/mnt/.build/acme/widget/<id>/target/guard/build/capture-writer-fixture/<hash>/out".
+#[test]
+fn a_compilation_outside_the_session_target_maps_its_own_target() {
+    let directory = tempfile::tempdir().unwrap();
+    let session_target = directory.path().join("checkout/target");
+    let fixture = directory
+        .path()
+        .join("cowshed-dtest-27768-0/mnt/.build/acme/widget/1945b2b85e3b4ad6a7a4973a279c64ba");
+    let fixture_target = fixture.join("target");
+    let output = fixture_target.join("guard/deps");
+    let mappings = path_mappings_with_env(&fixture, Some(&output), None, None, |name| match name {
+        session::TARGET_DIR_ENV => Some(session_target.as_os_str().to_owned()),
+        _ => None,
+    });
+
+    let target = mappings
+        .iter()
+        .find(|mapping| mapping.placeholder == "target")
+        .expect("a target mapping");
+    assert_eq!(target.root, fixture_target);
+    let out_dir = fixture_target.join("guard/build/capture-writer-fixture/73c008c4e1322db4/out");
+    assert_eq!(
+        normalize_mapped_path(&out_dir, &fixture, &PathMapping::ordered(&mappings)).unwrap(),
+        "${target}/guard/build/capture-writer-fixture/73c008c4e1322db4/out"
+    );
+
+    // The session's own compilations keep the session's target.
+    let inside = session_target.join("debug/deps");
+    let mappings = path_mappings_with_env(&fixture, Some(&inside), None, None, |name| match name {
+        session::TARGET_DIR_ENV => Some(session_target.as_os_str().to_owned()),
+        _ => None,
+    });
+    assert!(
+        mappings
+            .iter()
+            .any(|mapping| mapping.placeholder == "target" && mapping.root == session_target)
+    );
+}
+
 /// Session mappings for a compilation of `manifest_dir`, with `home` as home.
 fn session_mappings(
     workspace: &Path,

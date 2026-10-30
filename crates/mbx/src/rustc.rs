@@ -4426,6 +4426,11 @@ fn path_mappings_with_env(
     // Cargo compiles a dependency with its working directory inside the
     // registry, not in the workspace, so neither root can be inferred from the
     // working directory -- the session passes both in.
+    //
+    // A Cargo started inside the session -- a test that builds a fixture --
+    // inherits the session's roots but writes under its own target directory.
+    // The session's target is then not this compilation's, and its outputs and
+    // `OUT_DIR` are mapped from where it writes them, as without a session.
     let configured_target = environment(session::TARGET_DIR_ENV)
         .map(PathBuf::from)
         .filter(|root| root.is_absolute())
@@ -4440,7 +4445,8 @@ fn path_mappings_with_env(
                     })
                 })
                 .unwrap_or(root)
-        });
+        })
+        .filter(|root| target_output.is_none_or(|output| output.starts_with(root)));
     if let Some(root) = configured_target.or_else(|| {
         target_output
             .filter(|root| root.is_absolute())
