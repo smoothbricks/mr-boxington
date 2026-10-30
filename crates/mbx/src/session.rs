@@ -764,6 +764,19 @@ impl CacheSession {
             WORKSPACE_ROOT_ENV.into(),
             project_root.to_string_lossy().into_owned(),
         );
+        // A build tool that runs rustc through mbx's rustc shim hands it an
+        // `OUT_DIR` of its own choosing, under a build directory whose path
+        // differs from build to build. The shim gives such a compilation the
+        // same content-named copy a Cargo build's gets, so it is told where
+        // those copies live and whether sharing is on, exactly as `begin` does.
+        environment.insert(
+            crate::out_dir::ROOT_ENV.into(),
+            self.out_dir_root.to_string_lossy().into_owned(),
+        );
+        environment.insert(
+            SHARE_OUT_DIR_ENV.into(),
+            if self.share_out_dir { "1" } else { "0" }.into(),
+        );
         environment.insert(SOCKET_ENV.into(), self.socket.clone());
         environment.insert(
             STAGING_ENV.into(),
