@@ -76,6 +76,10 @@ fn bypass_kinds_are_stable_and_field_independent() {
             "unsupported-environment",
         ),
         (
+            CcBypassReason::NixImpurePath("/opt/include".into()),
+            "nix-impure-path",
+        ),
+        (
             CcBypassReason::RealCompilerUnpinned,
             "real-compiler-unpinned",
         ),
@@ -524,7 +528,37 @@ fn identity() -> CcCompilerIdentity {
         version_text: "clang version 17.0.6\nTarget: aarch64-apple-darwin\n".into(),
         target: "aarch64-apple-darwin".into(),
         assembler: String::new(),
+        nix: None,
     }
+}
+
+/// The same compiler reached through a nixpkgs cc-wrapper, which answers `-v`
+/// with the wrapped compiler's banner.
+fn nix_wrapper(path: &str) -> CcCompilerIdentity {
+    CcCompilerIdentity {
+        nix: Some(NixStoreDriver {
+            path: path.into(),
+            cc_wrapper: true,
+        }),
+        ..identity()
+    }
+}
+
+const WRAPPER: &str = "/nix/store/aaaa-clang-wrapper-21.1.8/bin/clang";
+
+fn variables<'a>(
+    pairs: impl IntoIterator<Item = &'a (&'a str, &'a str)>,
+) -> Vec<(OsString, OsString)> {
+    pairs
+        .into_iter()
+        .map(|(name, value)| ((*name).into(), (*value).into()))
+        .collect()
+}
+
+fn compile(arguments: &[&str]) -> CcInvocation {
+    let mut arguments = arguments.to_vec();
+    arguments.extend(["-c", "-o", "out.o", "src/a.c"]);
+    CcInvocation::parse(&argv(&arguments)).expect("admitted")
 }
 
 fn context(workspace: &Path, target: &Path) -> CcActionContext {
@@ -708,11 +742,9 @@ fn a_missing_required_input_is_not_publishable() {
 #[test]
 fn include_path_environment_variables_bypass_when_set() {
     for name in BYPASS_ENVIRONMENT {
-        let reason = environment_inputs(
-            |candidate| (candidate == *name).then(|| "/opt/include".to_string()),
-            None,
-        )
-        .unwrap_err();
+        let reason = compile(&[])
+            .environment_inputs(variables(&[(*name, "/opt/include")]), &identity())
+            .unwrap_err();
         assert_eq!(reason.kind(), "unsupported-environment");
         assert!(reason.to_string().contains(name), "{reason}");
     }
@@ -720,15 +752,12 @@ fn include_path_environment_variables_bypass_when_set() {
 
 #[test]
 fn deployment_target_and_sdkroot_enter_the_key_verbatim() {
-    let environment = environment_inputs(
-        |name| match name {
-            "MACOSX_DEPLOYMENT_TARGET" => Some("11.0".into()),
-            "SDKROOT" => Some("/sdk".into()),
-            _ => None,
-        },
-        None,
-    )
-    .expect("environment should be admitted");
+    let environment = compile(&[])
+        .environment_inputs(
+            variables(&[("MACOSX_DEPLOYMENT_TARGET", "11.0"), ("SDKROOT", "/sdk")]),
+            &identity(),
+        )
+        .expect("environment should be admitted");
     assert_eq!(
         environment.get("MACOSX_DEPLOYMENT_TARGET"),
         Some(&Some("11.0".to_string()))
@@ -741,12 +770,260 @@ fn deployment_target_and_sdkroot_enter_the_key_verbatim() {
 
 #[test]
 fn an_explicit_sysroot_argument_replaces_the_sdkroot_variable_in_the_key() {
-    let environment = environment_inputs(
-        |name| (name == "SDKROOT").then(|| "/sdk".into()),
-        Some(Path::new("/other")),
-    )
-    .expect("environment should be admitted");
+    let environment = compile(&["-isysroot", "/other"])
+        .environment_inputs(variables(&[("SDKROOT", "/sdk")]), &identity())
+        .expect("environment should be admitted");
     assert!(!environment.contains_key("SDKROOT"));
+}
+
+/// A modeled variable whose value is not text cannot be keyed. Reading it as
+/// unset would let it change the compile unseen.
+#[cfg(unix)]
+#[test]
+fn a_modeled_variable_that_is_not_utf8_is_refused_rather_than_read_as_unset() {
+    use std::os::unix::ffi::OsStringExt as _;
+    for name in ["SOURCE_DATE_EPOCH", "NIX_CFLAGS_COMPILE", "CPATH"] {
+        let reason = compile(&[])
+            .environment_inputs(
+                [(OsString::from(name), OsString::from_vec(vec![0xff]))],
+                &identity(),
+            )
+            .unwrap_err();
+        assert_eq!(reason, CcBypassReason::UnsupportedEnvironment(name.into()));
+    }
+}
+
+/// What a nixpkgs cc-wrapper reads to build its command line enters the key
+/// under every spelling it reads -- its own name, a role suffix, its target
+/// salt -- and what it reads only to link, or never, stays out.
+#[test]
+fn nix_cc_wrapper_variables_enter_the_key_and_link_variables_do_not() {
+    let read = [
+        (
+            "NIX_CFLAGS_COMPILE",
+            " -frandom-seed=y1ff0np2qc -isystem /nix/store/x-libcxx/include",
+        ),
+        (
+            "NIX_CFLAGS_COMPILE_FOR_BUILD",
+            "-isystem /nix/store/y/include",
+        ),
+        (
+            "NIX_CFLAGS_COMPILE_BEFORE_arm64_apple_darwin",
+            "-fno-omit-frame-pointer",
+        ),
+        (
+            "NIX_CXXSTDLIB_COMPILE",
+            "-isystem /nix/store/z/include/c++/v1",
+        ),
+        ("NIX_HARDENING_ENABLE", "bindnow format fortify fortify3"),
+        ("NIX_ENFORCE_NO_NATIVE", "1"),
+        ("NIX_CC_WRAPPER_TARGET_HOST_arm64_apple_darwin", "1"),
+        ("NIX_BINTOOLS_WRAPPER_FLAGS_SET_arm64_apple_darwin", "1"),
+        ("NIX_DEBUG", "1"),
+        ("DEVELOPER_DIR", "/nix/store/v73q-apple-sdk-14.4"),
+        ("MACOSX_DEPLOYMENT_TARGET_FOR_BUILD", "14.0"),
+    ];
+    let unread = [
+        ("NIX_LDFLAGS", "-L/nix/store/x/lib"),
+        ("NIX_CFLAGS_LINK", "-lc++"),
+        ("NIX_BUILD_TOP", "/private/tmp/top"),
+        ("NIX_BUILD_CORES", "18"),
+        ("NIX_CC", "/nix/store/w-clang-wrapper-21.1.8"),
+        ("NIX_CFLAGS_COMPILER", "1"),
+        ("DEVELOPER_DIRECTORY", "/elsewhere"),
+    ];
+    let environment = compile(&[])
+        .environment_inputs(variables(read.iter().chain(&unread)), &identity())
+        .expect("environment should be admitted");
+    for (name, value) in read {
+        assert_eq!(
+            environment.get(name),
+            Some(&Some(value.to_string())),
+            "{name}"
+        );
+    }
+    for (name, _) in unread {
+        assert!(
+            !environment.contains_key(name),
+            "{name} is not read to compile"
+        );
+    }
+}
+
+/// Two compiles that differ only in the flags a Nix cc-wrapper takes from the
+/// environment build different objects, so they must not share a key.
+#[test]
+fn compiles_differing_only_in_wrapper_flags_key_apart() {
+    let (workspace, target) = checkout("one");
+    let key = |flags: &str| {
+        let invocation = compile(&[]);
+        let mut context = context(&workspace, &target);
+        context.compiler = nix_wrapper(WRAPPER);
+        context.environment = invocation
+            .environment_inputs(
+                variables(&[("NIX_CFLAGS_COMPILE", flags)]),
+                &context.compiler,
+            )
+            .unwrap();
+        context.inputs = vec![CcActionInput {
+            path: workspace.join("src/a.c"),
+            digest: digest_of("source"),
+        }];
+        invocation.action(context).unwrap().digest
+    };
+    assert_ne!(key("-DVALUE=1"), key("-DVALUE=2"));
+    assert_eq!(key("-DVALUE=1"), key("-DVALUE=1"));
+}
+
+/// Two wrappers around one compiler print one banner, so the store path is
+/// what tells them apart, for the action and for the prediction it is found
+/// through. A driver outside the store keys exactly as before.
+#[test]
+fn a_nix_store_driver_is_keyed_by_its_store_path() {
+    let (workspace, target) = checkout("one");
+    let invocation = compile(&[]);
+    let keyed = |compiler: CcCompilerIdentity| {
+        let mut context = context(&workspace, &target);
+        context.compiler = compiler;
+        context.inputs = vec![CcActionInput {
+            path: workspace.join("src/a.c"),
+            digest: digest_of("source"),
+        }];
+        let prediction = invocation.invocation_digest(&context).unwrap();
+        (prediction, invocation.action(context).unwrap())
+    };
+    let (first_prediction, first) = keyed(nix_wrapper(WRAPPER));
+    let (other_prediction, other) = keyed(nix_wrapper(
+        "/nix/store/bbbb-clang-wrapper-21.1.8/bin/clang",
+    ));
+    let (plain_prediction, plain) = keyed(identity());
+    assert_ne!(first.digest, other.digest);
+    assert_ne!(first_prediction, other_prediction);
+    assert_ne!(first.digest, plain.digest);
+    assert_ne!(first_prediction, plain_prediction);
+    let descriptor = String::from_utf8(first.bytes).unwrap();
+    assert!(descriptor.contains(WRAPPER), "{descriptor}");
+    let descriptor = String::from_utf8(plain.bytes).unwrap();
+    assert!(!descriptor.contains("nix_store_path"), "{descriptor}");
+}
+
+/// A search directory a wrapper adds from its compile flags is not on the
+/// command line, so nothing watches it for a header that would shadow one the
+/// compilation read. In the store that cannot happen; anywhere else the
+/// variable is refused.
+#[test]
+fn wrapper_search_directories_outside_the_store_are_refused() {
+    let wrapper = nix_wrapper(WRAPPER);
+    let check = |name: &str, flags: &str, compiler: &CcCompilerIdentity| {
+        compile(&[])
+            .environment_inputs(variables(&[(name, flags)]), compiler)
+            .map(|_| ())
+    };
+    for flags in [
+        " -frandom-seed=y1ff0np2qc -isystem /nix/store/x-libcxx/include -fmacro-prefix-map=/nix/store/x=/nix/store/e",
+        "-I/nix/store/y/include -iframework /nix/store/z/Library/Frameworks",
+        "-idirafter /nix/store/w/include -DNDEBUG",
+    ] {
+        assert_eq!(
+            check("NIX_CFLAGS_COMPILE", flags, &wrapper),
+            Ok(()),
+            "{flags}"
+        );
+    }
+    for (name, flags) in [
+        ("NIX_CFLAGS_COMPILE", "-isystem /build/top/include"),
+        ("NIX_CFLAGS_COMPILE", "-I/opt/include"),
+        ("NIX_CFLAGS_COMPILE_FOR_BUILD", "-Iinclude"),
+        ("NIX_CFLAGS_COMPILE_BEFORE", "-iquote /nix/store/../../opt"),
+        (
+            "NIX_CXXSTDLIB_COMPILE",
+            "-cxx-isystem /home/u/libcxx/include",
+        ),
+    ] {
+        assert_eq!(
+            check(name, flags, &wrapper),
+            Err(CcBypassReason::UnsupportedEnvironment(name.into())),
+            "{flags}"
+        );
+        // A compiler that is not a wrapper never reads the variable.
+        assert_eq!(check(name, flags, &identity()), Ok(()), "{flags}");
+    }
+}
+
+/// nixpkgs' wrapper, enforcing purity, drops `-I` and `-isystem` paths outside
+/// the store, the build directory, and the temporary directories, compared as
+/// text. A compile that would lose one is refused, since the compiler would
+/// not search what the key names.
+#[test]
+fn a_nix_wrapper_enforcing_purity_refuses_search_paths_it_would_drop() {
+    let purity = [
+        ("NIX_ENFORCE_PURITY", "1"),
+        ("NIX_STORE", "/nix/store"),
+        ("NIX_BUILD_TOP", "/build/top"),
+        ("TMPDIR", "/var/tmp/shell"),
+    ];
+    let check = |arguments: &[&str], extra: &[(&str, &str)], compiler: &CcCompilerIdentity| {
+        compile(arguments)
+            .environment_inputs(variables(purity.iter().chain(extra)), compiler)
+            .map(|_| ())
+    };
+    let wrapper = nix_wrapper(WRAPPER);
+    for kept in [
+        &["-I/build/top/src/include"][..],
+        &["-I", "/build/topmost/include"],
+        &["-isystem", "/nix/store/x-libcxx/include"],
+        &["-Iinclude"],
+        &["-I", "/var/tmp/shell/generated"],
+        &["-I/tmp/generated"],
+        &["-I/dev/null"],
+        &["-iquote", "/opt/include"],
+    ] {
+        assert_eq!(check(kept, &[], &wrapper), Ok(()), "{kept:?}");
+    }
+    for (dropped, path) in [
+        (
+            &["-I/Users/me/project/include"][..],
+            "/Users/me/project/include",
+        ),
+        (&["-isystem", "/opt/include"], "/opt/include"),
+    ] {
+        assert_eq!(
+            check(dropped, &[], &wrapper),
+            Err(CcBypassReason::NixImpurePath(path.into())),
+            "{dropped:?}"
+        );
+        // Only a wrapper drops anything, and only while it enforces purity.
+        assert_eq!(check(dropped, &[], &identity()), Ok(()), "{dropped:?}");
+        assert_eq!(
+            check(dropped, &[("NIX_ENFORCE_PURITY", "0")], &wrapper),
+            Ok(()),
+            "{dropped:?}"
+        );
+    }
+    // The SDK the wrapper weighs a path inside first has to pass the same test.
+    assert_eq!(
+        check(
+            &["-I/build/top/src/include"],
+            &[(
+                "DEVELOPER_DIR",
+                "/Applications/Xcode.app/Contents/Developer"
+            )],
+            &wrapper
+        ),
+        Err(CcBypassReason::NixImpurePath(
+            "/Applications/Xcode.app/Contents/Developer".into()
+        ))
+    );
+    // Without NIX_BUILD_TOP the wrapper aborts on any absolute search path.
+    let without_build_top = [("NIX_ENFORCE_PURITY", "1"), ("NIX_STORE", "/nix/store")];
+    assert_eq!(
+        compile(&["-isystem", "/nix/store/x-libcxx/include"])
+            .environment_inputs(variables(&without_build_top), &wrapper)
+            .map(|_| ()),
+        Err(CcBypassReason::NixImpurePath(
+            "/nix/store/x-libcxx/include".into()
+        ))
+    );
 }
 
 #[test]

@@ -24,6 +24,48 @@ fn standalone_prediction_tasks_shard_rather_than_collecting_every_compile() {
     assert!(shards.len() <= 256, "shards are bounded by the hash prefix");
 }
 
+/// `CC` names a wrapper through a profile symlink; the store entry it resolves
+/// into is the identity, and `nix-support/orig-cc` is what marks a cc-wrapper.
+#[cfg(unix)]
+#[test]
+fn a_driver_is_identified_by_the_store_entry_it_resolves_into() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(directory.path()).unwrap();
+    let store = root.join("store");
+    let wrapper = store.join("aaaa-clang-wrapper-21.1.8");
+    let unwrapped = store.join("bbbb-clang-21.1.8");
+    for entry in [&wrapper, &unwrapped] {
+        std::fs::create_dir_all(entry.join("bin")).unwrap();
+        std::fs::write(entry.join("bin/clang"), "#!/bin/sh\n").unwrap();
+    }
+    std::fs::create_dir_all(wrapper.join("nix-support")).unwrap();
+    std::fs::write(
+        wrapper.join("nix-support/orig-cc"),
+        unwrapped.to_str().unwrap(),
+    )
+    .unwrap();
+    let profile = root.join("profile/bin");
+    std::fs::create_dir_all(&profile).unwrap();
+    std::os::unix::fs::symlink(wrapper.join("bin/clang"), profile.join("cc")).unwrap();
+
+    assert_eq!(
+        nix_store_driver(&profile.join("cc"), &store),
+        Some(NixStoreDriver {
+            path: wrapper.join("bin/clang"),
+            cc_wrapper: true,
+        })
+    );
+    assert_eq!(
+        nix_store_driver(&unwrapped.join("bin/clang"), &store),
+        Some(NixStoreDriver {
+            path: unwrapped.join("bin/clang"),
+            cc_wrapper: false,
+        })
+    );
+    std::fs::write(root.join("cc"), "#!/bin/sh\n").unwrap();
+    assert_eq!(nix_store_driver(&root.join("cc"), &store), None);
+}
+
 /// The exempt roots are POSIX paths and the shims are only installed on unix,
 /// so this models the platform the feature runs on.
 #[cfg(unix)]
@@ -40,6 +82,7 @@ fn manifest_directories_skip_system_roots_and_include_header_parents() {
             version_text: "clang version 17.0.6".into(),
             target: "aarch64-apple-darwin".into(),
             assembler: String::new(),
+            nix: None,
         },
         working_dir: PathBuf::from("/work/pkg"),
         path_mappings: Vec::new(),

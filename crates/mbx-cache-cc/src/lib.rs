@@ -18,14 +18,14 @@
 #![deny(missing_docs)]
 
 use mbx_cache_core::{
-    CacheDigest, FileDigestCache, PathAliases, PathMapping, PathNormalizationError, canonical_json,
-    compact_prediction_inputs, expand_prediction_inputs, normalize_resolved_mapped_path_with,
-    resolve_path_mappings,
+    CacheDigest, FileDigestCache, NIX_STORE, PathAliases, PathMapping, PathNormalizationError,
+    canonical_json, compact_prediction_inputs, expand_prediction_inputs,
+    normalize_resolved_mapped_path_with, resolve_path_mappings,
 };
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::path::{Component, Path, PathBuf};
 use thiserror::Error;
 
@@ -84,6 +84,38 @@ pub const BYPASS_ENVIRONMENT: &[&str] = &[
 /// `cl.exe` prepends their contents to the command line, so argv no longer
 /// describes the compile.
 pub const MSVC_BYPASS_ENVIRONMENT: &[&str] = &["CL", "_CL_"];
+/// Variable families a Nix cc-wrapper reads to build the command line it hands
+/// the compiler it wraps.
+///
+/// nixpkgs' `cc-wrapper.sh` prepends `NIX_CFLAGS_COMPILE_BEFORE` and appends
+/// `NIX_CFLAGS_COMPILE` to every compile, adds `NIX_CXXSTDLIB_COMPILE` to C++
+/// ones, turns `NIX_HARDENING_ENABLE` into flags such as
+/// `-fstack-protector-strong` and `-D_FORTIFY_SOURCE=3`, drops `-m*=native`
+/// under `NIX_ENFORCE_NO_NATIVE`, and on Darwin derives its SDK and minimum OS
+/// version from `DEVELOPER_DIR` and `MACOSX_DEPLOYMENT_TARGET`. It reads each
+/// one under its own name, under a role suffix (`_FOR_BUILD`, `_FOR_TARGET`)
+/// and under its target salt (`_arm64_apple_darwin`), and the
+/// `NIX_CC_WRAPPER_*` and `NIX_BINTOOLS_WRAPPER_*` variables pick which of
+/// those it takes. `NIX_DEBUG` adds the wrapper's own lines to the standard
+/// error a hit replays. None of it shows in argv or in the `-v` banner the
+/// identity probe reads, which the wrapper answers for the wrapped compiler
+/// alone.
+///
+/// A variable is in a family when its name is the family's or extends it with
+/// `_`; every one that is set enters the key with its value. The wrapper reads
+/// its link variables (`NIX_LDFLAGS`, `NIX_CFLAGS_LINK`, ...) only when it
+/// links, which a `-c` or `-E` invocation never does, so they stay out.
+pub const NIX_CC_WRAPPER_ENVIRONMENT: &[&str] = &[
+    "DEVELOPER_DIR",
+    "MACOSX_DEPLOYMENT_TARGET",
+    "NIX_BINTOOLS_WRAPPER",
+    "NIX_CC_WRAPPER",
+    "NIX_CFLAGS_COMPILE",
+    "NIX_CXXSTDLIB_COMPILE",
+    "NIX_DEBUG",
+    "NIX_ENFORCE_NO_NATIVE",
+    "NIX_HARDENING_ENABLE",
+];
 
 /// Absolute roots whose contents are keyed verbatim rather than through a
 /// placeholder.
@@ -95,7 +127,7 @@ pub const MSVC_BYPASS_ENVIRONMENT: &[&str] = &["CL", "_CL_"];
 pub const SYSTEM_ROOTS: &[&str] = &[
     "/Applications/Xcode.app",
     "/Library/Developer",
-    "/nix/store",
+    NIX_STORE,
     "/usr/include",
     "/usr/lib",
     "/usr/local/include",
@@ -342,6 +374,9 @@ impl CcBypassReason {
             Self::UnsupportedEnvironment(_) => Some(
                 "Unset the reported environment variable for this build so the compiler invocation describes all of its inputs.",
             ),
+            Self::NixImpurePath(_) => Some(
+                "Keep include directories under the Nix store, `$NIX_BUILD_TOP`, or a temporary directory, or unset `NIX_ENFORCE_PURITY`, so the compiler searches what the command line names.",
+            ),
             Self::LocalCpuTarget(_) => Some(
                 "Replace the reported local-CPU option with an explicit architecture or CPU name.",
             ),
@@ -458,6 +493,10 @@ pub enum CcBypassReason {
     /// An environment variable outside the modeled set is set.
     #[error("environment variable {0} changes the compilation in an unmodeled way")]
     UnsupportedEnvironment(String),
+    /// A Nix cc-wrapper enforcing purity would drop this path, so the compiler
+    /// would not search what the command line names.
+    #[error("the Nix compiler wrapper drops this path under NIX_ENFORCE_PURITY: {0}")]
+    NixImpurePath(PathBuf),
     /// The shim could not be told which real compiler to run.
     #[error("no real compiler was pinned for the cc shim")]
     RealCompilerUnpinned,
@@ -710,6 +749,24 @@ pub struct CcCompilerIdentity {
     /// without changing anything `gcc -v` prints. Clang assembles internally,
     /// so this is empty there.
     pub assembler: String,
+    /// Where the driver lives, when that is the Nix store.
+    pub nix: Option<NixStoreDriver>,
+}
+
+/// A driver in the Nix store, identified by its store path.
+///
+/// A Nix cc-wrapper answers `-v` for the compiler it wraps, so two wrappers
+/// around one compiler print the same banner while adding different flags of
+/// their own: libc and C++ library include directories, frame-pointer and
+/// hardening defaults, a `-target`. Each of those is part of the wrapper's
+/// store path, which names everything that built it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NixStoreDriver {
+    /// The executable's canonical path, beneath [`NIX_STORE`].
+    pub path: PathBuf,
+    /// Whether it is a nixpkgs cc-wrapper, which rewrites its command line
+    /// from the environment (see [`NIX_CC_WRAPPER_ENVIRONMENT`]).
+    pub cc_wrapper: bool,
 }
 
 /// One file input paired with the digest used in the action key.
@@ -750,6 +807,10 @@ pub struct CcAction {
 struct CcCompilerDescriptor {
     assembler: String,
     family: String,
+    /// Absent for a driver outside the Nix store, so its keys are what they
+    /// were before store drivers were told apart.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    nix_store_path: Option<PathBuf>,
     target: String,
     version_text: String,
 }
@@ -1317,60 +1378,223 @@ fn normalize_components(path: &Path) -> PathBuf {
     normalized
 }
 
-/// Read the modeled environment, rejecting variables that change the compile in
-/// a way the argv model cannot see.
-pub fn environment_inputs<F>(
-    lookup: F,
-    sysroot: Option<&Path>,
-) -> Result<BTreeMap<String, Option<String>>, CcBypassReason>
-where
-    F: Fn(&str) -> Option<String>,
-{
-    environment_inputs_for(lookup, sysroot, CcCompilerFamily::Clang)
-}
+/// The compiler's process environment, by name.
+type Variables = BTreeMap<OsString, OsString>;
 
-/// Read the modeled environment for a particular compiler family.
-pub fn environment_inputs_for<F>(
-    lookup: F,
-    sysroot: Option<&Path>,
-    family: CcCompilerFamily,
-) -> Result<BTreeMap<String, Option<String>>, CcBypassReason>
-where
-    F: Fn(&str) -> Option<String>,
-{
-    for name in BYPASS_ENVIRONMENT {
-        if lookup(name).is_some() {
-            return Err(CcBypassReason::UnsupportedEnvironment((*name).into()));
-        }
-    }
-    let mut environment = BTreeMap::new();
-    for name in KEYED_ENVIRONMENT {
-        // An explicit `-isysroot` on the command line already pins the SDK, and
-        // it is what the driver honors, so the variable stops being an input.
-        if *name == "SDKROOT" && sysroot.is_some() {
-            continue;
-        }
-        environment.insert((*name).to_string(), lookup(name));
-    }
-    if family.is_msvc() {
-        // INCLUDE changes header resolution without appearing in argv. The
-        // toolset and SDK versions make the otherwise machine-local paths
-        // meaningful when action records move between hosts.
-        for name in [
-            "INCLUDE",
-            "VCToolsVersion",
-            "WindowsSDKVersion",
-            "UCRTVersion",
-        ] {
-            environment.insert(name.into(), lookup(name));
-        }
-        for name in MSVC_BYPASS_ENVIRONMENT {
-            if lookup(name).is_some() {
+impl CcInvocation {
+    /// Read the environment this compile depends on from the variables the
+    /// compiler runs with.
+    ///
+    /// Variables that change the compile in a way the argv model cannot see
+    /// are refused. The modeled ones enter the key with their values; one whose
+    /// value is not UTF-8 cannot be keyed and is refused too, rather than read
+    /// as unset.
+    pub fn environment_inputs<I>(
+        &self,
+        variables: I,
+        compiler: &CcCompilerIdentity,
+    ) -> Result<BTreeMap<String, Option<String>>, CcBypassReason>
+    where
+        I: IntoIterator<Item = (OsString, OsString)>,
+    {
+        let variables: Variables = variables.into_iter().collect();
+        let value = |name: &str| variable(&variables, name);
+        for name in BYPASS_ENVIRONMENT {
+            if variables.contains_key(OsStr::new(name)) {
                 return Err(CcBypassReason::UnsupportedEnvironment((*name).into()));
             }
         }
+        let mut environment = BTreeMap::new();
+        for name in KEYED_ENVIRONMENT {
+            // An explicit `-isysroot` on the command line already pins the SDK,
+            // and it is what the driver honors, so the variable stops being an
+            // input.
+            if *name == "SDKROOT" && self.sysroot.is_some() {
+                continue;
+            }
+            environment.insert((*name).to_string(), value(name)?);
+        }
+        if compiler.family.is_msvc() {
+            // INCLUDE changes header resolution without appearing in argv. The
+            // toolset and SDK versions make the otherwise machine-local paths
+            // meaningful when action records move between hosts.
+            for name in [
+                "INCLUDE",
+                "VCToolsVersion",
+                "WindowsSDKVersion",
+                "UCRTVersion",
+            ] {
+                environment.insert(name.into(), value(name)?);
+            }
+            for name in MSVC_BYPASS_ENVIRONMENT {
+                if variables.contains_key(OsStr::new(name)) {
+                    return Err(CcBypassReason::UnsupportedEnvironment((*name).into()));
+                }
+            }
+        }
+        for name in variables.keys().filter_map(|name| name.to_str()) {
+            if in_family(NIX_CC_WRAPPER_ENVIRONMENT, name) {
+                environment.insert(name.to_owned(), value(name)?);
+            }
+        }
+        if compiler
+            .nix
+            .as_ref()
+            .is_some_and(|driver| driver.cc_wrapper)
+        {
+            nix_wrapper_search_paths(&variables)?;
+            self.nix_wrapper_purity(&variables)?;
+        }
+        Ok(environment)
     }
-    Ok(environment)
+
+    /// Refuse a compile whose search paths a Nix cc-wrapper would drop.
+    ///
+    /// With `NIX_ENFORCE_PURITY=1` and `NIX_STORE` set, nixpkgs' wrapper
+    /// removes every `-I` and `-isystem` whose absolute path, other than
+    /// `/dev/null`, starts with none of `NIX_STORE`, `NIX_BUILD_TOP`, `/tmp`,
+    /// `TMP`, `TMPDIR`, `TEMP`, and `TEMPDIR` (the last four `/tmp` when unset
+    /// or empty), compared as text: `badPath` in its `utils.bash`. An unset
+    /// `NIX_BUILD_TOP` aborts the wrapper instead. Either way the compiler does
+    /// not search what the key says it did, and the directories that decide it
+    /// differ between builds that share a key, so the outcome is checked here
+    /// rather than keyed.
+    ///
+    /// On Darwin the wrapper first weighs a path at its spelling inside the SDK
+    /// it selects from the `DEVELOPER_DIR` variables, when that exists. An SDK
+    /// the same test accepts accepts every path inside it, so refusing an
+    /// impure `DEVELOPER_DIR` value leaves the plain test as the whole answer.
+    fn nix_wrapper_purity(&self, variables: &Variables) -> Result<(), CcBypassReason> {
+        let value = |name: &str| variable(variables, name);
+        if value("NIX_ENFORCE_PURITY")?.as_deref() != Some("1") {
+            return Ok(());
+        }
+        let Some(store) = value("NIX_STORE")?.filter(|store| !store.is_empty()) else {
+            return Ok(());
+        };
+        let searched = self
+            .arguments
+            .iter()
+            .filter_map(|argument| match argument {
+                Argument::Path { flag, path } if matches!(flag.as_str(), "-I" | "-isystem") => {
+                    Some(path)
+                }
+                _ => None,
+            })
+            .filter(|path| path.is_absolute())
+            .collect::<Vec<_>>();
+        if searched.is_empty() {
+            return Ok(());
+        }
+        let build_top = value("NIX_BUILD_TOP")?;
+        let mut pure = vec![store, "/tmp".to_owned()];
+        for name in ["TMP", "TMPDIR", "TEMP", "TEMPDIR"] {
+            pure.push(
+                value(name)?
+                    .filter(|root| !root.is_empty())
+                    .unwrap_or_else(|| "/tmp".into()),
+            );
+        }
+        pure.extend(build_top.clone().filter(|top| !top.is_empty()));
+        // A relative path is one the wrapper assumes sits in the build
+        // directory, and keeps.
+        let impure = |path: &str| {
+            path.starts_with('/')
+                && path != "/dev/null"
+                && (build_top.is_none() || !pure.iter().any(|root| path.starts_with(root.as_str())))
+        };
+        for name in variables.keys().filter_map(|name| name.to_str()) {
+            if in_family(&["DEVELOPER_DIR"], name)
+                && let Some(root) = value(name)?
+                && impure(&root)
+            {
+                return Err(CcBypassReason::NixImpurePath(root.into()));
+            }
+        }
+        match searched
+            .into_iter()
+            .find(|path| path.to_str().is_none_or(impure))
+        {
+            Some(path) => Err(CcBypassReason::NixImpurePath(path.clone())),
+            None => Ok(()),
+        }
+    }
+}
+
+/// The value of `name`, refused when it cannot be keyed as text.
+fn variable(variables: &Variables, name: &str) -> Result<Option<String>, CcBypassReason> {
+    variables
+        .get(OsStr::new(name))
+        .map(|value| {
+            value
+                .to_str()
+                .map(ToOwned::to_owned)
+                .ok_or_else(|| CcBypassReason::UnsupportedEnvironment(name.into()))
+        })
+        .transpose()
+}
+
+/// Whether `name` is one of `families` or extends one with `_`.
+fn in_family(families: &[&str], name: &str) -> bool {
+    families.iter().any(|family| {
+        name.strip_prefix(family)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('_'))
+    })
+}
+
+/// Search-directory options a cc-wrapper's compile flags can carry, longest
+/// spelling first so that an attached value is split at the right place.
+const WRAPPER_SEARCH_FLAGS: &[&str] = &[
+    "-cxx-isystem",
+    "-iframework",
+    "-idirafter",
+    "-isystem",
+    "-iquote",
+    "-F",
+    "-I",
+];
+
+/// Refuse a search directory the wrapper adds from the environment outside
+/// every system root.
+///
+/// The key watches each search directory the command line names for a header
+/// that would newly shadow one the compilation read; see [`manifest_snapshot`].
+/// A directory a cc-wrapper adds from `NIX_CFLAGS_COMPILE` or
+/// `NIX_CXXSTDLIB_COMPILE` never reaches that command line, so it cannot be
+/// watched. In the Nix store it needs no watching -- store paths do not
+/// change -- and system roots are exempt anyway. Anywhere else the variable
+/// is refused: its value is keyed, but the directory's contents are not.
+fn nix_wrapper_search_paths(variables: &Variables) -> Result<(), CcBypassReason> {
+    for name in variables.keys().filter_map(|name| name.to_str()) {
+        if !in_family(&["NIX_CFLAGS_COMPILE", "NIX_CXXSTDLIB_COMPILE"], name) {
+            continue;
+        }
+        let Some(value) = variable(variables, name)? else {
+            continue;
+        };
+        let mut words = value.split_whitespace();
+        while let Some(word) = words.next() {
+            let Some(attached) = WRAPPER_SEARCH_FLAGS
+                .iter()
+                .find_map(|flag| word.strip_prefix(flag))
+            else {
+                continue;
+            };
+            let directory = if attached.is_empty() {
+                words.next().unwrap_or_default()
+            } else {
+                attached
+            };
+            let directory = Path::new(directory);
+            if !directory.is_absolute()
+                || normalize_components(directory).as_path() != directory
+                || !is_system_path(directory)
+            {
+                return Err(CcBypassReason::UnsupportedEnvironment(name.into()));
+            }
+        }
+    }
+    Ok(())
 }
 
 struct ActionBuilder<'a> {
@@ -1496,6 +1720,12 @@ impl<'a> ActionBuilder<'a> {
         CcCompilerDescriptor {
             assembler: self.context.compiler.assembler.clone(),
             family: self.context.compiler.family.as_str().into(),
+            nix_store_path: self
+                .context
+                .compiler
+                .nix
+                .as_ref()
+                .map(|driver| driver.path.clone()),
             target: self.context.compiler.target.clone(),
             version_text: self.context.compiler.version_text.clone(),
         }

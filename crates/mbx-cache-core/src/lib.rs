@@ -74,7 +74,7 @@ pub use mbx_cache_protocol::{
     TaskActionManifest,
 };
 pub use path_mapping::{
-    PathAliases, PathMapping, PathNormalizationError, normalize_mapped_path,
+    NIX_STORE, PathAliases, PathMapping, PathNormalizationError, normalize_mapped_path,
     normalize_resolved_mapped_path, normalize_resolved_mapped_path_with, resolve_path_mappings,
 };
 pub use prediction_inputs::{
