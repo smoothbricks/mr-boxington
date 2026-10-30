@@ -83,6 +83,12 @@ home and rustup mappings are unchanged. An
 arbitrary `--sysroot` override does not become the selected compiler's default:
 it must already fall under a known mapping or the action bypasses the cache.
 
+An input file in the Nix store keeps its own path in the key, for Rust as for
+C and C++: its contents are hashed like any input's, and a store path is
+spelled the same on every machine that holds it. That covers a Nix toolchain's
+sysroot crates and `rust-src`, which a symlink-joined toolchain resolves into
+store paths other than its own.
+
 The key also covers compiler inputs and relevant environment. If mbx cannot
 model something exactly, it bypasses the action.
 
