@@ -117,6 +117,18 @@ alone.
 For the complete list of supported and bypassed compiler calls, see the
 [C and C++ limits](/limits#c-and-c-caching-covers-the-host-compiles-mbx-drives).
 
+## Rust compilations
+
+A build tool that runs rustc itself, rather than through Cargo, can still
+have its compilations cached: point it at mbx's rustc shim, a link to the
+`mbx` binary named `mbx-rustc`, invoked as `mbx-rustc <rustc> <arguments>`, and
+run the build under `mbx exec`. Each compilation is keyed and restored as a
+Cargo build's is. That includes [`OUT_DIR` sharing](/limits#out-dir-sharing):
+a compilation reading build-script output under an `OUT_DIR` the tool chose is
+handed the content-named copy, so two build directories whose generated
+sources match share the result. The [`share_out_dir`](/configuration#share-out-dir)
+setting applies as it does to Cargo builds.
+
 ## Cross-checkout sharing {#sharing-results-across-checkouts}
 
 mbx removes the checkout's absolute path from compilation keys, so equivalent
@@ -136,7 +148,8 @@ directory names.
 
 ## Disable the cache {#disabling-the-cache}
 
-Set `MBX_CC=0` to turn off C and C++ caching. C and C++ compilation is the only
+Set `MBX_CC=0` to turn off C and C++ caching. Apart from a build that calls
+the [rustc shim](#rust-compilations) itself, C and C++ compilation is the only
 work `mbx exec` caches, so mbx warns and runs the command uncached:
 
 ```sh
