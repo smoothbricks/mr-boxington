@@ -26,11 +26,27 @@ use std::time::{Instant, SystemTime};
 
 const ADAPTER: &str = "build-script";
 
+/// What a build-script run is predicted under: the compiled script, and the
+/// target Cargo runs it for. One host binary serves every target, but the
+/// variables it declares are often named for the target (`CC_<target>`,
+/// `CFLAGS_<target>`), so a native and a cross build of one checkout record
+/// different input sets. Sharing one prediction made each overwrite the
+/// other's, and every run then looked up the other target's key and missed.
 #[derive(Debug, Serialize)]
 struct Invocation<'a> {
     binary_action: &'a CacheDigest,
     kind: &'static str,
+    target: Option<&'a str>,
     version: u8,
+}
+
+fn invocation_digest(binary_action: &CacheDigest, target: Option<&str>) -> Result<CacheDigest> {
+    Ok(CacheDigest::blake3(&canonical_json(&Invocation {
+        binary_action,
+        kind: ADAPTER,
+        target,
+        version: 2,
+    })?))
 }
 
 #[derive(Debug, Serialize)]
@@ -329,12 +345,7 @@ pub(crate) fn run() -> Result<ExitCode> {
     if binary_action.validate().is_err() || canonical_json(&binary_action)? != action_bytes {
         bail!("build-script binary action is not canonical");
     }
-    let invocation_bytes = canonical_json(&Invocation {
-        binary_action: &binary_action,
-        kind: ADAPTER,
-        version: 1,
-    })?;
-    let invocation = CacheDigest::blake3(&invocation_bytes);
+    let invocation = invocation_digest(&binary_action, std::env::var("TARGET").ok().as_deref())?;
 
     // Whether the run below follows a lookup. The agent counted that lookup,
     // so the run is its miss; without one the run was never consulted.
@@ -1560,12 +1571,13 @@ fn publish(action: &CacheDigest, action_bytes: &[u8], stdout: &[u8], stderr: &[u
         &normalize_output_text_with_aliases(stderr, &mappings),
     )?;
     let action_blob = stage_bytes(staging.path(), "action", action_bytes)?;
-    let metadata = canonical_json(&Metadata {
+    let ours = Metadata {
         kind: ADAPTER.into(),
         version: 1,
         stdout: stdout.0.clone(),
         stderr: stderr.0.clone(),
-    })?;
+    };
+    let metadata = canonical_json(&ours)?;
     let metadata = stage_bytes(staging.path(), "metadata", &metadata)?;
     blobs.extend([stdout, stderr, action_blob, metadata.clone()]);
     let mut requests = Vec::new();
@@ -1579,18 +1591,215 @@ fn publish(action: &CacheDigest, action_bytes: &[u8], stdout: &[u8], stderr: &[u
         result: RemoteActionResult {
             action: action.clone(),
             metadata: Some(metadata.0),
-            output_root: Some(root),
+            output_root: Some(root.clone()),
             version: 1,
         },
     });
     for response in session::request_agent(&requests)? {
         match response {
             AgentResponse::Stored { .. } | AgentResponse::ActionStored { .. } => {}
+            // A run under the same key that produced something else: the
+            // stored result is as much a run of these declared inputs as this
+            // one is, so keep it, and let the caller record the prediction
+            // that restores it next time.
+            AgentResponse::Error { message }
+                if message == mbx_cache_core::ACTION_CONFLICT_MESSAGE =>
+            {
+                match stored_result_differences(action, &ours, &root) {
+                    Ok(Some(differences)) => {
+                        session::report_shim_warning(&kept_result_warning(
+                            &stats_label(),
+                            &differences,
+                        ));
+                    }
+                    Ok(None) => bail!(message),
+                    Err(error) => {
+                        bail!("{message}, and the stored result could not be read: {error:#}")
+                    }
+                }
+            }
             AgentResponse::Error { message } => bail!(message),
             _ => bail!("cache agent returned an unexpected build-script store response"),
         }
     }
     Ok(())
+}
+
+/// One way a build-script run's result differs from the one stored for its key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Difference {
+    Stdout,
+    Stderr,
+    /// An OUT_DIR entry added, dropped or written differently, by its path
+    /// within OUT_DIR; a directory ends in `/`.
+    OutDir(String),
+}
+
+/// Most OUT_DIR entries a kept-result warning names.
+const MAX_NAMED_DIFFERENCES: usize = 4;
+
+/// The stored result this run's store conflicted with, if restore would use
+/// it, and what this run differs from it in.
+fn stored_result_differences(
+    action: &CacheDigest,
+    ours: &Metadata,
+    our_root: &CacheDigest,
+) -> Result<Option<Vec<Difference>>> {
+    let responses = session::request_agent(&[AgentRequest::FindActionResult {
+        action: action.clone(),
+    }])?;
+    let Some(AgentResponse::ActionResult {
+        result: Some(stored),
+    }) = responses.into_iter().next()
+    else {
+        return Ok(None);
+    };
+    let (Some(metadata_digest), Some(stored_root)) = (&stored.metadata, &stored.output_root) else {
+        return Ok(None);
+    };
+    if stored.version != 1 || stored.action != *action {
+        return Ok(None);
+    }
+    let roots = find_blobs(std::slice::from_ref(metadata_digest))?;
+    let metadata: Metadata =
+        read_canonical_blob(&roots[0], metadata_digest, "build-script metadata")?;
+    if metadata.version != 1 || metadata.kind != ADAPTER {
+        return Ok(None);
+    }
+    // The streams restore replays; the tree is walked below.
+    find_blobs(&[metadata.stdout.clone(), metadata.stderr.clone()])?;
+    let load = |digest: &CacheDigest| -> Result<CacheDirectory> {
+        let path = find_blobs(std::slice::from_ref(digest))?.remove(0);
+        read_canonical_blob(&path, digest, "build-script output directory")
+    };
+    result_differences(&metadata, ours, stored_root, our_root, &load).map(Some)
+}
+
+/// What `ours` changes against `stored`: its streams, and every OUT_DIR entry
+/// whose contents, mode or presence differ, reading trees through `load`.
+fn result_differences(
+    stored: &Metadata,
+    ours: &Metadata,
+    stored_root: &CacheDigest,
+    our_root: &CacheDigest,
+    load: &dyn Fn(&CacheDigest) -> Result<CacheDirectory>,
+) -> Result<Vec<Difference>> {
+    let mut differences = Vec::new();
+    if stored.stdout != ours.stdout {
+        differences.push(Difference::Stdout);
+    }
+    if stored.stderr != ours.stderr {
+        differences.push(Difference::Stderr);
+    }
+    tree_differences(stored_root, our_root, "", load, &mut differences)?;
+    Ok(differences)
+}
+
+fn tree_differences(
+    stored: &CacheDigest,
+    ours: &CacheDigest,
+    prefix: &str,
+    load: &dyn Fn(&CacheDigest) -> Result<CacheDirectory>,
+    differences: &mut Vec<Difference>,
+) -> Result<()> {
+    if stored == ours {
+        return Ok(());
+    }
+    let (stored, ours) = (load(stored)?, load(ours)?);
+    let files = |directory: &CacheDirectory| {
+        directory
+            .files
+            .iter()
+            .map(|file| {
+                (
+                    file.name.clone(),
+                    (file.digest.clone(), file.executable, file.mode),
+                )
+            })
+            .collect::<BTreeMap<_, _>>()
+    };
+    let links = |directory: &CacheDirectory| {
+        directory
+            .symlinks
+            .iter()
+            .map(|link| (link.name.clone(), link.target.clone()))
+            .collect::<BTreeMap<_, _>>()
+    };
+    let directories = |directory: &CacheDirectory| {
+        directory
+            .directories
+            .iter()
+            .map(|child| (child.name.clone(), child.digest.clone()))
+            .collect::<BTreeMap<_, _>>()
+    };
+    let (stored_files, our_files) = (files(&stored), files(&ours));
+    let (stored_links, our_links) = (links(&stored), links(&ours));
+    for name in stored_files
+        .keys()
+        .chain(our_files.keys())
+        .collect::<BTreeSet<_>>()
+    {
+        if stored_files.get(name) != our_files.get(name) {
+            differences.push(Difference::OutDir(format!("{prefix}{name}")));
+        }
+    }
+    for name in stored_links
+        .keys()
+        .chain(our_links.keys())
+        .collect::<BTreeSet<_>>()
+    {
+        if stored_links.get(name) != our_links.get(name) {
+            differences.push(Difference::OutDir(format!("{prefix}{name}")));
+        }
+    }
+    let (stored_children, our_children) = (directories(&stored), directories(&ours));
+    for name in stored_children
+        .keys()
+        .chain(our_children.keys())
+        .collect::<BTreeSet<_>>()
+    {
+        match (stored_children.get(name), our_children.get(name)) {
+            (Some(stored), Some(ours)) => {
+                tree_differences(stored, ours, &format!("{prefix}{name}/"), load, differences)?;
+            }
+            _ => differences.push(Difference::OutDir(format!("{prefix}{name}/"))),
+        }
+    }
+    Ok(())
+}
+
+/// The warning for a run that kept the result already stored for its key.
+fn kept_result_warning(label: &str, differences: &[Difference]) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let mut files = 0;
+    for difference in differences {
+        match difference {
+            Difference::Stdout => parts.push("stdout".into()),
+            Difference::Stderr => parts.push("stderr".into()),
+            Difference::OutDir(path) => {
+                files += 1;
+                if files <= MAX_NAMED_DIFFERENCES {
+                    parts.push(format!("OUT_DIR {path}"));
+                }
+            }
+        }
+    }
+    if files > MAX_NAMED_DIFFERENCES {
+        parts.push(format!(
+            "{} more OUT_DIR entries",
+            files - MAX_NAMED_DIFFERENCES
+        ));
+    }
+    let read = if files > 0 {
+        "; the crates built against this script read its OUT_DIR, so they compile against the stored files"
+    } else {
+        ""
+    };
+    format!(
+        "{label}: kept the result already stored for this run's key; this run differed in {}. \
+         Both are runs of the same declared inputs, so later builds restore the stored one{read}",
+        parts.join(", ")
+    )
 }
 
 fn stage_bytes(directory: &Path, name: &str, bytes: &[u8]) -> Result<(CacheDigest, PathBuf)> {
@@ -1939,6 +2148,104 @@ fn restore_symlink(_: &str, _: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use std::time::{Duration, SystemTime};
+
+    #[test]
+    fn a_build_script_is_predicted_per_target() {
+        let binary = CacheDigest::blake3(b"build script binary");
+        let native = invocation_digest(&binary, Some("aarch64-apple-darwin")).unwrap();
+        let cross = invocation_digest(&binary, Some("x86_64-unknown-linux-gnu")).unwrap();
+        assert_ne!(native, cross);
+        assert_eq!(
+            native,
+            invocation_digest(&binary, Some("aarch64-apple-darwin")).unwrap()
+        );
+    }
+
+    #[test]
+    fn a_kept_result_names_what_differed() {
+        let digest = |text: &str| CacheDigest::blake3(text.as_bytes());
+        let metadata = |stdout: &str, stderr: &str| Metadata {
+            kind: ADAPTER.into(),
+            version: 1,
+            stdout: digest(stdout),
+            stderr: digest(stderr),
+        };
+        let file = |name: &str, contents: &str| CacheFileNode {
+            digest: digest(contents),
+            executable: false,
+            mode: 0o644,
+            name: name.into(),
+        };
+        let directory =
+            |files: Vec<CacheFileNode>, directories: Vec<CacheDirectoryNode>| CacheDirectory {
+                directories,
+                files,
+                symlinks: Vec::new(),
+                version: 1,
+            };
+        let stored_lib = directory(vec![file("libcrypto.a", "first")], Vec::new());
+        let our_lib = directory(vec![file("libcrypto.a", "second")], Vec::new());
+        let child = |name: &str, tree: &CacheDirectory| CacheDirectoryNode {
+            digest: CacheDigest::blake3(&canonical_json(tree).unwrap()),
+            mode: 0o755,
+            name: name.into(),
+        };
+        let stored_root = directory(
+            vec![file("bindings.rs", "same")],
+            vec![child("lib", &stored_lib)],
+        );
+        let our_root = directory(
+            vec![file("bindings.rs", "same"), file("extra.txt", "new")],
+            vec![child("lib", &our_lib)],
+        );
+        let trees: BTreeMap<CacheDigest, CacheDirectory> =
+            [&stored_lib, &our_lib, &stored_root, &our_root]
+                .into_iter()
+                .map(|tree| {
+                    (
+                        CacheDigest::blake3(&canonical_json(tree).unwrap()),
+                        tree.clone(),
+                    )
+                })
+                .collect();
+        let load = |digest: &CacheDigest| -> Result<CacheDirectory> {
+            trees
+                .get(digest)
+                .cloned()
+                .ok_or_else(|| eyre::eyre!("no tree {digest:?}"))
+        };
+        let key = |tree: &CacheDirectory| CacheDigest::blake3(&canonical_json(tree).unwrap());
+
+        let differences = result_differences(
+            &metadata("directives", "noise 1"),
+            &metadata("directives", "noise 2"),
+            &key(&stored_root),
+            &key(&our_root),
+            &load,
+        )
+        .unwrap();
+        assert_eq!(
+            differences,
+            vec![
+                Difference::Stderr,
+                Difference::OutDir("extra.txt".into()),
+                Difference::OutDir("lib/libcrypto.a".into()),
+            ]
+        );
+        let warning = kept_result_warning("btls-sys build script", &differences);
+        assert!(
+            warning.starts_with("btls-sys build script: kept the result already stored"),
+            "{warning}"
+        );
+        assert!(
+            warning.contains("stderr, OUT_DIR extra.txt, OUT_DIR lib/libcrypto.a"),
+            "{warning}"
+        );
+        assert!(warning.contains("read its OUT_DIR"), "{warning}");
+
+        let quiet = kept_result_warning("noisy build script", &[Difference::Stderr]);
+        assert!(!quiet.contains("OUT_DIR"), "{quiet}");
+    }
 
     #[cfg(unix)]
     #[test]
