@@ -29,7 +29,7 @@
 #![deny(missing_docs)]
 
 use mbx_cache_core::{
-    CacheDigest, FileDigestCache, PathAliases, PathMapping as SharedPathMapping,
+    CacheDigest, FileDigestCache, NIX_STORE, PathAliases, PathMapping as SharedPathMapping,
     PathNormalizationError, canonical_json, compact_prediction_inputs, expand_prediction_inputs,
     normalize_mapped_path as normalize_shared_path,
     normalize_resolved_mapped_path_with as normalize_resolved_shared_path_with,
@@ -2657,7 +2657,20 @@ impl<'a> ActionBuilder<'a> {
                 return Ok(format!("{}/{}", self.normalize_path(&directory)?, suffix));
             }
         }
-        self.normalize_path(path)
+        // An input in the Nix store is keyed verbatim, as C and C++ key one
+        // (mbx-cache-cc's SYSTEM_ROOTS). Its contents are digested like any
+        // input's, and its path is the same on every machine that holds it.
+        // A Nix toolchain needs this: it is a symlink join, so its sysroot
+        // crates and `rust-src` resolve into other store paths, outside the
+        // selected compiler's sysroot mapping. Only inputs qualify, since
+        // they are the paths whose contents the key carries.
+        self.normalize_path(path).or_else(|reason| match reason {
+            BypassReason::UnmappedAbsolutePath(_) if absolute.starts_with(NIX_STORE) => absolute
+                .to_str()
+                .map(ToOwned::to_owned)
+                .ok_or_else(|| BypassReason::NonUtf8Path(absolute.clone())),
+            reason => Err(reason),
+        })
     }
 
     fn normalize_path(&self, path: &Path) -> Result<String, BypassReason> {
@@ -2704,6 +2717,12 @@ fn denormalize_path(value: &str, mappings: &[PathMapping]) -> Result<PathBuf, By
         }
         let mut path = normalize_components(&mapping.root);
         path.extend(suffix.split('/').filter(|component| !component.is_empty()));
+        return Ok(path);
+    }
+    // A verbatim input is admitted only in the Nix store, and only spelled
+    // literally: a traversal component would let a prediction reach outside.
+    let path = PathBuf::from(value);
+    if path.is_absolute() && path.starts_with(NIX_STORE) && normalize_components(&path) == path {
         return Ok(path);
     }
     Err(BypassReason::InvalidPredictedInput(value.into()))
