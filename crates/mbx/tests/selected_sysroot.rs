@@ -378,3 +378,113 @@ printf 'target/libfixture.rmeta: lib.rs\n' > target/fixture.d
         "the existing key-lookup identity-failure warning must remain visible: {stderr}"
     );
 }
+
+/// A `-Zbuild-std` unit of a symlink-joined toolchain, as a Nix toolchain is:
+/// `rustc --print sysroot` names the join, whose directories are its own and
+/// whose leaves link into the store paths it joins. Cargo runs the unit in the
+/// join's `rust-src` and names its sources as the join spells them, and a build
+/// that remaps the sysroot passes the join itself. Every one of those sources
+/// resolves into `rust-src`'s own store path, outside the join.
+#[test]
+fn a_build_std_unit_of_a_joined_toolchain_stores_and_restores() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let workspace = root.join("workspace");
+    let deps = workspace.join("target/debug/deps");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::create_dir_all(root.join("home")).unwrap();
+    std::fs::create_dir_all(root.join("shims")).unwrap();
+    let shim = mbx::session::install_shim(
+        Path::new(env!("CARGO_BIN_EXE_mbx")),
+        &root.join("shims"),
+        mbx::session::ShimLink::Tracking,
+    )
+    .unwrap();
+    let source = root.join("nix/store/rust-src/lib/rustlib/src/rust/library/core/src");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(source.join("lib.rs"), "#![no_std]\n").unwrap();
+    let join = root.join("nix/store/rust-nightly");
+    let core = join.join("lib/rustlib/src/rust/library/core");
+    std::fs::create_dir_all(&core).unwrap();
+    symlink(&source, core.join("src")).unwrap();
+    std::fs::create_dir_all(join.join("bin")).unwrap();
+    let compiler = join.join("bin/rustc");
+    std::fs::write(
+        &compiler,
+        r#"#!/bin/sh
+set -eu
+default=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)
+case "$1" in
+    -vV)
+        printf 'rustc 1.101.0-nightly (abc 2026-10-12)\ncommit-hash: abc\nhost: x86_64-unknown-linux-gnu\nrelease: 1.101.0-nightly\nLLVM version: 22.0.0\n'
+        exit 0
+        ;;
+    --print|--print=*) printf '%s\n' "$default"; exit 0 ;;
+esac
+out=
+source=
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --out-dir=*) out=${1#--out-dir=} ;;
+        *.rs) source=$1 ;;
+    esac
+    shift
+done
+printf 'compile\n' >> "$TEST_COMPILE_LOG"
+mkdir -p "$out"
+cat "$source" > "$out/libcore.rmeta"
+printf '%s: %s\n%s: %s\n\n%s:\n' "$out/core.d" "$source" "$out/libcore.rmeta" "$source" "$source" > "$out/core.d"
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&compiler, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let compiles = root.join("compiles");
+    let compile = || {
+        let output = Command::new(&shim)
+            .current_dir(&core)
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap())
+            .env("HOME", root.join("home"))
+            .env("RUSTUP_HOME", root.join("home/.rustup"))
+            .env("CARGO_HOME", root.join("home/.cargo"))
+            .env("XDG_CONFIG_HOME", root.join("home/.config"))
+            .env("MBX_CACHE_DIR", root.join("cache"))
+            .env("MBX_LEARNED_INCREMENTAL", "0")
+            .env("MBX_SCHEDULER", "0")
+            .env("TEST_COMPILE_LOG", &compiles)
+            .env("CARGO_MANIFEST_DIR", &core)
+            .arg(&compiler)
+            .args([
+                "--crate-name",
+                "core",
+                "--crate-type=lib",
+                "--emit=dep-info,metadata",
+                "-Zforce-unstable-if-unmarked",
+            ])
+            .arg(format!("--out-dir={}", deps.display()))
+            .arg(format!("--remap-path-prefix={}=/rust", join.display()))
+            .arg(core.join("src/lib.rs"))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "the build-std unit failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stderr).into_owned()
+    };
+
+    let stored = compile();
+    assert!(!stored.contains("not stored"), "{stored}");
+    std::fs::remove_dir_all(workspace.join("target")).unwrap();
+    let restored = compile();
+    assert_eq!(
+        std::fs::read_to_string(deps.join("libcore.rmeta")).unwrap(),
+        "#![no_std]\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&compiles).unwrap().lines().count(),
+        1,
+        "the build-std unit should be stored once and restored, not compiled again:\n{stored}\n{restored}"
+    );
+}
