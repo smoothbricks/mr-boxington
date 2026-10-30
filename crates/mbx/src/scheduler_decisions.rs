@@ -1427,7 +1427,10 @@ mod tests {
         assert!(entry.record.is_none());
         let value: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&entry._guard.path).unwrap()).unwrap();
-        assert!(value.get("pid").is_none());
+        // The live activity route reports each pending waiter's pid, so the
+        // record carries it whether or not decision events are kept; only
+        // the event-history fields stay out.
+        assert_eq!(value["pid"], std::process::id());
         assert!(value.get("first_arrival_ms").is_none());
         pool.available_memory = || Some(0);
         assert!(
