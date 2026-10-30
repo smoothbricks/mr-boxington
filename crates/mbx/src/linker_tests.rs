@@ -572,10 +572,66 @@ fn an_sdk_outside_a_developer_directory_describes_itself() {
         Some(format!("{root} 14.4 (23E208)"))
     );
     std::fs::remove_file(sdk.join("System/Library/CoreServices/SystemVersion.plist")).unwrap();
+    let missing = sdk_identity_for(Some(root)).unwrap_err();
     assert!(
-        sdk_identity_for(Some(root)).is_err(),
-        "an SDK without its build cannot be described"
+        format!("{missing:#}").contains("SystemVersion.plist"),
+        "an SDK without its build cannot be described, and the error names the file: {missing:#}"
     );
+}
+
+/// A link a Nix wrapper shapes reads link flags and an SDK the linker
+/// identity does not cover, so it is refused: a driver that is a nixpkgs
+/// cc-wrapper, and any variable of the wrapper's link families, under any
+/// role or target spelling. A compiler in the store that wraps nothing, a
+/// driver outside it, and Nix variables no link reads are not.
+#[cfg(unix)]
+#[test]
+fn a_link_a_nix_wrapper_shapes_is_not_identified() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(directory.path()).unwrap();
+    let store = root.join("store");
+    let executable = |path: PathBuf| {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "#!/bin/sh\n").unwrap();
+        path
+    };
+    let wrapped = executable(store.join("aaaa-clang-wrapper/bin/cc"));
+    std::fs::create_dir_all(store.join("aaaa-clang-wrapper/nix-support")).unwrap();
+    std::fs::write(
+        store.join("aaaa-clang-wrapper/nix-support/orig-cc"),
+        "/nix/store/bbbb-clang\n",
+    )
+    .unwrap();
+    let unwrapped = executable(store.join("bbbb-clang/bin/cc"));
+    let system = executable(root.join("usr/bin/cc"));
+    let refuse = |driver: &Path, names: &[&str]| {
+        refuse_nix_wrapped_link(driver, &store, names.iter().map(OsString::from))
+    };
+
+    assert!(refuse(&system, &[]).is_ok());
+    assert!(refuse(&unwrapped, &[]).is_ok());
+    let refusal = refuse(&wrapped, &[]).unwrap_err().to_string();
+    assert!(refusal.contains("Nix cc-wrapper"), "{refusal}");
+    for name in [
+        "NIX_LDFLAGS",
+        "NIX_LDFLAGS_BEFORE",
+        "NIX_LDFLAGS_HARDEN",
+        "NIX_CFLAGS_LINK_FOR_BUILD",
+        "NIX_DYNAMIC_LINKER_arm64_apple_darwin",
+        "NIX_BINTOOLS_WRAPPER_TARGET_HOST_arm64_apple_darwin",
+        "NIX_HARDENING_ENABLE",
+    ] {
+        let refusal = refuse(&system, &[name]).unwrap_err().to_string();
+        assert!(refusal.contains(name), "{name}: {refusal}");
+    }
+    for name in [
+        "NIX_SSL_CERT_FILE",
+        "NIX_PKG_CONFIG_WRAPPER_TARGET_HOST_arm64_apple_darwin",
+        "NIX_LDFLAGSX",
+        "NIX_CFLAGS_COMPILE",
+    ] {
+        assert!(refuse(&system, &[name]).is_ok(), "{name}");
+    }
 }
 
 /// Reading the SDK's own files describes an Xcode SDK exactly as `xcrun`

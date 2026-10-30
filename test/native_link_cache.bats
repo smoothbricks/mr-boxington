@@ -122,6 +122,35 @@ test_binary() {
   assert_success
 }
 
+@test "a Nix wrapper's link variables keep a linked test binary out of the cache" {
+  # A Nix cc-wrapper's link reads NIX_LDFLAGS and its other link families,
+  # under role and target spellings, and none of them shows on the command
+  # line mbx sees or in its linker identity. Two links that differ only there
+  # must not share a key, so neither is cached. Two copies of the project,
+  # since the two links run in two checkouts.
+  local second_project="$BATS_TEST_TMPDIR/second-project"
+  local warm_report="$BATS_TEST_TMPDIR/nix-warm.json"
+  cp -R "$PROJECT" "$second_project"
+
+  run env \
+    MBX_CACHE_LINKS=1 \
+    NIX_LDFLAGS="-L/nix/store/first-libiconv/lib" \
+    "$MBX_BIN" test --offline --no-run --manifest-path "$PROJECT/Cargo.toml"
+  assert_success
+
+  run env \
+    MBX_CACHE_LINKS=1 \
+    NIX_LDFLAGS="-L/nix/store/second-libiconv/lib" \
+    MBX_STATS_REPORT="$warm_report" \
+    "$MBX_BIN" test --offline --no-run --manifest-path "$second_project/Cargo.toml"
+  assert_success
+  # The library restores; the link is not looked up.
+  run grep -E '"hits"[[:space:]]*:[[:space:]]*1[^0-9]' "$warm_report"
+  assert_success
+  run grep -E '"unportable-native-link"' "$warm_report"
+  assert_success
+}
+
 @test "a -fuse-ld selection restores a linked test binary" {
   # Any alternate linker proves the path: the selection must resolve, join
   # the linker identity, and still restore. Skip where none is installed.

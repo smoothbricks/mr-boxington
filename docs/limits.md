@@ -165,6 +165,12 @@ native links are cached:
   report both versions.
 - On Windows, a host is refused when mbx cannot identify the MSVC toolset and
   Windows SDK versions, or cannot find both the VC and Universal CRT libraries.
+  - On any host, a link a Nix wrapper shapes is refused: a `cc` that resolves
+    into `/nix/store` as a nixpkgs cc-wrapper, or any variable of the wrapper's
+    link families (`NIX_LDFLAGS`, `NIX_CFLAGS_LINK`, `NIX_CXXSTDLIB_LINK`,
+    `NIX_DYNAMIC_LINKER`, `NIX_HARDENING_ENABLE` and the rest, under any role or
+    target spelling). The wrapper adds link flags from them, and on macOS picks
+    an SDK of its own, none of which the key covers.
 
 The same goes for a driver that names no linker or reports no version. mbx
 refuses these hosts rather than leaving the missing input out of the key: two

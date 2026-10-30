@@ -13,10 +13,12 @@
 
 use crate::session;
 use eyre::{Context, Result, bail};
-use mbx_cache_core::{AgentRequest, AgentResponse, CacheDigest, PinnedFile, canonical_json};
+use mbx_cache_core::{
+    AgentRequest, AgentResponse, CacheDigest, NIX_STORE, PinnedFile, canonical_json,
+};
 use mbx_cache_rustc::LinkerIdentity;
 use std::collections::BTreeMap;
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -39,6 +41,26 @@ const IDENTITY_ENVIRONMENT: &[&str] = &[
     "VCToolsVersion",
     "WindowsSdkDir",
     "WindowsSDKVersion",
+];
+
+/// The families of variables a Nix wrapper's link reads besides its command
+/// line. nixpkgs' cc-wrapper and bintools-wrapper read each one under its own
+/// name, under a role suffix (`_FOR_BUILD`, `_FOR_TARGET`) and under a target
+/// salt (`_arm64_apple_darwin`), and the `NIX_*_WRAPPER_*` variables choose
+/// among those. A variable is in a family when its name is the family's or
+/// extends it with `_`.
+const NIX_LINK_ENVIRONMENT: &[&str] = &[
+    "NIX_BINTOOLS_WRAPPER",
+    "NIX_BUILD_ID_STYLE",
+    "NIX_CC_WRAPPER",
+    "NIX_CFLAGS_LINK",
+    "NIX_CXXSTDLIB_LINK",
+    "NIX_DONT_SET_RPATH",
+    "NIX_DYNAMIC_LINKER",
+    "NIX_HARDENING_ENABLE",
+    "NIX_IGNORE_LD_THROUGH_GCC",
+    "NIX_LDFLAGS",
+    "NIX_SET_BUILD_ID",
 ];
 
 /// What the driver is asked to place, and which of it a key cannot do without.
@@ -147,6 +169,11 @@ pub(crate) fn identity_for(
     } else {
         which::which("cc").wrap_err("failed to find the linker driver `cc`")?
     };
+    refuse_nix_wrapped_link(
+        &driver,
+        Path::new(NIX_STORE),
+        std::env::vars_os().map(|(name, _)| name),
+    )?;
     let mut environment = IDENTITY_ENVIRONMENT
         .iter()
         .map(|name| ((*name).into(), std::env::var(name).ok()))
@@ -945,37 +972,94 @@ fn sdk_identity_for(root: Option<String>) -> Result<Option<String>> {
     if !cfg!(target_os = "macos") {
         return Ok(None);
     }
-    let describe = || {
-        let directory = match root.as_deref() {
-            Some(root) if Path::new(root).is_absolute() => PathBuf::from(root),
-            sdk => PathBuf::from(xcrun(&[
-                "--sdk",
-                sdk.unwrap_or("macosx"),
-                "--show-sdk-path",
-            ])?),
-        };
-        let (version, build) = sdk_description(&directory)?;
-        let path = match &root {
-            Some(root) => root.clone(),
-            None => directory.to_str()?.to_owned(),
-        };
-        Some(format!("{path} {version} ({build})"))
+    let directory = match root.as_deref() {
+        Some(root) if Path::new(root).is_absolute() => PathBuf::from(root),
+        sdk => {
+            let sdk = sdk.unwrap_or("macosx");
+            PathBuf::from(
+                xcrun(&["--sdk", sdk, "--show-sdk-path"])
+                    .ok_or_else(|| eyre::eyre!("xcrun could not locate the macOS SDK `{sdk}`"))?,
+            )
+        }
     };
-    describe().map(Some).ok_or_else(|| {
-        eyre::eyre!("the macOS SDK could not be identified, so its links cannot be either")
-    })
+    let (version, build) = sdk_description(&directory).wrap_err_with(|| {
+        format!(
+            "the macOS SDK {} could not be identified, so its links cannot be either",
+            directory.display()
+        )
+    })?;
+    let path = match root {
+        Some(root) => root,
+        None => directory
+            .to_str()
+            .ok_or_else(|| eyre::eyre!("the macOS SDK path {} is not UTF-8", directory.display()))?
+            .to_owned(),
+    };
+    Ok(Some(format!("{path} {version} ({build})")))
 }
 
-/// The version and build an SDK records for itself.
-fn sdk_description(sdk: &Path) -> Option<(String, String)> {
-    let settings: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(sdk.join("SDKSettings.json")).ok()?).ok()?;
-    let version = settings["Version"].as_str()?.trim();
-    let plist =
-        std::fs::read_to_string(sdk.join("System/Library/CoreServices/SystemVersion.plist"))
-            .ok()?;
-    let build = plist_string(&plist, "ProductBuildVersion")?;
-    (!version.is_empty() && !build.is_empty()).then(|| (version.to_owned(), build.to_owned()))
+/// The version and build an SDK records for itself, or which of its files
+/// could not say and why.
+fn sdk_description(sdk: &Path) -> Result<(String, String)> {
+    let settings = sdk.join("SDKSettings.json");
+    let parsed: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(&settings)
+            .wrap_err_with(|| format!("failed to read {}", settings.display()))?,
+    )
+    .wrap_err_with(|| format!("failed to parse {}", settings.display()))?;
+    let version = parsed["Version"]
+        .as_str()
+        .map(str::trim)
+        .filter(|version| !version.is_empty())
+        .ok_or_else(|| eyre::eyre!("{} names no Version", settings.display()))?;
+    let system = sdk.join("System/Library/CoreServices/SystemVersion.plist");
+    let plist = std::fs::read_to_string(&system)
+        .wrap_err_with(|| format!("failed to read {}", system.display()))?;
+    let build = plist_string(&plist, "ProductBuildVersion")
+        .filter(|build| !build.is_empty())
+        .ok_or_else(|| eyre::eyre!("{} names no ProductBuildVersion", system.display()))?;
+    Ok((version.to_owned(), build.to_owned()))
+}
+
+/// Refuse a link a Nix wrapper shapes.
+///
+/// A nixpkgs cc-wrapper driver, or a bintools-wrapper `ld` that any driver
+/// runs, adds link flags from [`NIX_LINK_ENVIRONMENT`], and on Darwin takes
+/// its SDK from `DEVELOPER_DIR` under its target salt, or a fallback of its
+/// own, rather than from `SDKROOT`. The linker identity covers none of it, so
+/// two shells that differ only there, such as `-liconv` resolving to two
+/// libiconv store paths, would share a link key, and a hit would restore a
+/// binary naming the other shell's store paths. Such a link is left
+/// unidentified, so it bypasses.
+fn refuse_nix_wrapped_link(
+    driver: &Path,
+    store: &Path,
+    names: impl IntoIterator<Item = OsString>,
+) -> Result<()> {
+    let link_variable = names.into_iter().find(|name| {
+        name.to_str().is_some_and(|name| {
+            NIX_LINK_ENVIRONMENT.iter().any(|family| {
+                name.strip_prefix(family)
+                    .is_some_and(|rest| rest.is_empty() || rest.starts_with('_'))
+            })
+        })
+    });
+    if let Some(name) = link_variable {
+        bail!(
+            "{} is set, and a Nix wrapper's link reads it, which the linker identity does not cover",
+            name.to_string_lossy()
+        );
+    }
+    let wrapper = crate::cc::nix_store_driver(driver, store)
+        .map_err(|reason| eyre::eyre!("{reason}"))?
+        .filter(|driver| driver.cc_wrapper);
+    if let Some(wrapper) = wrapper {
+        bail!(
+            "the linker driver {} is a Nix cc-wrapper, whose link reads variables and an SDK the linker identity does not cover",
+            wrapper.path.display()
+        );
+    }
+    Ok(())
 }
 
 /// The string an XML property list's dictionary holds under `key`.
