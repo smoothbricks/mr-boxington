@@ -937,7 +937,11 @@ fn is_system_include_path(path: &Path) -> bool {
 fn rustc_path_mappings(mappings: &[PathMapping]) -> Vec<mbx_cache_rustc::PathMapping> {
     mappings
         .iter()
-        .map(|mapping| mbx_cache_rustc::PathMapping::new(&mapping.root, &mapping.placeholder))
+        .map(|mapping| mbx_cache_rustc::PathMapping {
+            root: mapping.root.clone(),
+            placeholder: mapping.placeholder.clone(),
+            matching: mapping.matching,
+        })
         .collect()
 }
 

@@ -83,6 +83,14 @@ home and rustup mappings are unchanged. An
 arbitrary `--sysroot` override does not become the selected compiler's default:
 it must already fall under a known mapping or the action bypasses the cache.
 
+The selected sysroot's mapping also matches a path as it is spelled, not only
+as it resolves. A symlink-joined toolchain keeps its own directories and links
+its leaves into the store paths it joins, and `-Zbuild-std` compiles the
+standard library in that tree: Cargo names each unit's sources and working
+directory by the join's paths, and a build that remaps the sysroot names the
+join itself. Those key beneath the sysroot's placeholder, so a build-std unit
+is stored and restored like any other compilation.
+
 An input file in the Nix store keeps its own path in the key, for Rust as for
 C and C++: its contents are hashed like any input's, and a store path is
 spelled the same on every machine that holds it. That covers a Nix toolchain's

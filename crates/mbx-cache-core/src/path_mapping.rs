@@ -7,6 +7,20 @@ use std::path::{Component, Path, PathBuf};
 /// a checkout's.
 pub const NIX_STORE: &str = "/nix/store";
 
+/// How a path is matched against a mapping's root.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RootMatch {
+    /// As the path resolves: a link out of the root leaves it, and an alias of
+    /// the root enters it.
+    Resolved,
+    /// As the path is spelled as well. For a tree that is immutable for the
+    /// identity the key already carries, whose directories are its own while
+    /// its leaves link elsewhere: a toolchain sysroot joined from other store
+    /// paths names `rust-src` by the join's paths, and that is how the compiler
+    /// is given them.
+    Spelled,
+}
+
 /// Mapping from a host-specific absolute root to a stable key placeholder.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PathMapping {
@@ -14,6 +28,8 @@ pub struct PathMapping {
     pub root: PathBuf,
     /// Placeholder name without the surrounding `${...}` syntax.
     pub placeholder: String,
+    /// How a path is matched against `root`.
+    pub matching: RootMatch,
 }
 
 impl PathMapping {
@@ -22,6 +38,16 @@ impl PathMapping {
         Self {
             root: root.into(),
             placeholder: placeholder.into(),
+            matching: RootMatch::Resolved,
+        }
+    }
+
+    /// [`PathMapping::new`], also matching paths as they are spelled
+    /// ([`RootMatch::Spelled`]).
+    pub fn spelled(root: impl Into<PathBuf>, placeholder: impl Into<String>) -> Self {
+        Self {
+            matching: RootMatch::Spelled,
+            ..Self::new(root, placeholder)
         }
     }
 
@@ -88,6 +114,7 @@ pub fn resolve_path_mappings(mappings: &[PathMapping]) -> Vec<PathMapping> {
         .map(|mapping| PathMapping {
             root: resolve_mapping_root(&mapping.root),
             placeholder: mapping.placeholder.clone(),
+            matching: mapping.matching,
         })
         .collect()
 }
@@ -152,7 +179,15 @@ pub fn normalize_resolved_mapped_path_with(
         absolute.clone()
     };
     for mapping in mappings {
-        if let Ok(relative) = resolved.strip_prefix(&mapping.root) {
+        let relative =
+            resolved
+                .strip_prefix(&mapping.root)
+                .ok()
+                .or_else(|| match mapping.matching {
+                    RootMatch::Spelled => absolute.strip_prefix(&mapping.root).ok(),
+                    RootMatch::Resolved => None,
+                });
+        if let Some(relative) = relative {
             let suffix = slash_path(relative)?;
             return Ok(if suffix.is_empty() {
                 format!("${{{}}}", mapping.placeholder)
