@@ -4334,6 +4334,74 @@ fn build_script_execution_and_out_dir_restore_across_checkouts() {
     assert!(count(&warm, "hits") >= 1, "build script should hit: {warm}");
 }
 
+/// A build script that writes something different to stderr on every run,
+/// as cmake's timings and a job's jobserver fifo do. A checkout whose
+/// prediction is gone runs it again, and its result conflicts with the one
+/// stored for the same key. The run keeps the stored result, says what
+/// differed, and records the prediction, so the next build restores it
+/// instead of running the script on every build.
+#[test]
+fn a_noisy_build_script_keeps_the_stored_result_and_restores_it_next_time() {
+    let store = tempfile::tempdir().unwrap();
+    let reports = tempfile::tempdir().unwrap();
+    let first = tempfile::tempdir().unwrap();
+    let second = tempfile::tempdir().unwrap();
+    for project in [first.path(), second.path()] {
+        std::fs::create_dir_all(project.join("src")).unwrap();
+        std::fs::write(
+            project.join("Cargo.toml"),
+            "[package]\nname = \"noisy-fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            project.join("build.rs"),
+            "use std::{env, fs, path::PathBuf, time::SystemTime};\n\
+             fn main() {\n\
+                 let count = PathBuf::from(\"runs\");\n\
+                 let runs = fs::read_to_string(&count).ok().and_then(|s| s.parse::<u32>().ok()).unwrap_or(0) + 1;\n\
+                 fs::write(count, runs.to_string()).unwrap();\n\
+                 println!(\"cargo:rerun-if-changed=build.rs\");\n\
+                 eprintln!(\"configured in {:?}\", SystemTime::now());\n\
+                 let out = PathBuf::from(env::var_os(\"OUT_DIR\").unwrap());\n\
+                 fs::write(out.join(\"generated.rs\"), \"pub const VALUE: u32 = 1;\\n\").unwrap();\n\
+             }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            project.join("src/lib.rs"),
+            "include!(concat!(env!(\"OUT_DIR\"), \"/generated.rs\"));\n",
+        )
+        .unwrap();
+        generate_lockfile(project);
+    }
+    let build = |project: &Path, name: &str| {
+        build_with(
+            project,
+            store.path(),
+            &reports.path().join(format!("{name}.json")),
+            &[("MBX_CACHE_LINKS", "0")],
+        )
+    };
+
+    build(first.path(), "first");
+    // The prediction is retired, as a full task manifest retires it.
+    std::fs::remove_dir_all(store.path().join("actions/task-manifests/v1")).unwrap();
+    let (_, conflicted) = build(second.path(), "conflicted");
+    assert!(
+        conflicted.contains("noisy-fixture build script: kept the result already stored")
+            && conflicted.contains("stderr"),
+        "the run should keep the stored result and say its stderr differed: {conflicted}"
+    );
+    std::fs::remove_dir_all(second.path().join("target")).unwrap();
+    let (restored, stderr) = build(second.path(), "restored");
+
+    assert_eq!(
+        std::fs::read_to_string(second.path().join("runs")).unwrap(),
+        "1",
+        "the build script ran again instead of restoring the kept result: {restored}\n{stderr}"
+    );
+}
+
 /// An OUT_DIR that is wide and deep, with repeated and empty files, restores
 /// exactly, including a directory with more files than one blob lookup asks
 /// about.
