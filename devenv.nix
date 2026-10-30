@@ -64,6 +64,9 @@
     pkgs.cargo-nextest
     # aws-lc-sys falls back to CMake where its cc build does not apply.
     pkgs.cmake
+    # test/setup.bats drives mise's postinstall hook and command wrappers, as
+    # CI runs the suite under jdx/mise-action.
+    pkgs.mise
   ];
 
   # Builder-only variables the shell derivation would export: they change what
