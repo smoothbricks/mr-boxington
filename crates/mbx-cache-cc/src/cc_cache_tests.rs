@@ -907,6 +907,95 @@ fn a_nix_store_driver_is_keyed_by_its_store_path() {
     assert!(!descriptor.contains("nix_store_path"), "{descriptor}");
 }
 
+/// A wrapper's compile flags reach the compiler on its command line, so they
+/// meet the model argv does: what bypasses there bypasses here, and what
+/// would change how the compile is modeled -- its output, its language, its
+/// mode, its dependency output, a second source -- is refused.
+#[test]
+fn wrapper_flags_meet_the_argv_flag_model() {
+    let wrapper = nix_wrapper(WRAPPER);
+    let check = |name: &str, flags: &str| {
+        compile(&[])
+            .environment_inputs(variables(&[(name, flags)]), &wrapper)
+            .map(|_| ())
+            .map_err(|reason| reason.kind())
+    };
+    // What a Nix shell really carries (the Bun probe's NIX_CFLAGS_COMPILE).
+    assert_eq!(
+        check(
+            "NIX_CFLAGS_COMPILE",
+            " -frandom-seed=y1ff0np2qc -isystem /nix/store/kgsj-libcxx-21.1.6/include \
+             -fmacro-prefix-map=/nix/store/kgsj-libcxx-21.1.6=/nix/store/eeee-libcxx-21.1.6"
+        ),
+        Ok(())
+    );
+    let mismatches: Vec<String> = [
+        ("NIX_CFLAGS_COMPILE", "-march=native", "local-cpu-target"),
+        (
+            "NIX_CFLAGS_COMPILE_BEFORE",
+            "-O2 -gsplit-dwarf",
+            "split-debug-output",
+        ),
+        (
+            "NIX_CFLAGS_COMPILE",
+            "-fprofile-use=/nix/store/p/default.profdata",
+            "coverage-instrumentation",
+        ),
+        (
+            "NIX_CFLAGS_COMPILE",
+            "-fplugin=/nix/store/p/plugin.so",
+            "plugin",
+        ),
+        (
+            "NIX_CFLAGS_COMPILE",
+            "-fsanitize-ignorelist=/nix/store/p/ignore.txt",
+            "unknown-flag",
+        ),
+        ("NIX_CFLAGS_COMPILE", "-Xclang -load", "tool-passthrough"),
+        (
+            "NIX_CXXSTDLIB_COMPILE",
+            "-mllvm -inline-threshold=0",
+            "tool-passthrough",
+        ),
+        ("NIX_CFLAGS_COMPILE", "-save-temps", "save-temps"),
+        (
+            "NIX_CFLAGS_COMPILE",
+            "-MD -MF deps.d",
+            "caller-dependency-flags",
+        ),
+        (
+            "NIX_CFLAGS_COMPILE",
+            "-o elsewhere.o",
+            "unsupported-environment",
+        ),
+        ("NIX_CFLAGS_COMPILE", "-x c++", "unsupported-environment"),
+        ("NIX_CFLAGS_COMPILE", "-E", "unsupported-environment"),
+        (
+            "NIX_CFLAGS_COMPILE",
+            "-DX extra.c",
+            "unsupported-environment",
+        ),
+        // Unquoted, the wrapper's words are globbed under `nullglob`.
+        (
+            "NIX_CFLAGS_COMPILE",
+            "-I/nix/store/*/include",
+            "unsupported-environment",
+        ),
+        (
+            "NIX_CFLAGS_COMPILE",
+            "-DPICK=[ab]",
+            "unsupported-environment",
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(name, flags, kind)| {
+        let outcome = check(name, flags);
+        (outcome != Err(kind)).then(|| format!("{name}={flags}: {outcome:?}, expected {kind}"))
+    })
+    .collect();
+    assert!(mismatches.is_empty(), "{mismatches:#?}");
+}
+
 /// A search directory a wrapper adds from its compile flags is not on the
 /// command line, so nothing watches it for a header that would shadow one the
 /// compilation read. In the store that cannot happen; anywhere else the
@@ -920,8 +1009,7 @@ fn wrapper_search_directories_outside_the_store_are_refused() {
             .map(|_| ())
     };
     for flags in [
-        " -frandom-seed=y1ff0np2qc -isystem /nix/store/x-libcxx/include -fmacro-prefix-map=/nix/store/x=/nix/store/e",
-        "-I/nix/store/y/include -iframework /nix/store/z/Library/Frameworks",
+        "-I/nix/store/y/include",
         "-idirafter /nix/store/w/include -DNDEBUG",
     ] {
         assert_eq!(
@@ -935,10 +1023,6 @@ fn wrapper_search_directories_outside_the_store_are_refused() {
         ("NIX_CFLAGS_COMPILE", "-I/opt/include"),
         ("NIX_CFLAGS_COMPILE_FOR_BUILD", "-Iinclude"),
         ("NIX_CFLAGS_COMPILE_BEFORE", "-iquote /nix/store/../../opt"),
-        (
-            "NIX_CXXSTDLIB_COMPILE",
-            "-cxx-isystem /home/u/libcxx/include",
-        ),
     ] {
         assert_eq!(
             check(name, flags, &wrapper),
@@ -947,6 +1031,29 @@ fn wrapper_search_directories_outside_the_store_are_refused() {
         );
         // A compiler that is not a wrapper never reads the variable.
         assert_eq!(check(name, flags, &identity()), Ok(()), "{flags}");
+    }
+}
+
+/// Every platform's deployment target is read under a role suffix and a
+/// target salt as well as under its own name.
+#[test]
+fn every_deployment_target_is_keyed_under_every_spelling() {
+    let spellings = [
+        ("IPHONEOS_DEPLOYMENT_TARGET_FOR_BUILD", "17.0"),
+        ("MACOSX_DEPLOYMENT_TARGET_arm64_apple_darwin", "14.0"),
+        ("TVOS_DEPLOYMENT_TARGET_FOR_TARGET", "17.0"),
+        ("WATCHOS_DEPLOYMENT_TARGET_FOR_BUILD", "10.0"),
+        ("XROS_DEPLOYMENT_TARGET_FOR_TARGET", "1.0"),
+    ];
+    let environment = compile(&[])
+        .environment_inputs(variables(&spellings), &identity())
+        .unwrap();
+    for (name, value) in spellings {
+        assert_eq!(
+            environment.get(name),
+            Some(&Some(value.to_string())),
+            "{name}"
+        );
     }
 }
 
