@@ -1069,6 +1069,45 @@ fn flags_real_sys_crates_pass_are_admitted() {
     }
 }
 
+/// Flags Bun's build passes to its C, C++ and preprocessed-assembly compiles
+/// (`scripts/build/flags.ts`). Each one tunes debug information, code
+/// generation, constant evaluation, or diagnostics; none names a file or
+/// writes a second output, so its text describes it completely and enters the
+/// key as given.
+#[test]
+fn debug_tuning_codegen_and_limit_flags_are_keyed_verbatim() {
+    let unkeyed: Vec<String> = [
+        "-glldb",
+        "-ferror-limit=100",
+        "-fno-pic",
+        "-fno-pie",
+        "-fno-c++-static-destructors",
+        "-fconstexpr-steps=6000000",
+        "-fconstexpr-depth=54",
+    ]
+    .into_iter()
+    .filter_map(
+        |flag| match CcInvocation::parse(&argv(&[flag, "-c", "-o", "a.o", "a.c"])) {
+            Ok(invocation) if invocation.arguments.contains(&Argument::Plain(flag.into())) => None,
+            Ok(_) => Some(format!("{flag}: admitted but not keyed verbatim")),
+            Err(reason) => Some(format!("{flag}: {reason}")),
+        },
+    )
+    .collect();
+    assert!(unkeyed.is_empty(), "{unkeyed:#?}");
+}
+
+/// `-f` and `-m` names are looked up with `binary_search`, which silently
+/// misses a name that sits out of order.
+#[test]
+fn flag_name_tables_stay_sorted() {
+    for table in [SUPPORTED_F_FLAGS, SUPPORTED_M_FLAGS] {
+        for pair in table.windows(2) {
+            assert!(pair[0] < pair[1], "{} sorts after {}", pair[0], pair[1]);
+        }
+    }
+}
+
 /// The `cc` crate probes drivers with `-?` to tell MSVC from gcc. That is a
 /// question, not a compilation, and must not read as an unmodeled flag.
 #[test]

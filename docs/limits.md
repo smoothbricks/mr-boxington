@@ -364,6 +364,13 @@ supported: its includes participate in dependency discovery, and the assembler
 is part of the GCC toolchain identity. Known assembler options that add no
 inputs, such as `-Wa,--noexecstack`, are also supported.
 
+Code generation, debug information, and diagnostic options that name no file
+and write nothing beside the object, such as `-fno-pic`, `-glldb`,
+`-fconstexpr-steps=`, or `-ferror-limit=`, enter the key exactly as written.
+That includes the ones that only change diagnostics: a hit replays the
+diagnostics the compiler printed, so they belong to the result too. An option
+mbx does not list bypasses rather than being guessed at.
+
 GCC/Clang preprocessing with `-E ... -o file` is cached too. The file is
 restored byte-for-byte, preserving line markers and `__FILE__` values. These
 entries put literal argument paths, the working directory, and mapped roots in

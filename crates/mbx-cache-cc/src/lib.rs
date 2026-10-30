@@ -95,14 +95,23 @@ pub const SYSTEM_ROOTS: &[&str] = &[
     "/usr/local/include",
 ];
 
+/// `-f` options whose text describes them completely: none names a file or
+/// writes a second output, so each enters the key verbatim, its value
+/// included. Some only shape diagnostics (`error-limit`), and they are keyed
+/// all the same, since a hit replays the diagnostics too.
+///
+/// Sorted, for the `binary_search` in `parse_f_flag`.
 const SUPPORTED_F_FLAGS: &[&str] = &[
     "PIC",
     "PIE",
     "asynchronous-unwind-tables",
     "cf-protection",
     "color-diagnostics",
+    "constexpr-depth",
+    "constexpr-steps",
     "data-sections",
     "diagnostics-color",
+    "error-limit",
     "exceptions",
     "fast-math",
     "finite-math-only",
@@ -112,6 +121,7 @@ const SUPPORTED_F_FLAGS: &[&str] = &[
     "merge-all-constants",
     "no-asynchronous-unwind-tables",
     "no-builtin",
+    "no-c++-static-destructors",
     "no-common",
     "no-exceptions",
     "no-fast-math",
@@ -119,6 +129,8 @@ const SUPPORTED_F_FLAGS: &[&str] = &[
     "no-lto",
     "no-math-errno",
     "no-omit-frame-pointer",
+    "no-pic",
+    "no-pie",
     "no-plt",
     "no-reciprocal-math",
     "no-rtti",
@@ -231,6 +243,9 @@ const SUPPORTED_O_FLAGS: &[&str] = &[
     "-O", "-O0", "-O1", "-O2", "-O3", "-Ofast", "-Og", "-Os", "-Oz",
 ];
 
+/// `-g` spellings: whether to emit debug information, at what level, in
+/// which DWARF version, and tuned for which debugger (`-ggdb`, `-glldb`).
+/// Each changes only the debug information the object carries.
 const SUPPORTED_G_FLAGS: &[&str] = &[
     "-g",
     "-g0",
@@ -247,6 +262,7 @@ const SUPPORTED_G_FLAGS: &[&str] = &[
     "-ggdb1",
     "-ggdb2",
     "-ggdb3",
+    "-glldb",
 ];
 
 const SUPPORTED_BARE_FLAGS: &[&str] = &[
