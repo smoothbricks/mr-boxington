@@ -544,6 +544,59 @@ fn the_sdk_identity_follows_sdkroot() {
     );
 }
 
+/// An SDK outside any developer directory -- nixpkgs' `apple-sdk`, which a
+/// Nix shell names in `SDKROOT` -- is one `xcrun` answers "unable to find sdk"
+/// for, yet it carries the same description an Xcode SDK does: its version in
+/// `SDKSettings.json` and its build in `SystemVersion.plist`.
+#[cfg(target_os = "macos")]
+#[test]
+fn an_sdk_outside_a_developer_directory_describes_itself() {
+    let directory = tempfile::tempdir().unwrap();
+    let sdk = directory.path().join("MacOSX14.4.sdk");
+    std::fs::create_dir_all(sdk.join("System/Library/CoreServices")).unwrap();
+    std::fs::write(
+        sdk.join("SDKSettings.json"),
+        r#"{"CanonicalName":"macosx14.4","DisplayName":"macOS 14.4","Version":"14.4"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        sdk.join("System/Library/CoreServices/SystemVersion.plist"),
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\">\n<dict>\n\
+         \t<key>ProductBuildVersion</key>\n\t<string>23E208</string>\n\
+         \t<key>ProductVersion</key>\n\t<string>14.4</string>\n</dict>\n</plist>\n",
+    )
+    .unwrap();
+    let root = sdk.to_str().unwrap().to_owned();
+    assert_eq!(
+        sdk_identity_for(Some(root.clone())).unwrap(),
+        Some(format!("{root} 14.4 (23E208)"))
+    );
+    std::fs::remove_file(sdk.join("System/Library/CoreServices/SystemVersion.plist")).unwrap();
+    assert!(
+        sdk_identity_for(Some(root)).is_err(),
+        "an SDK without its build cannot be described"
+    );
+}
+
+/// Reading the SDK's own files describes an Xcode SDK exactly as `xcrun`
+/// does, so the keys of links made against one do not change.
+#[cfg(target_os = "macos")]
+#[test]
+fn an_sdk_describes_itself_as_xcrun_does() {
+    let (Some(path), Some(version), Some(build)) = (
+        xcrun(&["--sdk", "macosx", "--show-sdk-path"]),
+        xcrun(&["--sdk", "macosx", "--show-sdk-version"]),
+        xcrun(&["--sdk", "macosx", "--show-sdk-build-version"]),
+    ) else {
+        // No SDK `xcrun` can find on this machine; there is nothing to compare.
+        return;
+    };
+    assert_eq!(
+        sdk_identity_for(Some(path.clone())).unwrap(),
+        Some(format!("{path} {version} ({build})"))
+    );
+}
+
 /// A shim installed by `mbx setup` is driven by plain cargo, with no session
 /// to have applied the platform gate, so the shim applies it itself rather
 /// than trusting the variable it was handed.

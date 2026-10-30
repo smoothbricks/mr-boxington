@@ -155,8 +155,14 @@ native links are cached:
 
 - On Linux, mbx asks the driver to place a startup object and a libc. A host
   where either one does not resolve is refused.
-- On macOS, a host is refused when `xcrun` cannot report the SDK's version,
-  its build version, or (when `SDKROOT` is unset) its path.
+- On macOS, mbx reads the SDK's version from its `SDKSettings.json` and its
+  build version from its `System/Library/CoreServices/SystemVersion.plist`,
+  which is where `xcrun` reads them too. The SDK is the one `SDKROOT` names, or
+  the one `xcrun` locates when `SDKROOT` is unset or names an SDK rather than
+  a directory. Reading the SDK itself identifies one outside any developer
+  directory, such as the SDK a Nix shell names in `SDKROOT`, which `xcrun`
+  cannot find. A host is refused when the SDK cannot be located or does not
+  report both versions.
 - On Windows, a host is refused when mbx cannot identify the MSVC toolset and
   Windows SDK versions, or cannot find both the VC and Universal CRT libraries.
 
