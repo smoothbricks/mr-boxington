@@ -844,7 +844,9 @@ impl RustcInvocation {
         // There are few of those; the thousands of objects are not named.
         let mut inputs = BTreeSet::new();
         for input in &discovered.inputs {
-            let normalized = builder.normalize_path(&input.path)?;
+            // Named as the key names it (normalize_input_path), so an input
+            // in the Nix store is recorded verbatim rather than refused.
+            let normalized = builder.normalize_input_path(&input.path)?;
             if !under_any_directory(&normalized, &native_directories)
                 || !discovered.is_native_only(&input.path)
             {
