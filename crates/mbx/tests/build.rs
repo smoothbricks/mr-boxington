@@ -9031,6 +9031,85 @@ fn private_shims_support_nested_exec_and_survive_the_command() {
     assert!(probe.status.success());
 }
 
+/// A Nix cc-wrapper takes flags from the environment as well as from its
+/// command line, so one argv can build different objects.
+///
+/// The script stands in for nixpkgs' `cc-wrapper.sh`: it appends what it reads
+/// from `NIX_CFLAGS_COMPILE` to the arguments it was given, and, like the real
+/// one, adds nothing when it is only asked `-v`, so the compiler identity mbx
+/// probes is the same under any wrapper flags. A compile under other wrapper
+/// flags must not restore this one's object; the same flags again must.
+#[cfg(unix)]
+#[test]
+fn nix_wrapper_flags_from_the_environment_enter_the_c_key() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    if !has_c_compiler() {
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let cache = directory.path().join("cache");
+    let project = directory.path().join("project");
+    let wrapper = directory.path().join("nix wrapper");
+    std::fs::create_dir(&project).unwrap();
+    std::fs::create_dir(&wrapper).unwrap();
+    let real = Command::new("sh")
+        .args(["-c", "command -v cc"])
+        .output()
+        .unwrap();
+    let real = String::from_utf8(real.stdout).unwrap();
+    let script = wrapper.join("cc");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\n[ \"$*\" = -v ] && exec '{real}' -v\nexec '{real}' \"$@\" $NIX_CFLAGS_COMPILE\n",
+            real = real.trim()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(
+        project.join("input.c"),
+        "int value(void) { return VALUE; }\n",
+    )
+    .unwrap();
+    let path = std::env::join_paths(
+        std::iter::once(wrapper.clone()).chain(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        )),
+    )
+    .unwrap();
+    let compile = |flags: &str, report: &str| {
+        let report = directory.path().join(report);
+        let output = mbx_command()
+            .current_dir(&project)
+            .env("PATH", &path)
+            .env("MBX_CACHE_DIR", &cache)
+            .env("MBX_STATS_REPORT", &report)
+            .env("MBX_GC_AUTO", "0")
+            .env("NIX_CFLAGS_COMPILE", flags)
+            .args(["exec", "sh", "-c", "cc -c input.c -o result.o"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stats: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&report).unwrap()).unwrap();
+        let object = std::fs::read(project.join("result.o")).unwrap();
+        (count(&stats, "hits"), object)
+    };
+    let (_, first) = compile("-DVALUE=1", "first.json");
+    let (hits, again) = compile("-DVALUE=1", "again.json");
+    assert_eq!(hits, 1, "the same wrapper flags should hit");
+    assert_eq!(first, again);
+    let (hits, other) = compile("-DVALUE=2", "other.json");
+    assert_eq!(hits, 0, "other wrapper flags restored a cached object");
+    assert_ne!(first, other, "the object must be built under its own flags");
+}
+
 #[test]
 fn mbx_clean_under_reports_when_a_deleted_root_has_no_records() {
     let directory = tempfile::tempdir().unwrap();

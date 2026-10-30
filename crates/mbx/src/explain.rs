@@ -737,6 +737,9 @@ pub(crate) fn guidance(kind: &str) -> &'static str {
         "cc-unsupported-environment" => {
             "An include-path or sub-tool environment variable changes the compilation in a way the argv model cannot see. Unset it to make these compilations cacheable."
         }
+        "cc-nix-impure-path" => {
+            "A Nix compiler wrapper enforcing purity (`NIX_ENFORCE_PURITY=1`) drops include directories outside the Nix store, `$NIX_BUILD_TOP`, and the temporary directories, so the compiler would not search what the command line names. Keep include directories under one of those, or unset `NIX_ENFORCE_PURITY`, to make these compilations cacheable."
+        }
         "cc-search-path-modified-during-compilation" => {
             "An include directory gained or lost a header while the compiler was running, so what it read cannot be established. Avoid writing headers into a search directory during a build."
         }
