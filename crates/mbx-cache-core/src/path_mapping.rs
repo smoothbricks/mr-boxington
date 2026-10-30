@@ -1,6 +1,12 @@
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
 
+/// The Nix store. A path beneath it names its own contents -- the store path's
+/// hash covers everything that built it -- and it is spelled the same on
+/// every machine that holds it, so the path is a machine property rather than
+/// a checkout's.
+pub const NIX_STORE: &str = "/nix/store";
+
 /// Mapping from a host-specific absolute root to a stable key placeholder.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PathMapping {
