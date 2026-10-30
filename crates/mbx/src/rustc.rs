@@ -3810,7 +3810,12 @@ fn default_sysroot_mapping(root: PathBuf) -> Option<PathMapping> {
     // Equal version text does not prove two installations have equal libraries.
     // Like external native roots, an uncovered sysroot keeps its location identity.
     let placeholder = format!("sysroot_{}", CacheDigest::blake3(text.as_bytes()).hash);
-    Some(PathMapping::new(root, placeholder))
+    // Matched as spelled too: a symlink-joined toolchain (Nix builds one) keeps
+    // its directories but links its leaves into the store paths it joins, so
+    // `rust-src` resolves outside the root. `-Zbuild-std` names a unit's sources,
+    // working directory and any sysroot remap by the join's own paths, and the
+    // toolchain identity in the key covers what they name.
+    Some(PathMapping::spelled(root, placeholder))
 }
 
 fn compiler_identity(rustc: &OsStr) -> Result<Cow<'static, SelectedCompiler>> {

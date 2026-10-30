@@ -30,8 +30,8 @@
 
 use mbx_cache_core::{
     CacheDigest, FileDigestCache, NIX_STORE, PathAliases, PathMapping as SharedPathMapping,
-    PathNormalizationError, canonical_json, compact_prediction_inputs, expand_prediction_inputs,
-    normalize_mapped_path as normalize_shared_path,
+    PathNormalizationError, RootMatch, canonical_json, compact_prediction_inputs,
+    expand_prediction_inputs, normalize_mapped_path as normalize_shared_path,
     normalize_resolved_mapped_path_with as normalize_resolved_shared_path_with,
     resolve_path_mappings,
 };
@@ -917,6 +917,8 @@ pub struct PathMapping {
     pub root: PathBuf,
     /// Placeholder name without the surrounding `${...}` syntax.
     pub placeholder: String,
+    /// How a path is matched against `root`.
+    pub matching: RootMatch,
 }
 
 impl PathMapping {
@@ -925,6 +927,16 @@ impl PathMapping {
         Self {
             root: root.into(),
             placeholder: placeholder.into(),
+            matching: RootMatch::Resolved,
+        }
+    }
+
+    /// [`PathMapping::new`], also matching paths as they are spelled
+    /// ([`RootMatch::Spelled`]).
+    pub fn spelled(root: impl Into<PathBuf>, placeholder: impl Into<String>) -> Self {
+        Self {
+            matching: RootMatch::Spelled,
+            ..Self::new(root, placeholder)
         }
     }
 
@@ -940,7 +952,11 @@ impl PathMapping {
 fn shared_path_mappings(mappings: &[PathMapping]) -> Vec<SharedPathMapping> {
     mappings
         .iter()
-        .map(|mapping| SharedPathMapping::new(&mapping.root, &mapping.placeholder))
+        .map(|mapping| SharedPathMapping {
+            root: mapping.root.clone(),
+            placeholder: mapping.placeholder.clone(),
+            matching: mapping.matching,
+        })
         .collect()
 }
 
