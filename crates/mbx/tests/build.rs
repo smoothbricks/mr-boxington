@@ -8504,16 +8504,19 @@ fn a_chained_precompiled_header_misses_when_the_one_it_loads_is_rebuilt() {
             ])
             .output()
             .unwrap();
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
         let hits = std::fs::read(&report)
             .ok()
             .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
             .map_or(0, |stats| count(&stats, "hits"));
-        (hits, std::fs::read(project.join("tu.o")).unwrap())
+        let object = output
+            .status
+            .success()
+            .then(|| std::fs::read(project.join("tu.o")).unwrap());
+        (
+            hits,
+            object,
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        )
     };
     root("-DROOT=1");
     cc(&[
@@ -8525,21 +8528,32 @@ fn a_chained_precompiled_header_misses_when_the_one_it_loads_is_rebuilt() {
         "-o",
         "chained.h.pch",
     ]);
-    let (_, first) = compile("cold.json");
-    let (hits, again) = compile("warm.json");
-    assert_eq!(hits, 1, "the same precompiled headers should hit");
-    assert_eq!(first, again);
+    let (_, first, stderr) = compile("cold.json");
+    let first = first.unwrap_or_else(|| panic!("{stderr}"));
+    let (hits, again, stderr) = compile("warm.json");
+    assert_eq!(hits, 1, "the same precompiled headers should hit: {stderr}");
+    assert_eq!(Some(first.clone()), again);
 
+    // Clang records the size and modification time of the PCH a chained one
+    // loads, so a rebuild it can tell apart is refused as out of date; one
+    // within the same second and of the same size is loaded and compiled
+    // against. Either way the compilation must reach Clang, never a hit.
     root("-DROOT=2");
-    let (hits, rebuilt) = compile("rebuilt.json");
+    let (hits, rebuilt, stderr) = compile("rebuilt.json");
     assert_eq!(
         hits, 0,
         "a rebuilt first precompiled header restored the object built against the old one"
     );
-    assert_ne!(
-        first, rebuilt,
-        "the object must be built against the new header"
-    );
+    match rebuilt {
+        Some(rebuilt) => assert_ne!(
+            first, rebuilt,
+            "the object must be built against the new header"
+        ),
+        None => assert!(
+            stderr.contains("out of date"),
+            "only Clang's own stale-PCH refusal may fail the compilation: {stderr}"
+        ),
+    }
 }
 
 #[test]
