@@ -20,13 +20,13 @@ use crate::session;
 use eyre::{Context, Result, bail};
 use mbx_cache_cc::{
     CcAction, CcActionContext, CcBypassReason, CcCompilerFamily, CcCompilerIdentity, CcDepfile,
-    CcDiscoveredInputs, CcInputPrediction, CcInvocation, CcLanguage, environment_inputs_for,
+    CcDiscoveredInputs, CcInputPrediction, CcInvocation, CcLanguage, NixStoreDriver,
     is_system_path, manifest_snapshot,
 };
 use mbx_cache_core::{
     ActionPrediction, AgentRequest, AgentResponse, CacheDigest, CacheDirectory, CacheFileNode,
-    CcMetadata, FileDigestScope, FileIdentity, FileSnapshot, PathMapping, RecordedFileDigest,
-    RemoteActionResult, RestoreStats, canonical_json, normalize_mapped_path,
+    CcMetadata, FileDigestScope, FileIdentity, FileSnapshot, NIX_STORE, PathMapping,
+    RecordedFileDigest, RemoteActionResult, RestoreStats, canonical_json, normalize_mapped_path,
 };
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
@@ -71,11 +71,7 @@ pub fn compile(compiler: &OsStr, arguments: &[OsString], language: CcLanguage) -
     // one it needs; the caller's is written by the shim once the files this
     // compilation read are known.
     let compiler_arguments = invocation.compiler_arguments(arguments);
-    let mut environment = environment_inputs_for(
-        |name| std::env::var(name).ok(),
-        invocation.sysroot(),
-        identity.family,
-    )?;
+    let mut environment = invocation.environment_inputs(std::env::vars_os(), &identity)?;
     if preprocessing {
         // With debug working-directory markers, GCC can honor a logical PWD
         // alias. It is output text, so it must also be part of the action key.
@@ -979,7 +975,22 @@ fn compiler_identity(compiler: &OsStr, language: CcLanguage) -> Result<CcCompile
         version_text: probe,
         target,
         assembler,
+        nix: nix_store_driver(&executable, Path::new(NIX_STORE)),
     })
+}
+
+/// Where a driver that resolves into the Nix store lives, and whether it is a
+/// nixpkgs cc-wrapper.
+///
+/// The canonical path is the identity: `CC` usually names the wrapper through
+/// a profile or `bin` symlink, and the store entry it resolves into is what
+/// names its content. A cc-wrapper marks itself with `nix-support/orig-cc`,
+/// which records the compiler it wraps.
+fn nix_store_driver(executable: &Path, store: &Path) -> Option<NixStoreDriver> {
+    let path = std::fs::canonicalize(executable).ok()?;
+    let entry = path.strip_prefix(store).ok()?.components().next()?;
+    let cc_wrapper = store.join(entry).join("nix-support/orig-cc").is_file();
+    Some(NixStoreDriver { path, cc_wrapper })
 }
 
 /// Ask `cl.exe` for its `_MSC_VER`, `_MSC_FULL_VER` and `_MSC_BUILD` by
