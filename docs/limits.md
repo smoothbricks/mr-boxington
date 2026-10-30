@@ -77,6 +77,23 @@ compilations are never published to the shared cache. See
 [Cargo incremental mode](/incremental#cargo-incremental-mode) for the trade-off
 `MBX_INCREMENTAL=1` makes.
 
+## Rust compiler options are keyed as written
+
+A rustc option that reads no file and writes nothing beside its outputs enters
+the key exactly as written, so two builds share a result only when they pass
+the same options. Among the unstable ones, mbx models `-Zlocation-detail=`
+(which parts of a panic location a binary records), `-Zshare-generics=`, and
+`-Zbinary-dep-depinfo`. The last one makes rustc add every artifact it loaded,
+sysroot crates included, to its dep-info; those artifacts are already inputs
+whose contents are in the key, so only the dep-info changes, and it is stored
+and restored with the rest of the result.
+
+`-C llvm-args` hands LLVM options of its own, some of which read files or
+write beside the object, so mbx models only the ones it lists: `-addrsig`,
+which emits the address-significance table lld uses to fold identical code.
+A compilation passing any other LLVM option bypasses as
+`unknown-codegen-option`.
+
 ## Native linking is cached only where the linker can be described
 
 Native binaries and dynamic libraries link against an external linker, startup

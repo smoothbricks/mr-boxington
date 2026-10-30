@@ -5921,6 +5921,43 @@ fn mapping_the_workspace_root_keeps_the_dependents_of_an_out_dir_reader_sharing(
     );
 }
 
+/// `-Zbinary-dep-depinfo` makes rustc list every artifact it loaded in its
+/// dep-info -- dependency rlibs and the sysroot's rmetas -- beside the sources
+/// it read. Those are inputs the key already digests, so the compilation
+/// stores and a second checkout restores both crates.
+#[test]
+fn binary_dep_info_compilations_store_and_restore_across_checkouts() {
+    let store = tempfile::tempdir().unwrap();
+    let reports = tempfile::tempdir().unwrap();
+    let settings = [
+        ("RUSTC_BOOTSTRAP", "1"),
+        ("RUSTFLAGS", "-Zbinary-dep-depinfo"),
+        ("MBX_LEARNED_INCREMENTAL", "0"),
+    ];
+    for name in ["first", "second"] {
+        let checkout = tempfile::tempdir().unwrap();
+        write_dependent_project(checkout.path());
+        let (_, stderr) = build_with(
+            checkout.path(),
+            store.path(),
+            &reports.path().join(format!("{name}.json")),
+            &settings,
+        );
+        assert!(
+            !stderr.contains("not stored") && !stderr.contains("bypassed"),
+            "{name}: {stderr}"
+        );
+    }
+    let outcomes = second_build_outcomes(store.path());
+    for crate_name in ["base", "above"] {
+        assert_eq!(
+            outcomes.get(crate_name).map(String::as_str),
+            Some("hit"),
+            "{crate_name}: {outcomes:?}"
+        );
+    }
+}
+
 /// What the second checkout's build recorded for each crate it compiled.
 ///
 /// A stream is named for the millisecond its build started, so sorting the
