@@ -2736,6 +2736,7 @@ fn expected_cc_bypass(reason: Option<&mbx_cache_cc::CcBypassReason>) -> bool {
                 | LocalCpuTarget(_)
                 | UnsupportedCompilerDriver(_)
                 | UnsupportedEnvironment(_)
+                | NixImpurePath(_)
                 | EmbeddedTimestampMacro(_)
                 | AssemblerInputDirective(_)
                 | TooManyInputs
