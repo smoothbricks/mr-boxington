@@ -454,7 +454,8 @@ pub enum CcBypassReason {
     /// The caller asked for its own dependency output.
     #[error("compiler invocation requests its own dependency output: {0}")]
     CallerDependencyFlags(String),
-    /// Precompiled headers are not byte-hermetic key material.
+    /// Building a precompiled header, or naming one in a spelling the adapter
+    /// does not model.
     #[error("precompiled headers are not modeled by the cache adapter: {0}")]
     PrecompiledHeader(String),
     /// Coverage instrumentation writes outputs beside the object.
@@ -2068,6 +2069,41 @@ impl<'a> Parser<'a> {
         Ok(value)
     }
 
+    /// `-Xclang -include-pch -Xclang <pch>` or `-Xclang -include -Xclang
+    /// <header>`, consumed whole after the leading `-Xclang`. Any other
+    /// frontend option, or a pair spelled differently, answers `false` and is
+    /// left to the passthrough bypass.
+    fn parse_frontend_precompiled_header(&mut self) -> Result<bool, CcBypassReason> {
+        let text = |index: usize| {
+            self.arguments.get(index).map(|argument| {
+                argument
+                    .to_str()
+                    .ok_or(CcBypassReason::NonUtf8Argument { index })
+            })
+        };
+        let option = match text(self.index).transpose()? {
+            Some(option @ ("-include-pch" | "-include")) => option,
+            _ => return Ok(false),
+        };
+        let flag = format!("-Xclang {option}");
+        match text(self.index + 1).transpose()? {
+            Some("-Xclang") => {}
+            Some(_) => return Ok(false),
+            None => return Err(CcBypassReason::MissingValue(flag)),
+        }
+        let path = PathBuf::from(
+            text(self.index + 2)
+                .transpose()?
+                .ok_or_else(|| CcBypassReason::MissingValue(flag.clone()))?,
+        );
+        if option == "-include-pch" {
+            self.required_inputs.push(path.clone());
+        }
+        self.index += 3;
+        self.parsed.push(Argument::Path { flag, path });
+        Ok(true)
+    }
+
     fn parse_input(&mut self, value: &str) -> Result<(), CcBypassReason> {
         if self.source.is_some() {
             return Err(CcBypassReason::MultipleInputs);
@@ -2118,6 +2154,25 @@ impl<'a> Parser<'a> {
                 .all(|option| SUPPORTED_ASSEMBLER_OPTIONS.contains(&option))
         {
             self.parsed.push(Argument::Plain(value.into()));
+            return Ok(());
+        }
+        // A precompiled header used rather than built: `-include-pch <pch>` to
+        // the driver, or the same option handed straight to clang's frontend,
+        // which is how Bun's build spells it. The frontend reads the PCH whole,
+        // and the dependency list names the headers recorded inside it but
+        // never the PCH itself, so the PCH is a required input keyed by its
+        // bytes. A PCH records where and when its headers were, so one rebuilt
+        // elsewhere has other bytes and the compilations using it miss there.
+        if value == "-Xclang" && self.parse_frontend_precompiled_header()? {
+            return Ok(());
+        }
+        if value == "-include-pch" {
+            let path = PathBuf::from(self.take_value(value, None)?);
+            self.required_inputs.push(path.clone());
+            self.parsed.push(Argument::Path {
+                flag: value.into(),
+                path,
+            });
             return Ok(());
         }
         if TOOL_PASSTHROUGH_FLAGS.contains(&value)

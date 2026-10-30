@@ -8354,6 +8354,103 @@ fn nix_wrapper_flags_from_the_environment_enter_the_c_key() {
     assert_ne!(first, other, "the object must be built under its own flags");
 }
 
+/// A compilation that uses a Clang precompiled header, spelled the way Bun's
+/// build hands it to the frontend, is cached keyed by the PCH's bytes and by
+/// the headers recorded inside it: the same PCH hits, a header changed under
+/// a stale PCH still reaches the compiler's own error, and a rebuilt PCH
+/// compiles again.
+#[cfg(unix)]
+#[test]
+fn a_compilation_using_a_precompiled_header_hits_until_its_header_changes() {
+    if !has_c_compiler() {
+        return;
+    }
+    let version = Command::new("cc").arg("--version").output().unwrap();
+    if !String::from_utf8_lossy(&version.stdout).contains("clang") {
+        // `-include-pch` is Clang's; GCC finds its `.gch` by itself.
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let cache = directory.path().join("cache");
+    let project = directory.path().join("project");
+    std::fs::create_dir(&project).unwrap();
+    std::fs::write(project.join("tu.c"), "int value(void) { return VALUE; }\n").unwrap();
+    let header = |value: &str| {
+        std::fs::write(project.join("root.h"), format!("#define VALUE {value}\n")).unwrap();
+    };
+    let precompile = || {
+        let status = Command::new("cc")
+            .current_dir(&project)
+            .args(["-x", "c-header", "root.h", "-o", "root.h.pch"])
+            .status()
+            .unwrap();
+        assert!(status.success(), "the precompiled header should build");
+    };
+    let compile = |report: &str| {
+        let report = directory.path().join(report);
+        let output = mbx_command()
+            .current_dir(&project)
+            .env("MBX_CACHE_DIR", &cache)
+            .env("MBX_STATS_REPORT", &report)
+            .env("MBX_GC_AUTO", "0")
+            .args([
+                "exec",
+                "sh",
+                "-c",
+                "cc -Xclang -include-pch -Xclang root.h.pch -Xclang -include -Xclang root.h -c tu.c -o tu.o",
+            ])
+            .output()
+            .unwrap();
+        let hits = std::fs::read(&report)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .map_or(0, |stats| count(&stats, "hits"));
+        (output, hits)
+    };
+    header("1");
+    precompile();
+    let (output, _) = compile("cold.json");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let first = std::fs::read(project.join("tu.o")).unwrap();
+    let (output, hits) = compile("warm.json");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(hits, 1, "the same precompiled header should hit");
+    assert_eq!(first, std::fs::read(project.join("tu.o")).unwrap());
+
+    // Longer, so the compiler sees the change without relying on the clock.
+    header("22");
+    let (output, hits) = compile("stale.json");
+    assert_eq!(
+        hits, 0,
+        "a header changed under its precompiled header was restored"
+    );
+    assert!(
+        !output.status.success(),
+        "the compiler should refuse a stale precompiled header"
+    );
+
+    precompile();
+    let (output, hits) = compile("rebuilt.json");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        hits, 0,
+        "a rebuilt precompiled header restored the old object"
+    );
+    assert_ne!(first, std::fs::read(project.join("tu.o")).unwrap());
+}
+
 #[test]
 fn mbx_clean_under_reports_when_a_deleted_root_has_no_records() {
     let directory = tempfile::tempdir().unwrap();
