@@ -1598,6 +1598,44 @@ fn predicted_mapping_root_round_trips() {
     );
 }
 
+/// A Nix toolchain is a symlink join: its sysroot rlibs and its `rust-src`
+/// resolve into other store paths, outside the selected compiler's sysroot
+/// mapping. An input in the Nix store is keyed verbatim, as C and C++ key one:
+/// its contents are digested like any input's, and the path is spelled the
+/// same on every machine that holds it. A prediction naming one resolves back
+/// to it, and to nothing else outside a mapping.
+#[cfg(unix)]
+#[test]
+fn an_input_in_the_nix_store_is_keyed_verbatim() {
+    let rlib = "/nix/store/cwaiv8bhs33ac4qlcqzqb9dq1f2hj0cb-rust-std-1.100.0-nightly/lib/rustlib/aarch64-apple-darwin/lib/libstd-1a2b3c.rlib";
+    let action = |contents: &str| {
+        common_invocation()
+            .action(context(&[
+                ("src/lib.rs", "source"),
+                ("target/debug/deps/libserde.rlib", "serde"),
+                (rlib, contents),
+            ]))
+            .unwrap_or_else(|reason| panic!("a store input should be keyed: {reason}"))
+    };
+    let first = action("std");
+    let descriptor = String::from_utf8(first.bytes).unwrap();
+    assert!(descriptor.contains(rlib), "{descriptor}");
+    assert_ne!(first.digest, action("another std").digest);
+
+    assert_eq!(denormalize_path(rlib, &[]).unwrap(), PathBuf::from(rlib));
+    for outside in [
+        "/nix/store/../../etc/passwd",
+        "/nix/storefront/lib.rs",
+        "/etc/passwd",
+    ] {
+        assert_eq!(
+            denormalize_path(outside, &[]).unwrap_err().kind(),
+            "invalid-predicted-input",
+            "{outside}"
+        );
+    }
+}
+
 #[test]
 fn absolute_environment_values_remain_literal_action_inputs() {
     let invocation = common_invocation();
