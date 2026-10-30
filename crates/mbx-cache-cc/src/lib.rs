@@ -87,14 +87,15 @@ pub const BYPASS_ENVIRONMENT: &[&str] = &[
 /// ones, turns `NIX_HARDENING_ENABLE` into flags such as
 /// `-fstack-protector-strong` and `-D_FORTIFY_SOURCE=3`, drops `-m*=native`
 /// under `NIX_ENFORCE_NO_NATIVE`, and on Darwin derives its SDK and minimum OS
-/// version from `DEVELOPER_DIR` and `MACOSX_DEPLOYMENT_TARGET`. It reads each
-/// one under its own name, under a role suffix (`_FOR_BUILD`, `_FOR_TARGET`)
-/// and under its target salt (`_arm64_apple_darwin`), and the
-/// `NIX_CC_WRAPPER_*` and `NIX_BINTOOLS_WRAPPER_*` variables pick which of
-/// those it takes. `NIX_DEBUG` adds the wrapper's own lines to the standard
-/// error a hit replays. None of it shows in argv or in the `-v` banner the
-/// identity probe reads, which the wrapper answers for the wrapped compiler
-/// alone.
+/// version from `DEVELOPER_DIR` and the deployment target. It reads each one
+/// under its own name, under a role suffix (`_FOR_BUILD`, `_FOR_TARGET`) and
+/// under its target salt (`_arm64_apple_darwin`), and the `NIX_CC_WRAPPER_*`
+/// and `NIX_BINTOOLS_WRAPPER_*` variables pick which of those it takes.
+/// `NIX_DEBUG` adds the wrapper's own lines to the standard error a hit
+/// replays. None of it shows in argv or in the `-v` banner the identity probe
+/// reads, which the wrapper answers for the wrapped compiler alone. Every
+/// platform's deployment target is a family here, not only the one this
+/// wrapper mangles today.
 ///
 /// A variable is in a family when its name is the family's or extends it with
 /// `_`; every one that is set enters the key with its value. The wrapper reads
@@ -102,6 +103,7 @@ pub const BYPASS_ENVIRONMENT: &[&str] = &[
 /// links, which a `-c` or `-E` invocation never does, so they stay out.
 pub const NIX_CC_WRAPPER_ENVIRONMENT: &[&str] = &[
     "DEVELOPER_DIR",
+    "IPHONEOS_DEPLOYMENT_TARGET",
     "MACOSX_DEPLOYMENT_TARGET",
     "NIX_BINTOOLS_WRAPPER",
     "NIX_CC_WRAPPER",
@@ -110,7 +112,14 @@ pub const NIX_CC_WRAPPER_ENVIRONMENT: &[&str] = &[
     "NIX_DEBUG",
     "NIX_ENFORCE_NO_NATIVE",
     "NIX_HARDENING_ENABLE",
+    "TVOS_DEPLOYMENT_TARGET",
+    "WATCHOS_DEPLOYMENT_TARGET",
+    "XROS_DEPLOYMENT_TARGET",
 ];
+
+/// The families whose words a Nix cc-wrapper puts on the compiler's command
+/// line.
+const NIX_CC_WRAPPER_FLAGS: &[&str] = &["NIX_CFLAGS_COMPILE", "NIX_CXXSTDLIB_COMPILE"];
 
 /// Absolute roots whose contents are keyed verbatim rather than through a
 /// placeholder.
@@ -176,6 +185,9 @@ const SUPPORTED_F_FLAGS: &[&str] = &[
     "omit-frame-pointer",
     "pic",
     "pie",
+    // Seeds names GCC makes up, such as those of anonymous namespaces; nixpkgs
+    // passes one derived from the output path in `NIX_CFLAGS_COMPILE`.
+    "random-seed",
     "reciprocal-math",
     "rtti",
     "sanitize-undefined-strip-path-components",
@@ -1437,7 +1449,7 @@ impl CcInvocation {
             .as_ref()
             .is_some_and(|driver| driver.cc_wrapper)
         {
-            nix_wrapper_search_paths(&variables)?;
+            nix_wrapper_flags(&variables, compiler.family)?;
             self.nix_wrapper_purity(&variables)?;
         }
         Ok(environment)
@@ -1537,56 +1549,72 @@ fn in_family(families: &[&str], name: &str) -> bool {
     })
 }
 
-/// Search-directory options a cc-wrapper's compile flags can carry, longest
-/// spelling first so that an attached value is split at the right place.
-const WRAPPER_SEARCH_FLAGS: &[&str] = &[
-    "-cxx-isystem",
-    "-iframework",
-    "-idirafter",
-    "-isystem",
-    "-iquote",
-    "-F",
-    "-I",
-];
-
-/// Refuse a search directory the wrapper adds from the environment outside
-/// every system root.
+/// Run the words a Nix cc-wrapper adds to the compiler's command line from
+/// the environment through the model argv goes through.
 ///
-/// The key watches each search directory the command line names for a header
-/// that would newly shadow one the compilation read; see [`manifest_snapshot`].
-/// A directory a cc-wrapper adds from `NIX_CFLAGS_COMPILE` or
-/// `NIX_CXXSTDLIB_COMPILE` never reaches that command line, so it cannot be
-/// watched. In the Nix store it needs no watching -- store paths do not
-/// change -- and system roots are exempt anyway. Anywhere else the variable
-/// is refused: its value is keyed, but the directory's contents are not.
-fn nix_wrapper_search_paths(variables: &Variables) -> Result<(), CcBypassReason> {
+/// They are the compiler's arguments as much as argv's are, so each one meets
+/// the same model: what bypasses on argv bypasses here (`-march=native`,
+/// `-gsplit-dwarf`, `-fplugin=`, `-Xclang`, ...). Their text is already keyed
+/// with the variable. What would change how the compile itself is modeled is
+/// refused: an output, a language, a mode, a sysroot, a source, or the
+/// caller's own dependency output, which a hit would not restore.
+///
+/// The wrapper expands each variable unquoted, so it splits on spaces, tabs,
+/// and newlines and globs every word under `nullglob`: a word naming files the
+/// key cannot see, or none at all, so one carrying a glob character is
+/// refused. A search directory a word adds is not on the command line either,
+/// so the include manifest cannot watch it for a header that would shadow one
+/// the compilation read (see [`manifest_snapshot`]). In the Nix store it needs
+/// no watching -- store paths do not change -- and system roots are exempt
+/// anyway; anywhere else the variable is refused.
+fn nix_wrapper_flags(
+    variables: &Variables,
+    family: CcCompilerFamily,
+) -> Result<(), CcBypassReason> {
     for name in variables.keys().filter_map(|name| name.to_str()) {
-        if !in_family(&["NIX_CFLAGS_COMPILE", "NIX_CXXSTDLIB_COMPILE"], name) {
+        if !in_family(NIX_CC_WRAPPER_FLAGS, name) {
             continue;
         }
         let Some(value) = variable(variables, name)? else {
             continue;
         };
-        let mut words = value.split_whitespace();
-        while let Some(word) = words.next() {
-            let Some(attached) = WRAPPER_SEARCH_FLAGS
-                .iter()
-                .find_map(|flag| word.strip_prefix(flag))
-            else {
-                continue;
-            };
-            let directory = if attached.is_empty() {
-                words.next().unwrap_or_default()
-            } else {
-                attached
-            };
-            let directory = Path::new(directory);
-            if !directory.is_absolute()
-                || normalize_components(directory).as_path() != directory
-                || !is_system_path(directory)
-            {
-                return Err(CcBypassReason::UnsupportedEnvironment(name.into()));
+        let refused = || CcBypassReason::UnsupportedEnvironment(name.into());
+        let words = value
+            .split([' ', '\t', '\n'])
+            .filter(|word| !word.is_empty())
+            .map(OsString::from)
+            .collect::<Vec<_>>();
+        if words.iter().any(|word| {
+            word.to_str()
+                .is_some_and(|word| word.contains(['*', '?', '[']))
+        }) {
+            return Err(refused());
+        }
+        let mut parser = Parser::new(&words);
+        parser.family = family;
+        while parser.index < words.len() {
+            let word = parser.current()?.to_owned();
+            parser.index += 1;
+            if !word.starts_with('-') || word == "-" {
+                return Err(refused());
             }
+            parser.parse_flag(&word)?;
+        }
+        if !parser.dependency.indices.is_empty() {
+            return Err(CcBypassReason::CallerDependencyFlags(name.into()));
+        }
+        if parser.source.is_some()
+            || parser.output.is_some()
+            || parser.explicit_language.is_some()
+            || parser.preprocessing
+            || parser.sysroot.is_some()
+            || parser.include_dirs.iter().any(|directory| {
+                !directory.is_absolute()
+                    || normalize_components(directory) != *directory
+                    || !is_system_path(directory)
+            })
+        {
+            return Err(refused());
         }
     }
     Ok(())

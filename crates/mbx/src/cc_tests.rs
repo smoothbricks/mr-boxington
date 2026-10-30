@@ -49,21 +49,31 @@ fn a_driver_is_identified_by_the_store_entry_it_resolves_into() {
     std::os::unix::fs::symlink(wrapper.join("bin/clang"), profile.join("cc")).unwrap();
 
     assert_eq!(
-        nix_store_driver(&profile.join("cc"), &store),
+        nix_store_driver(&profile.join("cc"), &store).unwrap(),
         Some(NixStoreDriver {
             path: wrapper.join("bin/clang"),
             cc_wrapper: true,
         })
     );
     assert_eq!(
-        nix_store_driver(&unwrapped.join("bin/clang"), &store),
+        nix_store_driver(&unwrapped.join("bin/clang"), &store).unwrap(),
         Some(NixStoreDriver {
             path: unwrapped.join("bin/clang"),
             cc_wrapper: false,
         })
     );
     std::fs::write(root.join("cc"), "#!/bin/sh\n").unwrap();
-    assert_eq!(nix_store_driver(&root.join("cc"), &store), None);
+    assert_eq!(nix_store_driver(&root.join("cc"), &store).unwrap(), None);
+
+    // A driver that cannot be resolved says so rather than reading as one
+    // outside the store.
+    std::os::unix::fs::symlink(root.join("gone"), profile.join("dangling")).unwrap();
+    assert_eq!(
+        nix_store_driver(&profile.join("dangling"), &store)
+            .unwrap_err()
+            .kind(),
+        "compiler-identity-unavailable"
+    );
 }
 
 /// The exempt roots are POSIX paths and the shims are only installed on unix,

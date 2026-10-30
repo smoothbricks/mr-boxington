@@ -975,7 +975,7 @@ fn compiler_identity(compiler: &OsStr, language: CcLanguage) -> Result<CcCompile
         version_text: probe,
         target,
         assembler,
-        nix: nix_store_driver(&executable, Path::new(NIX_STORE)),
+        nix: nix_store_driver(&executable, Path::new(NIX_STORE))?,
     })
 }
 
@@ -985,12 +985,29 @@ fn compiler_identity(compiler: &OsStr, language: CcLanguage) -> Result<CcCompile
 /// The canonical path is the identity: `CC` usually names the wrapper through
 /// a profile or `bin` symlink, and the store entry it resolves into is what
 /// names its content. A cc-wrapper marks itself with `nix-support/orig-cc`,
-/// which records the compiler it wraps.
-fn nix_store_driver(executable: &Path, store: &Path) -> Option<NixStoreDriver> {
-    let path = std::fs::canonicalize(executable).ok()?;
-    let entry = path.strip_prefix(store).ok()?.components().next()?;
-    let cc_wrapper = store.join(entry).join("nix-support/orig-cc").is_file();
-    Some(NixStoreDriver { path, cc_wrapper })
+/// which records the compiler it wraps. A driver that cannot be resolved, or a
+/// marker that cannot be looked for, is an identity that cannot be
+/// established rather than one outside the store.
+fn nix_store_driver(
+    executable: &Path,
+    store: &Path,
+) -> Result<Option<NixStoreDriver>, CcBypassReason> {
+    let unavailable = |path: &Path, error: std::io::Error| {
+        CcBypassReason::CompilerIdentityUnavailable(format!("{}: {error}", path.display()))
+    };
+    let path = std::fs::canonicalize(executable).map_err(|error| unavailable(executable, error))?;
+    let Some(entry) = path
+        .strip_prefix(store)
+        .ok()
+        .and_then(|rest| rest.components().next())
+    else {
+        return Ok(None);
+    };
+    let marker = store.join(entry).join("nix-support/orig-cc");
+    let cc_wrapper = marker
+        .try_exists()
+        .map_err(|error| unavailable(&marker, error))?;
+    Ok(Some(NixStoreDriver { path, cc_wrapper }))
 }
 
 /// Ask `cl.exe` for its `_MSC_VER`, `_MSC_FULL_VER` and `_MSC_BUILD` by

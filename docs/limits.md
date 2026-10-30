@@ -413,26 +413,38 @@ when the wrapper is built, such as its libc and C++ library include
 directories and its frame-pointer defaults. The rest come from the
 environment: `NIX_CFLAGS_COMPILE` and `NIX_CFLAGS_COMPILE_BEFORE`,
 `NIX_CXXSTDLIB_COMPILE`, the hardening flags `NIX_HARDENING_ENABLE` turns on,
-`NIX_ENFORCE_NO_NATIVE`, and on macOS the SDK and minimum OS version from
-`DEVELOPER_DIR` and `MACOSX_DEPLOYMENT_TARGET`. None of them shows on the
+`NIX_ENFORCE_NO_NATIVE`, and on Apple platforms the SDK and minimum OS version
+from `DEVELOPER_DIR` and the deployment target (`MACOSX_DEPLOYMENT_TARGET`,
+`IPHONEOS_DEPLOYMENT_TARGET` and the like). None of them shows on the
 command line mbx sees, and the wrapper answers `-v` for the compiler it wraps
 alone. mbx keys them anyway:
 
 - A compiler that resolves into the Nix store is identified by its store path
-  as well as its version, so two wrappers around one compiler key apart.
+  as well as its version, so two wrappers around one compiler key apart. Only
+  `/nix/store` is recognized: a wrapper in another store directory is keyed by
+  its `-v` banner alone, like any other compiler. A compiler whose path cannot
+  be resolved bypasses as `compiler-identity-unavailable`.
 - Every variable of those families that is set enters the key with its value:
   the name itself, a role suffix such as `_FOR_BUILD`, and the wrapper's target
   salt such as `_arm64_apple_darwin`, along with the `NIX_CC_WRAPPER_*` and
   `NIX_BINTOOLS_WRAPPER_*` variables that pick between them and `NIX_DEBUG`,
   whose output a hit replays. The variables the wrapper reads only to link,
   such as `NIX_LDFLAGS`, stay out, since mbx caches no links here.
-- A search directory those flags add (`-I`, `-isystem`, `-idirafter`, and the
-  like in `NIX_CFLAGS_COMPILE` or `NIX_CXXSTDLIB_COMPILE`) must lie in the Nix
-  store or another system root. It is not on the command line, so mbx cannot
-  watch it for a header that would
+- The words of `NIX_CFLAGS_COMPILE` and `NIX_CXXSTDLIB_COMPILE`, in every
+  spelling, reach the compiler's command line, so they meet the model argv
+  does: a flag that bypasses on the command line, such as `-march=native` or
+  `-gsplit-dwarf`, bypasses with the same reason here. A word that would change
+  how the compilation is modeled (an output, a language, a mode, a source, a
+  sysroot) bypasses as `unsupported-environment`, and a dependency-file flag as
+  `caller-dependency-flags`. The wrapper expands these variables unquoted, with
+  `nullglob` on, so a word holding `*`, `?` or `[` would name whatever files
+  match; it bypasses as `unsupported-environment`.
+- A search directory those words add (`-I`, `-isystem`, `-idirafter`, and the
+  like) must lie in the Nix store or another system root. It is not on the
+  command line, so mbx cannot watch it for a header that would
   [shadow](#shadowing-is-modeled-by-name-not-by-content) one the compilation
-  read; a store path never changes, so it needs no watching. A wrapper flag
-  naming a directory anywhere else bypasses as `unsupported-environment`.
+  read; a store path never changes, so it needs no watching. A word naming a
+  directory anywhere else bypasses as `unsupported-environment`.
 
 A value that changes between builds therefore changes the key. nixpkgs'
 `-frandom-seed=` in `NIX_CFLAGS_COMPILE` is derived from the derivation's
