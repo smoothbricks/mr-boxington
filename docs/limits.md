@@ -402,10 +402,18 @@ header is named to the driver (`-include-pch <file>`) or handed to the
 frontend (`-Xclang -include-pch -Xclang <file>`, with the header it was built
 from as `-Xclang -include -Xclang <header>`). The precompiled header is an
 input keyed by its contents, and the headers recorded inside it enter the key
-like any other header the compilation read. A precompiled header records the
-paths and modification times of the headers it was built from, so one rebuilt
-in another directory has other bytes, and the compilations that use it miss
-there.
+like any other header the compilation read. A precompiled header built while
+another was loaded is chained: Clang loads that one too, from the path
+recorded inside it. mbx asks Clang to list the precompiled headers it loads
+(`-Xclang -module-file-deps`), so each one in a chain is an input keyed by its
+contents as well. A precompiled header records the paths and modification
+times of the headers it was built from, so one rebuilt in another directory
+has other bytes, and the compilations that use it miss there. Clang refuses a
+precompiled header whose header changed since it was built, by content or by
+modification time alone. A changed header changes the key, so that refusal is
+never masked by a hit. A header whose modification time alone changed keeps
+its key, and the compilation hits where Clang would refuse: the object
+restored is the one those same bytes produce.
 
 ### Calls that bypass the cache
 

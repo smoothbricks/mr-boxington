@@ -1168,8 +1168,23 @@ impl CcInvocation {
     /// `-MD` rather than `-MMD`: system headers are exactly the inputs most
     /// likely to change without any other key component noticing, because the
     /// compiler identity does not cover the C library or the platform SDK.
+    ///
+    /// A compilation that uses a precompiled header also gets
+    /// `-Xclang -module-file-deps`. Clang leaves module files out of the list
+    /// otherwise, and a PCH built while another was loaded makes Clang load
+    /// that one too, from the path recorded inside it: with the option the
+    /// list names both, so the PCH a chain loads is keyed by its bytes like
+    /// any header read. Without it, rebuilding that first PCH under another
+    /// definition would restore an object built against the old one.
     pub fn dependency_arguments(&self, depfile: &Path) -> Vec<OsString> {
-        vec!["-MD".into(), "-MF".into(), depfile.into()]
+        let mut arguments = vec!["-MD".into(), "-MF".into(), depfile.into()];
+        if self.arguments.iter().any(|argument| {
+            matches!(argument, Argument::Path { flag, .. }
+                if flag == "-include-pch" || flag == "-Xclang -include-pch")
+        }) {
+            arguments.extend(["-Xclang".into(), "-module-file-deps".into()]);
+        }
+        arguments
     }
 
     /// Arguments to append so a driver from `family` writes its dependency
