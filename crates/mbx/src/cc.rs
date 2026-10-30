@@ -988,7 +988,7 @@ fn compiler_identity(compiler: &OsStr, language: CcLanguage) -> Result<CcCompile
 /// which records the compiler it wraps. A driver that cannot be resolved, or a
 /// marker that cannot be looked for, is an identity that cannot be
 /// established rather than one outside the store.
-fn nix_store_driver(
+pub(crate) fn nix_store_driver(
     executable: &Path,
     store: &Path,
 ) -> Result<Option<NixStoreDriver>, CcBypassReason> {
