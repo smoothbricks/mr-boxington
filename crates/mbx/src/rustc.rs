@@ -929,7 +929,7 @@ pub(crate) fn compile(
                 compiler_input_invalid = true;
             }
             Err(error) => {
-                session::report_shim_warning(&format!("result was not stored: {error:#}"));
+                session::report_rustc_store_failure(&timing.crate_name, &error);
             }
         }
     }

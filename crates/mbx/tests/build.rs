@@ -7934,6 +7934,47 @@ fn cc_publication_failures_are_visible_without_counting_a_second_outcome() {
     }
 }
 
+/// A Rust compilation that succeeds but cannot be stored records why, as a C
+/// compilation does: in the bypass log, against its crate, without counting a
+/// second outcome for the one compilation.
+///
+/// The crate reads a file outside every mapped root, so its key cannot be
+/// built until dep-info names that file after the compiler has run.
+#[test]
+fn rustc_store_failures_are_recorded_without_counting_a_second_outcome() {
+    let project = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let store = tempfile::tempdir().unwrap();
+    let reports = tempfile::tempdir().unwrap();
+    write_named_project(project.path(), "unstored");
+    let data = outside.path().join("unmapped-data.txt");
+    std::fs::write(&data, "outside every mapped root\n").unwrap();
+    std::fs::write(
+        project.path().join("src/lib.rs"),
+        format!("pub const DATA: &str = include_str!({:?});\n", data),
+    )
+    .unwrap();
+    let log = reports.path().join("bypass.log");
+    let (stats, stderr) = build_with(
+        project.path(),
+        store.path(),
+        &reports.path().join("stats.json"),
+        &[("MBX_BYPASS_LOG", log.to_str().unwrap())],
+    );
+    let log = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        log.lines()
+            .any(|line| line.starts_with("unmapped-absolute-path\t")
+                && line.contains("unmapped-data.txt")
+                && line.ends_with("\tunit=unstored")),
+        "the store failure was not recorded:\nbypass log:\n{log}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stats["bypasses"].get("unmapped-absolute-path").is_none(),
+        "the compilation already counted its outcome: {stats}"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn private_shims_keep_native_builds_cached_across_checkouts() {
