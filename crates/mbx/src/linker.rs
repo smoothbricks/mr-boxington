@@ -929,27 +929,66 @@ fn sdk_identity() -> Result<Option<String>> {
 
 /// Split from the environment it usually reads so that a test can ask about an
 /// SDK without setting a variable every other test in the process would see.
+///
+/// Every question is asked of the SDK the link will actually use, which
+/// `SDKROOT` names when it is set: a path, or a name such as `macosx` that
+/// `xcrun` resolves. Asking for `macosx` regardless would report the default
+/// SDK's version beside another SDK's path, so the key would describe an SDK
+/// no link was made against. The SDK describes itself, and the description is
+/// read from its own files -- the version from `SDKSettings.json`, the build
+/// from `System/Library/CoreServices/SystemVersion.plist` -- where `xcrun`
+/// reads both. `xcrun` answers only for an SDK inside a developer directory it
+/// knows, so asking it would leave an SDK outside one, such as nixpkgs'
+/// `apple-sdk` that a Nix shell names in `SDKROOT`, unidentified. It is asked
+/// only where an SDK named rather than located is.
 fn sdk_identity_for(root: Option<String>) -> Result<Option<String>> {
     if !cfg!(target_os = "macos") {
         return Ok(None);
     }
     let describe = || {
-        // Every question is asked of the SDK the link will actually use, which
-        // `SDKROOT` names when it is set. Asking for `macosx` regardless would
-        // report the default SDK's version beside another SDK's path, so the
-        // key would describe an SDK no link was made against.
-        let sdk = root.as_deref().unwrap_or("macosx");
-        let version = xcrun(&["--sdk", sdk, "--show-sdk-version"])?;
-        let build = xcrun(&["--sdk", sdk, "--show-sdk-build-version"])?;
+        let directory = match root.as_deref() {
+            Some(root) if Path::new(root).is_absolute() => PathBuf::from(root),
+            sdk => PathBuf::from(xcrun(&[
+                "--sdk",
+                sdk.unwrap_or("macosx"),
+                "--show-sdk-path",
+            ])?),
+        };
+        let (version, build) = sdk_description(&directory)?;
         let path = match &root {
             Some(root) => root.clone(),
-            None => xcrun(&["--sdk", sdk, "--show-sdk-path"])?,
+            None => directory.to_str()?.to_owned(),
         };
         Some(format!("{path} {version} ({build})"))
     };
     describe().map(Some).ok_or_else(|| {
         eyre::eyre!("the macOS SDK could not be identified, so its links cannot be either")
     })
+}
+
+/// The version and build an SDK records for itself.
+fn sdk_description(sdk: &Path) -> Option<(String, String)> {
+    let settings: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(sdk.join("SDKSettings.json")).ok()?).ok()?;
+    let version = settings["Version"].as_str()?.trim();
+    let plist =
+        std::fs::read_to_string(sdk.join("System/Library/CoreServices/SystemVersion.plist"))
+            .ok()?;
+    let build = plist_string(&plist, "ProductBuildVersion")?;
+    (!version.is_empty() && !build.is_empty()).then(|| (version.to_owned(), build.to_owned()))
+}
+
+/// The string an XML property list's dictionary holds under `key`.
+///
+/// An SDK's `SystemVersion.plist` is a flat dictionary of strings, so the
+/// value is the `<string>` element that follows the key's own element.
+fn plist_string<'a>(plist: &'a str, key: &str) -> Option<&'a str> {
+    let after = plist
+        .split_once(&format!("<key>{key}</key>"))?
+        .1
+        .trim_start();
+    let value = after.strip_prefix("<string>")?;
+    Some(value.split_once("</string>")?.0.trim())
 }
 
 fn xcrun(arguments: &[&str]) -> Option<String> {
