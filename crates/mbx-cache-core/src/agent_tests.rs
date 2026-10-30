@@ -2390,6 +2390,164 @@ async fn a_local_only_hit_below_the_refresh_margin_does_not_reorder_the_manifest
 }
 
 #[tokio::test]
+async fn a_hit_near_the_byte_budget_survives_the_next_eviction() {
+    // A manifest can fill its byte budget long before it fills its entry cap.
+    // A hit-only run in that state must still move its hit to the back of the
+    // durable LRU, or the next run that adds entries evicts the hit as oldest.
+    let directory = tempfile::tempdir().unwrap();
+    let cache = directory.path().join("cache");
+    let task = "e".repeat(64);
+    let prediction = |label: String| {
+        let invocation = CacheDigest::blake3(label.as_bytes());
+        ActionPrediction {
+            action: CacheDigest::blake3(invocation.hash.as_bytes()),
+            invocation,
+            adapter: "rustc".into(),
+            payload: format!("\"{}\"", "x".repeat(4096)),
+        }
+    };
+    let serialized = |predictions: &[ActionPrediction]| {
+        canonical_json(&TaskActionManifest {
+            version: TASK_ACTION_MANIFEST_VERSION,
+            task: task.clone(),
+            predictions: predictions.to_vec(),
+        })
+        .unwrap()
+        .len()
+    };
+    // Every entry serializes to the same length, so filling the budget to
+    // within a couple of entries is arithmetic rather than a guess.
+    let entry_bytes = canonical_json(&prediction("probe".into())).unwrap().len() + 1;
+    let baseline: Vec<_> = (0..MAX_TASK_MANIFEST_BYTES / entry_bytes - 2)
+        .map(|index| prediction(format!("baseline {index}")))
+        .collect();
+    let bytes = serialized(&baseline);
+    assert!(baseline.len() < MAX_TASK_ACTION_PREDICTIONS - TASK_ACTION_LRU_REFRESH_MARGIN);
+    assert!(bytes <= MAX_TASK_MANIFEST_BYTES);
+    assert!(bytes > MAX_TASK_MANIFEST_BYTES - MAX_TASK_MANIFEST_BYTES / 16);
+
+    let seed = CacheAgent::new(&cache, "test-version");
+    seed.persist_task_manifest(&TaskActionManifest {
+        version: TASK_ACTION_MANIFEST_VERSION,
+        task: task.clone(),
+        predictions: baseline.clone(),
+    })
+    .unwrap();
+
+    // The first run hits only the oldest entry.
+    let hit = baseline[0].clone();
+    let first = CacheAgent::new(&cache, "test-version");
+    let first_run = first.begin_task(&task).await.unwrap();
+    assert!(matches!(
+        first
+            .respond(AgentRequest::RecordActionPrediction {
+                task: first_run.clone(),
+                prediction: hit.clone(),
+            })
+            .await,
+        AgentResponse::ActionPredictionRecorded
+    ));
+    first.commit_task(&first_run).await.unwrap();
+
+    // The second run adds entries that do not fit, so the budget must retire
+    // the oldest untouched history to make room.
+    let second = CacheAgent::new(&cache, "test-version");
+    let second_run = second.begin_task(&task).await.unwrap();
+    let added: Vec<_> = (0..5)
+        .map(|index| prediction(format!("added {index}")))
+        .collect();
+    for recorded in &added {
+        assert!(matches!(
+            second
+                .respond(AgentRequest::RecordActionPrediction {
+                    task: second_run.clone(),
+                    prediction: recorded.clone(),
+                })
+                .await,
+            AgentResponse::ActionPredictionRecorded
+        ));
+    }
+    second.commit_task(&second_run).await.unwrap();
+
+    let manifest = second.load_task_manifest(&task).unwrap().unwrap();
+    assert!(serialized(&manifest.predictions) <= MAX_TASK_MANIFEST_BYTES);
+    assert!(
+        manifest.predictions.contains(&hit),
+        "the entry hit in the first run was evicted as the oldest"
+    );
+    for recorded in &added {
+        assert!(manifest.predictions.contains(recorded));
+    }
+    let evicted: Vec<_> = baseline
+        .iter()
+        .filter(|prediction| !manifest.predictions.contains(prediction))
+        .collect();
+    assert!(!evicted.is_empty(), "the budget never forced an eviction");
+    let oldest_untouched: Vec<_> = baseline[1..=evicted.len()].iter().collect();
+    assert!(
+        evicted == oldest_untouched,
+        "evicted {} entries, not the oldest untouched ones",
+        evicted.len()
+    );
+}
+
+#[tokio::test]
+async fn a_hit_outside_the_exposed_margin_leaves_a_full_manifest_unwritten() {
+    // A manifest at its byte budget is 15 MiB. A hit on an entry the next
+    // pruning cannot reach changes nothing that pruning decides, so the
+    // manifest is left exactly as it was found.
+    let directory = tempfile::tempdir().unwrap();
+    let cache = directory.path().join("cache");
+    let task = "f".repeat(64);
+    let prediction = |index: usize| {
+        let invocation = CacheDigest::blake3(format!("baseline {index}").as_bytes());
+        ActionPrediction {
+            action: CacheDigest::blake3(invocation.hash.as_bytes()),
+            invocation,
+            adapter: "rustc".into(),
+            payload: format!("\"{}\"", "x".repeat(4096)),
+        }
+    };
+    let entry_bytes = canonical_json(&prediction(0)).unwrap().len() + 1;
+    let baseline: Vec<_> = (0..MAX_TASK_MANIFEST_BYTES / entry_bytes - 2)
+        .map(prediction)
+        .collect();
+    let seed = CacheAgent::new(&cache, "test-version");
+    seed.persist_task_manifest(&TaskActionManifest {
+        version: TASK_ACTION_MANIFEST_VERSION,
+        task: task.clone(),
+        predictions: baseline.clone(),
+    })
+    .unwrap();
+    let manifest_path = seed.task_manifest_path(&task);
+    let before = fs::read(&manifest_path).unwrap();
+    let written = fs::metadata(&manifest_path).unwrap();
+
+    let agent = CacheAgent::new(&cache, "test-version");
+    let run = agent.begin_task(&task).await.unwrap();
+    let newest = baseline.last().unwrap().clone();
+    assert!(matches!(
+        agent
+            .respond(AgentRequest::RecordActionPrediction {
+                task: run.clone(),
+                prediction: newest.clone(),
+            })
+            .await,
+        AgentResponse::ActionPredictionRecorded
+    ));
+    assert_eq!(agent.commit_task_actions(&run).await.unwrap(), vec![newest]);
+
+    assert_eq!(fs::read(&manifest_path).unwrap(), before);
+    let unchanged = fs::metadata(&manifest_path).unwrap();
+    assert_eq!(unchanged.modified().unwrap(), written.modified().unwrap());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        assert_eq!(unchanged.ino(), written.ino(), "the manifest was replaced");
+    }
+}
+
+#[tokio::test]
 async fn a_refused_prediction_reports_the_constraint_the_shim_should_print() {
     // The shim prints whatever this error says. "invalid action prediction"
     // on its own left an oversized payload from one crate looking identical
@@ -4168,14 +4326,65 @@ fn a_withheld_concurrent_replacement_restores_only_its_remote_value() {
 }
 
 #[test]
-fn hit_only_commits_refresh_order_only_near_the_prediction_limit() {
-    let threshold = MAX_TASK_ACTION_PREDICTIONS - TASK_ACTION_LRU_REFRESH_MARGIN;
+fn hit_only_commits_refresh_order_only_for_an_exposed_hit() {
+    let prediction = |index: usize, payload: usize| {
+        let invocation = CacheDigest::blake3(&index.to_le_bytes());
+        ActionPrediction {
+            action: CacheDigest::blake3(invocation.hash.as_bytes()),
+            invocation,
+            adapter: "rustc".into(),
+            payload: format!("\"{}\"", "x".repeat(payload)),
+        }
+    };
+    let invocations = |predictions: &[ActionPrediction]| -> Vec<CacheDigest> {
+        predictions
+            .iter()
+            .map(|prediction| prediction.invocation.clone())
+            .collect()
+    };
 
-    assert!(!should_refresh_task_prediction_order(threshold - 1, true));
-    assert!(should_refresh_task_prediction_order(threshold, true));
+    // Far from both bounds nothing is exposed.
+    let small: Vec<_> = (0..100).map(|index| prediction(index, 16)).collect();
+    assert!(exposed_predictions(&small).unwrap().is_empty());
+
+    // Near the entry cap, the oldest margin of entries.
+    let many: Vec<_> = (0..MAX_TASK_ACTION_PREDICTIONS)
+        .map(|index| prediction(index, 16))
+        .collect();
+    let exposed = exposed_predictions(&many).unwrap();
+    assert_eq!(exposed.len(), TASK_ACTION_LRU_REFRESH_MARGIN);
+    assert!(
+        invocations(&many[..TASK_ACTION_LRU_REFRESH_MARGIN])
+            .iter()
+            .all(|invocation| exposed.contains(invocation))
+    );
+
+    // Near the byte budget with few entries, the oldest entries covering the
+    // byte margin, and nothing newer.
+    let large: Vec<_> = (0..3_700).map(|index| prediction(index, 4096)).collect();
+    let exposed = exposed_predictions(&large).unwrap();
+    let entry = canonical_json(&large[0]).unwrap().len() + 1;
+    assert_eq!(
+        exposed.len(),
+        TASK_MANIFEST_LRU_REFRESH_BYTE_MARGIN.div_ceil(entry)
+    );
+    assert!(exposed.contains(&large[0].invocation));
+    assert!(!exposed.contains(&large[3_699].invocation));
+
+    let recorded = |prediction: &ActionPrediction| {
+        BTreeMap::from([(prediction.invocation.clone(), prediction.clone())])
+    };
+    assert!(should_refresh_task_prediction_order(
+        &exposed,
+        &recorded(&large[0])
+    ));
     assert!(!should_refresh_task_prediction_order(
-        MAX_TASK_ACTION_PREDICTIONS,
-        false
+        &exposed,
+        &recorded(&large[3_699])
+    ));
+    assert!(!should_refresh_task_prediction_order(
+        &exposed,
+        &BTreeMap::new()
     ));
 }
 
