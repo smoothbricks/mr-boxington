@@ -7,7 +7,7 @@ fn project(workspace_root: PathBuf) -> store::ProjectUsage {
         identities: 1,
         action_bytes: 2,
         target_bytes: 3,
-        live: true,
+        presence: store::CheckoutPresence::Present,
     }
 }
 

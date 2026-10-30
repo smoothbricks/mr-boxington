@@ -27,6 +27,8 @@ action store, managed targets, and learned incremental state currently held.
 | Automatically pruned | Bytes collected by automatic sweeps, counted from a separate start date. |
 | Requested removals | Bytes removed by confirmed migrations or explicit workspace removals, kept separate from pruning. |
 | Copying avoided | Cumulative output bytes materialized by reflink or hard link rather than copied. |
+| Live workspaces | Recorded workspaces whose checkout is on disk and that mbx built in the last 30 days. |
+| Unreachable workspaces | Recorded workspaces whose checkout is absent but not provably deleted, because its nearest existing parent is on another filesystem than the cache, such as a volume that is not mounted now. Their cache entries are kept until the record expires, but they are not counted as live. |
 | With separate caches | Sum of the logical cache bytes each live recorded workspace can reach, counting shared content once for each workspace. |
 | Duplication avoided | A conservative lower-bound estimate: the separate-cache sum minus the entire shared store, floored at zero. |
 

@@ -273,7 +273,7 @@ fn attributes_reachable_cache_bytes_to_a_workspace() {
     assert_eq!(projects[0].workspace_root, workspace);
     assert_eq!(projects[0].identities, 1);
     assert!(projects[0].action_bytes > 0);
-    assert!(projects[0].live);
+    assert_eq!(projects[0].presence, CheckoutPresence::Present);
 }
 
 /// Publish an action whose output tree nests `deep` one directory down beside
@@ -390,7 +390,42 @@ fn live_cache_bytes_leave_out_workspaces_that_are_gone() {
         .unwrap()
         .action_bytes;
 
-    assert_eq!(live_project_cache_bytes(store).unwrap(), vec![live_bytes]);
+    assert_eq!(
+        workspace_census(store).unwrap().present_cache_bytes,
+        vec![live_bytes]
+    );
+}
+
+#[test]
+fn an_absent_checkout_on_another_filesystem_is_not_a_live_workspace() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = directory.path();
+    let present = store.join("present");
+    std::fs::create_dir_all(&present).unwrap();
+    // Absent, and its nearest existing ancestor is devfs: another filesystem,
+    // so its absence is not proof that it was deleted.
+    let absent = PathBuf::from(format!(
+        "/dev/mbx-absent-{}/checkout",
+        store.file_name().unwrap().to_string_lossy()
+    ));
+    record_checkout(store, &"a".repeat(64), &present, &present).unwrap();
+    record_checkout(store, &"b".repeat(64), &absent, &absent).unwrap();
+
+    let census = workspace_census(store).unwrap();
+    assert_eq!(census.present_cache_bytes.len(), 1);
+    assert_eq!(census.unreachable, 1);
+    assert_eq!(
+        checkout_presence(store, &absent),
+        CheckoutPresence::Unreachable
+    );
+    assert_eq!(
+        checkout_presence(store, &present),
+        CheckoutPresence::Present
+    );
+    std::fs::remove_dir(&present).unwrap();
+    assert_eq!(checkout_presence(store, &present), CheckoutPresence::Gone);
+    // Retention is unchanged: an unreachable checkout's claim still counts.
+    assert!(checkout_is_live_on(store, &absent));
 }
 
 #[test]
@@ -424,7 +459,7 @@ fn project_usage_excludes_expired_claims() {
     assert_eq!(projects[0].workspace_root, workspace);
     assert_eq!(projects[0].identities, 0);
     assert_eq!(projects[0].action_bytes, 0);
-    assert!(!projects[0].live);
+    assert_eq!(projects[0].presence, CheckoutPresence::Gone);
 }
 
 #[cfg(unix)]

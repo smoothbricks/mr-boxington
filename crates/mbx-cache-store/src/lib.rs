@@ -106,7 +106,34 @@ pub struct ProjectUsage {
     pub identities: u64,
     pub action_bytes: u64,
     pub target_bytes: u64,
-    pub live: bool,
+    pub presence: CheckoutPresence,
+}
+
+/// What the filesystem says about the checkout a store claim names.
+///
+/// Ordered from least to most present, so a workspace with several claims
+/// takes its best one.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum CheckoutPresence {
+    /// Deleted, or its claim expired: nothing speaks for it.
+    #[default]
+    Gone,
+    /// Absent, but not provably deleted: its nearest existing ancestor is on
+    /// another filesystem than the store, which may be a volume that is not
+    /// mounted now, or the check failed. Its cache is kept until its claim
+    /// expires, but it is no workspace that is there.
+    Unreachable,
+    /// Its root exists.
+    Present,
+}
+
+/// The workspaces the store's claims speak for, as `mbx stats` counts them.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct WorkspaceCensus {
+    /// The reusable cache bytes of each workspace present on disk.
+    pub present_cache_bytes: Vec<u64>,
+    /// Workspaces absent but kept; see [`CheckoutPresence::Unreachable`].
+    pub unreachable: u64,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1592,24 +1619,37 @@ fn checkout_target_bytes(sizes: &mut BTreeMap<PathBuf, u64>, record: &CheckoutRe
 /// makes each row answer "how much keeps this workspace warm" without
 /// pretending shared storage can be divided exactly between projects.
 pub fn projects(store: &Path) -> Result<Vec<ProjectUsage>> {
-    project_usage(store, true)
+    project_usage(store, true, CheckoutPresence::Unreachable)
 }
 
-/// The reusable cache bytes of each live workspace, as [`projects`] counts
-/// them.
+/// The reusable cache bytes of each workspace present on disk, as [`projects`]
+/// counts them, and how many more are unreachable.
 ///
 /// Sizing target directories is most of what [`projects`] costs on a machine
-/// with many checkouts, and an estimate of cache sharing never looks at them.
-pub fn live_project_cache_bytes(store: &Path) -> Result<Vec<u64>> {
-    Ok(project_usage(store, false)?
-        .into_iter()
-        .filter(|project| project.live)
-        .map(|project| project.action_bytes)
-        .collect())
+/// with many checkouts, and an estimate of cache sharing never looks at them,
+/// nor at the manifests of workspaces that are not there.
+pub fn workspace_census(store: &Path) -> Result<WorkspaceCensus> {
+    let mut census = WorkspaceCensus::default();
+    for project in project_usage(store, false, CheckoutPresence::Present)? {
+        match project.presence {
+            CheckoutPresence::Present => census.present_cache_bytes.push(project.action_bytes),
+            CheckoutPresence::Unreachable => census.unreachable += 1,
+            CheckoutPresence::Gone => {}
+        }
+    }
+    Ok(census)
 }
 
-fn project_usage(store: &Path, size_targets: bool) -> Result<Vec<ProjectUsage>> {
-    let mut projects: BTreeMap<PathBuf, (BTreeSet<String>, bool, u64)> = BTreeMap::new();
+/// Every recorded workspace's usage. The manifests of workspaces at least as
+/// present as `resolve` are resolved into reachable bytes; the others count
+/// only what those already reach.
+fn project_usage(
+    store: &Path,
+    size_targets: bool,
+    resolve: CheckoutPresence,
+) -> Result<Vec<ProjectUsage>> {
+    let mut projects: BTreeMap<PathBuf, (BTreeSet<String>, CheckoutPresence, u64)> =
+        BTreeMap::new();
     let mut target_sizes = BTreeMap::new();
     let root = store.join(CHECKOUTS_DIR);
     for identity_entry in read_dir_or_empty(&root)? {
@@ -1622,10 +1662,11 @@ fn project_usage(store: &Path, size_targets: bool) -> Result<Vec<ProjectUsage>> 
                 continue;
             };
             let project = projects.entry(record.workspace_root.clone()).or_default();
-            if claim_is_live(store, &record) {
+            let presence = claim_presence(store, &record);
+            if presence != CheckoutPresence::Gone {
                 project.0.insert(identity.clone());
-                project.1 = true;
             }
+            project.1 = project.1.max(presence);
             if size_targets {
                 project.2 = project
                     .2
@@ -1635,19 +1676,20 @@ fn project_usage(store: &Path, size_targets: bool) -> Result<Vec<ProjectUsage>> 
     }
     let live = projects
         .values()
+        .filter(|(_, presence, _)| *presence >= resolve)
         .flat_map(|(identities, _, _)| identities.iter().cloned())
         .collect::<BTreeSet<_>>();
     let mut reachability = Reachability::new(store);
     resolve_identities(&reachability, &live);
     let mut usages = Vec::new();
-    for (workspace_root, (identities, live, target_bytes)) in projects {
+    for (workspace_root, (identities, presence, target_bytes)) in projects {
         let action_bytes = reachability.bytes(&identities);
         usages.push(ProjectUsage {
             workspace_root,
             identities: identities.len() as u64,
             action_bytes,
             target_bytes,
-            live,
+            presence,
         });
     }
     usages.sort_by(|left, right| {
@@ -2761,10 +2803,19 @@ fn grouped_receipt_actions(store: &Path) -> Result<BTreeSet<CacheDigest>> {
         .collect())
 }
 
+/// What the filesystem says about the checkout a recorded claim names. An
+/// expired claim speaks for nothing.
+fn claim_presence(store: &Path, record: &CheckoutRecord) -> CheckoutPresence {
+    if claim_has_expired(record) {
+        return CheckoutPresence::Gone;
+    }
+    checkout_presence(store, &record.workspace_root)
+}
+
 /// Whether a recorded claim still speaks for a checkout that is using this
 /// store.
 fn claim_is_live(store: &Path, record: &CheckoutRecord) -> bool {
-    checkout_is_live_on(store, &record.workspace_root) && !claim_has_expired(record)
+    claim_presence(store, record) != CheckoutPresence::Gone
 }
 
 fn claim_has_expired(record: &CheckoutRecord) -> bool {
@@ -2776,7 +2827,7 @@ fn claim_has_expired(record: &CheckoutRecord) -> bool {
         .gt(&CHECKOUT_RETENTION.as_secs())
 }
 
-/// Whether the checkout a record names is still on disk.
+/// What the filesystem says about a checkout.
 ///
 /// Absence is believed only when the checkout is definitely absent and its
 /// nearest existing ancestor is on the same filesystem as the store. Walking
@@ -2785,27 +2836,38 @@ fn claim_has_expired(record: &CheckoutRecord) -> bool {
 /// its otherwise-empty parents.
 ///
 /// A different filesystem can be a mount whose contents are temporarily
-/// unavailable, so uncertainty there remains live. Errors are treated the same
-/// way: being wrong in that direction only delays collection; the other way
-/// round throws away a warm cache someone is still using.
-pub fn checkout_is_live_on(store: &Path, workspace_root: &Path) -> bool {
-    if !matches!(workspace_root.try_exists(), Ok(false)) {
-        return true;
+/// unavailable, so absence there is [`CheckoutPresence::Unreachable`], and so
+/// is an error: being wrong in that direction only delays collection; the
+/// other way round throws away a warm cache someone is still using.
+pub fn checkout_presence(store: &Path, workspace_root: &Path) -> CheckoutPresence {
+    match workspace_root.try_exists() {
+        Ok(true) => return CheckoutPresence::Present,
+        Ok(false) => {}
+        Err(_) => return CheckoutPresence::Unreachable,
     }
-
     let Ok(store_metadata) = std::fs::metadata(store) else {
-        return true;
+        return CheckoutPresence::Unreachable;
     };
     for ancestor in workspace_root.ancestors().skip(1) {
         match std::fs::metadata(ancestor) {
             Ok(ancestor_metadata) => {
-                return !same_filesystem(store, &store_metadata, ancestor, &ancestor_metadata);
+                return if same_filesystem(store, &store_metadata, ancestor, &ancestor_metadata) {
+                    CheckoutPresence::Gone
+                } else {
+                    CheckoutPresence::Unreachable
+                };
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(_) => return true,
+            Err(_) => return CheckoutPresence::Unreachable,
         }
     }
-    true
+    CheckoutPresence::Unreachable
+}
+
+/// Whether the checkout a record names may still be using the store: present,
+/// or absent without proof that it was deleted. See [`checkout_presence`].
+pub fn checkout_is_live_on(store: &Path, workspace_root: &Path) -> bool {
+    checkout_presence(store, workspace_root) != CheckoutPresence::Gone
 }
 
 /// Whether a checkout is still on disk, corroborating absence through its
