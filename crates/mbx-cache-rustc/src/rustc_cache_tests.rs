@@ -873,6 +873,77 @@ fn share_generics_explicit_boolean_values_are_keyed() {
     }
 }
 
+/// Options Bun's build passes to its Rust units (`scripts/build/rust.ts` and
+/// `scripts/build/rust/units.ts`): an address-significance table for lld's
+/// identical-code folding, panic locations left out of the binary, and
+/// dependency artifacts listed in dep-info. Each is described by its text, so
+/// it enters the key, and each spelling keys apart from the compilation
+/// without it.
+#[test]
+fn address_significance_location_detail_and_binary_dep_info_are_keyed() {
+    let source = [("/work/project/src.rs", "source")];
+    let digest_with = |flags: &[&str]| {
+        let mut arguments = args(&["--crate-type=lib", "--emit=metadata"]);
+        arguments.extend(args(flags));
+        arguments.extend(args(&["src.rs"]));
+        RustcInvocation::parse(&arguments)
+            .unwrap_or_else(|error| panic!("{flags:?} should be admitted: {error}"))
+            .action(context(&source))
+            .unwrap()
+            .digest
+    };
+    let plain = digest_with(&[]);
+    for (attached, separate) in [
+        (
+            &["-Cllvm-args=-addrsig"][..],
+            &["-C", "llvm-args=-addrsig"][..],
+        ),
+        (&["-Zlocation-detail=none"], &["-Z", "location-detail=none"]),
+        (
+            &["-Zlocation-detail=file,line"],
+            &["-Z", "location-detail=file,line"],
+        ),
+        (&["-Zbinary-dep-depinfo"], &["-Z", "binary-dep-depinfo"]),
+    ] {
+        let digest = digest_with(attached);
+        assert_ne!(digest, plain, "{attached:?} must enter the key");
+        assert_eq!(
+            digest,
+            digest_with(separate),
+            "{separate:?} spells {attached:?}"
+        );
+    }
+    assert_ne!(
+        digest_with(&["-Zlocation-detail=none"]),
+        digest_with(&["-Zlocation-detail=file,line"])
+    );
+}
+
+/// `llvm-args` hands LLVM arbitrary options, some of which read files or
+/// change what the backend writes, so only listed ones are modeled.
+#[test]
+fn unlisted_llvm_args_and_location_details_still_bypass() {
+    for (flag, kind) in [
+        ("-Cllvm-args=-inline-threshold=0", "unknown-codegen-option"),
+        (
+            "-Cllvm-args=-addrsig -inline-threshold=0",
+            "unknown-codegen-option",
+        ),
+        ("-Cllvm-args=", "unknown-codegen-option"),
+        ("-Zlocation-detail=everything", "unknown-flag"),
+        ("-Zlocation-detail=", "unknown-flag"),
+    ] {
+        let reason = RustcInvocation::parse(&args(&[
+            "--crate-type=lib",
+            "--emit=metadata",
+            flag,
+            "src.rs",
+        ]))
+        .unwrap_err();
+        assert_eq!(reason.kind(), kind, "{flag}: {reason}");
+    }
+}
+
 /// The archive is keyed by content like an `--extern` artifact, along both
 /// discovery paths: a rebuilt archive with the same name can never be
 /// restored against, and a prediction replays exactly the key dep-info
