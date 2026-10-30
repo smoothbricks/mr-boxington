@@ -45,6 +45,18 @@ Dependents of a crate using private incremental state also keep private state,
 because their inputs contain an artifact other checkouts cannot share. They can
 publish again after the edited crate compiles once more without a source change.
 
+In a Git checkout, an edit is a change made under the commit HEAD named when
+the crate last compiled, or a change still uncommitted on top of a new HEAD.
+When HEAD moves and the crate's tracked files match it, as after a pull, a
+rebase, a merge or a checkout, the change came with history every checkout at
+that commit builds alike. The crate compiles and publishes normally, and so do
+its dependents. A main checkout, a CI runner and a checkout that only lands or
+gates others' work therefore fill the shared cache instead of keeping each
+change private. The edit loop keeps its private state across a commit: once
+what was built is committed, the next uncommitted edit on top of it is still
+an edit. A change committed before its first build, by contrast, compiles and
+publishes normally. Outside Git, every change is an edit.
+
 ### Start new checkouts warm
 
 With rustc 1.98 or later, mbx seeds private incremental state from another
