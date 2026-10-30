@@ -8451,6 +8451,97 @@ fn a_compilation_using_a_precompiled_header_hits_until_its_header_changes() {
     assert_ne!(first, std::fs::read(project.join("tu.o")).unwrap());
 }
 
+/// A precompiled header built while another was loaded is chained: a
+/// compilation that uses it makes Clang load the first one from the path
+/// recorded inside it, and Clang's dependency list leaves module files out
+/// unless asked for them. Rebuilding the first PCH under another definition,
+/// with its header and the chained PCH unchanged, changes what the
+/// compilation produces, so it must not restore the object built against the
+/// old one.
+#[cfg(unix)]
+#[test]
+fn a_chained_precompiled_header_misses_when_the_one_it_loads_is_rebuilt() {
+    if !has_c_compiler() {
+        return;
+    }
+    let version = Command::new("cc").arg("--version").output().unwrap();
+    if !String::from_utf8_lossy(&version.stdout).contains("clang") {
+        // `-include-pch` is Clang's; GCC finds its `.gch` by itself.
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let cache = directory.path().join("cache");
+    let project = directory.path().join("project");
+    std::fs::create_dir(&project).unwrap();
+    std::fs::write(project.join("root.h"), "static const int root = ROOT;\n").unwrap();
+    std::fs::write(project.join("chained.h"), "int chained(void);\n").unwrap();
+    std::fs::write(
+        project.join("tu.c"),
+        "int value(void) { return root + chained(); }\n",
+    )
+    .unwrap();
+    let cc = |arguments: &[&str]| {
+        let status = Command::new("cc")
+            .current_dir(&project)
+            .args(arguments)
+            .status()
+            .unwrap();
+        assert!(status.success(), "cc {arguments:?} should succeed");
+    };
+    let root = |definition: &str| cc(&[definition, "-x", "c-header", "root.h", "-o", "root.h.pch"]);
+    let compile = |report: &str| {
+        let report = directory.path().join(report);
+        let output = mbx_command()
+            .current_dir(&project)
+            .env("MBX_CACHE_DIR", &cache)
+            .env("MBX_STATS_REPORT", &report)
+            .env("MBX_GC_AUTO", "0")
+            .args([
+                "exec",
+                "sh",
+                "-c",
+                "cc -include-pch chained.h.pch -c tu.c -o tu.o",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let hits = std::fs::read(&report)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .map_or(0, |stats| count(&stats, "hits"));
+        (hits, std::fs::read(project.join("tu.o")).unwrap())
+    };
+    root("-DROOT=1");
+    cc(&[
+        "-include-pch",
+        "root.h.pch",
+        "-x",
+        "c-header",
+        "chained.h",
+        "-o",
+        "chained.h.pch",
+    ]);
+    let (_, first) = compile("cold.json");
+    let (hits, again) = compile("warm.json");
+    assert_eq!(hits, 1, "the same precompiled headers should hit");
+    assert_eq!(first, again);
+
+    root("-DROOT=2");
+    let (hits, rebuilt) = compile("rebuilt.json");
+    assert_eq!(
+        hits, 0,
+        "a rebuilt first precompiled header restored the object built against the old one"
+    );
+    assert_ne!(
+        first, rebuilt,
+        "the object must be built against the new header"
+    );
+}
+
 #[test]
 fn mbx_clean_under_reports_when_a_deleted_root_has_no_records() {
     let directory = tempfile::tempdir().unwrap();
