@@ -5759,6 +5759,77 @@ fn a_compilation_reading_divergent_generated_sources_is_not_shared() {
     );
 }
 
+/// A build driven by `mbx exec` runs its Rust compilations through the same
+/// rustc shim `mbx build` does, so a compilation that reads build-script
+/// output gets the same stable `OUT_DIR`: two roots whose generated sources
+/// match share one result, as two checkouts do under Cargo.
+#[test]
+fn an_out_dir_reader_under_exec_shares_between_roots() {
+    let directory = tempfile::tempdir().unwrap();
+    let directory = directory.path().canonicalize().unwrap();
+    std::fs::create_dir_all(directory.join("shims")).unwrap();
+    let shim = mbx::session::install_shim(
+        Path::new(env!("CARGO_BIN_EXE_mbx")),
+        &directory.join("shims"),
+        mbx::session::ShimLink::Tracking,
+    )
+    .unwrap();
+    let mut hits = Vec::new();
+    // One project in two build roots, as two Nix builds of one derivation
+    // are: the exec identity names the project, not where it is.
+    for name in ["first", "second"] {
+        let root = directory.join(name).join("project");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("out")).unwrap();
+        std::fs::create_dir_all(root.join("target")).unwrap();
+        std::fs::write(
+            root.join("out/generated.rs"),
+            "pub const GENERATED: u32 = 7;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/lib.rs"),
+            "include!(concat!(env!(\"OUT_DIR\"), \"/generated.rs\"));\n",
+        )
+        .unwrap();
+        let report = directory.join(format!("{name}.json"));
+        let output = mbx_command()
+            .current_dir(&root)
+            .env("MBX_CACHE_DIR", directory.join("cache"))
+            .env("MBX_STATS_REPORT", &report)
+            .env("MBX_GC_AUTO", "0")
+            .env("MBX_LEARNED_INCREMENTAL", "0")
+            .env("OUT_DIR", root.join("out"))
+            .args(["exec", "--project-root"])
+            .arg(&root)
+            .arg("--")
+            .arg(&shim)
+            .arg("rustc")
+            .args([
+                "--crate-name=fixture",
+                "--crate-type=lib",
+                "--emit=dep-info,metadata",
+                "--out-dir=target",
+                "src/lib.rs",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stats: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&report).unwrap()).unwrap();
+        hits.push(count(&stats, "hits"));
+    }
+    assert_eq!(
+        hits,
+        [0, 1],
+        "the second root should restore the first root's compilation"
+    );
+}
+
 /// A workspace member that reads `OUT_DIR` is restored rather than rebuilt,
 /// so the crate above it consumes the same artifact in both checkouts and
 /// shares too. The pair is checked by crate: the fixture also compiles a build
