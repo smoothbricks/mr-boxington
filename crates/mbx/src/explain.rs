@@ -729,7 +729,7 @@ pub(crate) fn guidance(kind: &str) -> &'static str {
             "A build script passed a C compiler option this mbx adapter does not model. Check for a newer mbx release before reporting it."
         }
         "cc-unsupported-language" => {
-            "mbx caches C and C++ compilations; assembly, Objective-C, and precompiled headers still compile normally."
+            "mbx caches C and C++ compilations; assembly, Objective-C, and building precompiled headers still compile normally."
         }
         "cc-embedded-timestamp-macro" => {
             "A source or header expands `__DATE__`, `__TIME__`, or `__TIMESTAMP__`, so its object is not a function of its inputs and cannot be reused."

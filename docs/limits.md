@@ -397,16 +397,26 @@ discovery and include-directory invalidation still apply.
 With `-E` and `-MD`/`-MMD`, an explicit `-MF` is required. Without it, GCC gives
 `-o` a different meaning and mbx bypasses the invocation.
 
+A Clang compilation that uses a precompiled header is cached too, whether the
+header is named to the driver (`-include-pch <file>`) or handed to the
+frontend (`-Xclang -include-pch -Xclang <file>`, with the header it was built
+from as `-Xclang -include -Xclang <header>`). The precompiled header is an
+input keyed by its contents, and the headers recorded inside it enter the key
+like any other header the compilation read. A precompiled header records the
+paths and modification times of the headers it was built from, so one rebuilt
+in another directory has other bytes, and the compilations that use it miss
+there.
+
 ### Calls that bypass the cache
 
 mbx leaves these C and C++ calls uncached:
 
 - Links, multi-source calls, preprocessing to stdout, and dependency output
   to stdout (`-MF -`)
-- Assembly without preprocessing (`.s`), Objective-C, precompiled headers,
-  coverage instrumentation, compiler plugins, and response files
-- Unmodeled sub-tool options, including `-Wp,`, `-Wl,`, `-Xclang`, and
-  unsupported `-Wa,` options
+- Assembly without preprocessing (`.s`), Objective-C, building a precompiled
+  header, coverage instrumentation, compiler plugins, and response files
+- Unmodeled sub-tool options, including `-Wp,`, `-Wl,`, `-Xclang` (other than
+  the precompiled-header pairs above), and unsupported `-Wa,` options
 - Assembler-time `.include`, `.sinclude`, and `.incbin` inputs
 - MSVC compiler PDBs, modules, and other unsupported extra outputs
 - Sources or headers that expand `__DATE__`, `__TIME__`, or `__TIMESTAMP__`,

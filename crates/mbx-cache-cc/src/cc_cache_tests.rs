@@ -415,6 +415,93 @@ fn tool_passthrough_flags_bypass_even_with_admitted_prefixes() {
     );
 }
 
+/// Bun hands clang's frontend its precompiled header the way the driver would:
+/// `-Xclang -include-pch -Xclang <pch>` with the header it was built from as
+/// `-Xclang -include -Xclang <header>`. The PCH is read whole, and the
+/// dependency list names the headers inside it but never the PCH itself, so it
+/// is a required input keyed by its bytes.
+#[test]
+fn a_precompiled_header_is_a_required_input_keyed_by_content() {
+    let pch = "build/root.h.pch";
+    let spellings: [&[&str]; 2] = [
+        &[
+            "-Xclang",
+            "-include-pch",
+            "-Xclang",
+            pch,
+            "-Xclang",
+            "-include",
+            "-Xclang",
+            "build/root.h",
+        ],
+        &["-include-pch", pch, "-include", "build/root.h"],
+    ];
+    for spelling in spellings {
+        let mut arguments = argv(spelling);
+        arguments.extend(argv(&["-c", "-o", "out.o", "src/a.cpp"]));
+        let invocation = CcInvocation::parse(&arguments)
+            .unwrap_or_else(|reason| panic!("{spelling:?} should be admitted: {reason}"));
+        assert_eq!(
+            invocation.required_inputs(),
+            [PathBuf::from(pch), PathBuf::from("src/a.cpp")],
+            "{spelling:?}"
+        );
+        let (workspace, target) = checkout("one");
+        let key = |precompiled: &str| {
+            let mut context = context(&workspace, &target);
+            context.inputs = vec![
+                CcActionInput {
+                    path: workspace.join("src/a.cpp"),
+                    digest: digest_of("source"),
+                },
+                CcActionInput {
+                    path: workspace.join(pch),
+                    digest: digest_of(precompiled),
+                },
+            ];
+            invocation.action(context).expect("action").digest
+        };
+        assert_ne!(key("first build"), key("second build"), "{spelling:?}");
+        let mut context = context(&workspace, &target);
+        context.inputs = vec![CcActionInput {
+            path: workspace.join("src/a.cpp"),
+            digest: digest_of("source"),
+        }];
+        assert_eq!(
+            invocation.action(context).unwrap_err().kind(),
+            "missing-required-input",
+            "{spelling:?}"
+        );
+    }
+}
+
+/// Only the frontend options that name a precompiled header and its header
+/// are modeled. A pair cut short, any other frontend option, and building a
+/// precompiled header still bypass.
+#[test]
+fn other_frontend_options_and_building_a_precompiled_header_bypass() {
+    for (spelling, kind) in [
+        (&["-Xclang", "-include-pch"][..], "missing-value"),
+        (&["-Xclang", "-include-pch", "-Xclang"], "missing-value"),
+        (
+            &["-Xclang", "-include-pch", "root.h.pch"],
+            "tool-passthrough",
+        ),
+        (&["-Xclang", "-fno-validate-pch"], "tool-passthrough"),
+        (&["-Xclang", "-emit-pch"], "tool-passthrough"),
+        (&["-emit-pch"], "precompiled-header"),
+    ] {
+        // Last, so that a pair cut short is cut short by the end of argv.
+        let mut arguments = argv(&["-c", "-o", "out.o", "src/a.cpp"]);
+        arguments.extend(argv(spelling));
+        assert_eq!(
+            CcInvocation::parse(&arguments).unwrap_err().kind(),
+            kind,
+            "{spelling:?}"
+        );
+    }
+}
+
 #[test]
 fn no_input_assembler_options_stay_admitted_key_material() {
     let flag = "-Wa,--noexecstack";
