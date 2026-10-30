@@ -1,6 +1,9 @@
 use super::*;
 use std::time::SystemTime;
 
+/// The lanes below a managed target: the check lane's and the editor's.
+const LANES: [&str; 2] = ["check", "rust-analyzer"];
+
 /// Seed a build's own profiles, outside any lane.
 fn seed(
     view: &Path,
@@ -8,7 +11,14 @@ fn seed(
     packages: &BTreeSet<String>,
     donors: &[Donor],
 ) -> SeedOutcome {
-    super::seed(view, Path::new(""), profiles, packages, donors)
+    super::seed(
+        view,
+        Path::new(""),
+        &LANES.map(Path::new),
+        profiles,
+        packages,
+        donors,
+    )
 }
 
 const LOCKFILE: &str = r#"
@@ -252,6 +262,166 @@ fn a_donor_profile_a_build_is_using_is_skipped() {
     assert!(!to.path().join("debug/build").exists());
 }
 
+/// A unit standing for a crate that rustc compiled in `build`: what it holds
+/// differs between builds, as a crate hash can between two checkouts that
+/// build the same registry unit.
+fn compiled_in(profile: &Path, package: &str, hash: &str, build: &str) -> PathBuf {
+    let unit = unit(profile, package, hash);
+    std::fs::write(unit.join("out/compiled-in"), build).unwrap();
+    unit
+}
+
+/// Which build compiled the unit at `unit` below `view`, if it is there.
+fn compiled_by(view: &Path, unit: &str) -> Option<String> {
+    std::fs::read_to_string(view.join(unit).join("out/compiled-in")).ok()
+}
+
+fn donor_named(directory: &Path, name: &str) -> Donor {
+    Donor {
+        workspace_root: Path::new("/checkouts").join(name),
+        ..donor(directory)
+    }
+}
+
+/// arc-swap's target unit reads the host profile's rustversion proc macro.
+fn arc_swap_and_rustversion() -> BTreeSet<String> {
+    BTreeSet::from(["arc-swap".to_owned(), "rustversion".to_owned()])
+}
+
+const RUSTVERSION: &str = "debug/build/rustversion/4c54d45ad42a6835";
+const ARC_SWAP: &str = "aarch64-apple-darwin/debug/build/arc-swap/a6e3c4e34bae865c";
+
+/// rustc names each dependency of a crate by the crate hash it had in the
+/// build that compiled the crate, and two checkouts building the same
+/// registry unit can give it different crate hashes. So arc-swap's target
+/// unit from one checkout beside rustversion's host unit from another is
+/// fresh to Cargo and fails in rustc with E0463 "can't find crate for
+/// `arc_swap`": SmoothBricks' gate, 2026-10-31, built from units copied from
+/// AxE's train5, which had taken them from two checkouts the same way.
+#[test]
+fn a_donor_busy_in_one_profile_gives_no_profile() {
+    let busy = tempfile::tempdir().unwrap();
+    let idle = tempfile::tempdir().unwrap();
+    let to = tempfile::tempdir().unwrap();
+    for (from, build) in [(&busy, "busy"), (&idle, "idle")] {
+        let (host, target) = (
+            from.path().join("debug"),
+            from.path().join("aarch64-apple-darwin/debug"),
+        );
+        compiled_in(&host, "rustversion", "4c54d45ad42a6835", build);
+        compiled_in(&target, "arc-swap", "a6e3c4e34bae865c", build);
+    }
+    // A build holds the newest donor's host profile but not its target's.
+    let mut building = fslock::LockFile::open(&busy.path().join("debug/.cargo-lock")).unwrap();
+    assert!(building.try_lock().unwrap());
+
+    let outcome = seed(
+        to.path(),
+        &[PathBuf::from("debug")],
+        &arc_swap_and_rustversion(),
+        &[
+            donor_named(busy.path(), "busy"),
+            donor_named(idle.path(), "idle"),
+        ],
+    );
+
+    assert_eq!(outcome.donor, Some(PathBuf::from("/checkouts/idle")));
+    assert_eq!(compiled_by(to.path(), RUSTVERSION).as_deref(), Some("idle"));
+    assert_eq!(
+        compiled_by(to.path(), ARC_SWAP).as_deref(),
+        Some("idle"),
+        "arc-swap compiled against the busy checkout's rustversion was copied beside the idle one's"
+    );
+}
+
+/// The donor that gives any profile gives them all, even when it has nothing
+/// usable for one: a dependency Cargo then compiles here is newer than the
+/// copies that read it, so Cargo rebuilds those, where a copy from another
+/// checkout keeps its older time and passes as their dependency.
+#[test]
+fn a_donor_that_gives_one_profile_gives_them_all() {
+    let newest = tempfile::tempdir().unwrap();
+    let older = tempfile::tempdir().unwrap();
+    let to = tempfile::tempdir().unwrap();
+    // The newest donor's host profile holds only a path package's unit.
+    compiled_in(
+        &newest.path().join("debug"),
+        "local",
+        "0123456789abcdef",
+        "newest",
+    );
+    compiled_in(
+        &newest.path().join("aarch64-apple-darwin/debug"),
+        "arc-swap",
+        "a6e3c4e34bae865c",
+        "newest",
+    );
+    compiled_in(
+        &older.path().join("debug"),
+        "rustversion",
+        "4c54d45ad42a6835",
+        "older",
+    );
+
+    let outcome = seed(
+        to.path(),
+        &[PathBuf::from("debug")],
+        &arc_swap_and_rustversion(),
+        &[
+            donor_named(newest.path(), "newest"),
+            donor_named(older.path(), "older"),
+        ],
+    );
+
+    assert_eq!(outcome.donor, Some(PathBuf::from("/checkouts/newest")));
+    assert_eq!(compiled_by(to.path(), ARC_SWAP).as_deref(), Some("newest"));
+    assert_eq!(
+        compiled_by(to.path(), RUSTVERSION),
+        None,
+        "rustversion came from a checkout other than the one arc-swap was compiled in"
+    );
+}
+
+/// A target profile is not seeded beside a host profile this checkout built:
+/// its proc macros are this checkout's own, with this checkout's crate
+/// hashes, and older than the copies would be.
+#[test]
+fn no_profile_is_seeded_beside_one_this_checkout_built() {
+    let from = tempfile::tempdir().unwrap();
+    let to = tempfile::tempdir().unwrap();
+    compiled_in(
+        &from.path().join("debug"),
+        "rustversion",
+        "4c54d45ad42a6835",
+        "donor",
+    );
+    compiled_in(
+        &from.path().join("aarch64-apple-darwin/debug"),
+        "arc-swap",
+        "a6e3c4e34bae865c",
+        "donor",
+    );
+    compiled_in(
+        &to.path().join("debug"),
+        "rustversion",
+        "4c54d45ad42a6835",
+        "here",
+    );
+
+    let outcome = seed(
+        to.path(),
+        &[
+            PathBuf::from("debug"),
+            Path::new("aarch64-apple-darwin").join("debug"),
+        ],
+        &arc_swap_and_rustversion(),
+        &[donor(from.path())],
+    );
+
+    assert_eq!(outcome, SeedOutcome::default());
+    assert_eq!(compiled_by(to.path(), RUSTVERSION).as_deref(), Some("here"));
+    assert!(!to.path().join("aarch64-apple-darwin/debug/build").exists());
+}
 #[test]
 fn the_pinned_build_script_binary_comes_along() {
     let from = tempfile::tempdir().unwrap();
@@ -571,6 +741,7 @@ fn a_lane_is_seeded_from_the_same_lane_in_the_donor() {
     let outcome = super::seed(
         to.path(),
         Path::new("check"),
+        &LANES.map(Path::new),
         &[PathBuf::from("debug")],
         &registry(),
         &[donor(from.path())],
@@ -585,6 +756,35 @@ fn a_lane_is_seeded_from_the_same_lane_in_the_donor() {
     assert!(
         !to.path().join("debug").exists(),
         "a lane's build should leave the build profiles alone"
+    );
+}
+
+/// A build's profiles are its lane's: the check lane below the managed target
+/// is neither seeded with them nor, once built, a reason to leave them unseeded.
+#[test]
+fn a_build_seeds_its_own_lane_beside_a_built_check_lane() {
+    let from = tempfile::tempdir().unwrap();
+    let to = tempfile::tempdir().unwrap();
+    unit(&from.path().join("debug"), "serde", "0123456789abcdef");
+    unit(
+        &from.path().join("check/debug"),
+        "serde",
+        "fedcba9876543210",
+    );
+    unit(&to.path().join("check/debug"), "serde", "fedcba9876543210");
+
+    let outcome = seed(
+        to.path(),
+        &[PathBuf::from("debug")],
+        &registry(),
+        &[donor(from.path())],
+    );
+
+    assert_eq!(outcome.units, 1);
+    assert!(
+        to.path()
+            .join("debug/build/serde/0123456789abcdef")
+            .is_dir()
     );
 }
 

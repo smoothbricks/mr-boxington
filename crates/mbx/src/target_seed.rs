@@ -23,6 +23,11 @@
 //!   checkout's build change another's.
 //! - Each unit is copied beside its final name and renamed into place, so an
 //!   interrupted copy never leaves a fingerprint without its outputs.
+//! - A build's profiles, the host's and each target triple's, all come from
+//!   one checkout, and only into a checkout that has built none of them.
+//!   rustc names a crate's dependencies by crate hash, which two checkouts can
+//!   give the same unit differently, and a target's units read the host
+//!   profile's proc macros. See [`seed`].
 //!
 //! A unit copied from the other checkout that this build does not use is
 //! removed later by [`crate::target_units`] like any other unused unit.
@@ -137,83 +142,105 @@ pub(crate) fn registry_packages(lockfile: &str) -> BTreeSet<String> {
     &registry - &path
 }
 
-/// Copy `packages`' units into each profile directory, relative to `lane`
-/// in `view`, that has no `build/` directory yet. `lane` is empty for a
-/// build's own profiles, or the directory a check lane or the editor writes
-/// below the managed target, whose units come from the same directory in each
-/// donor. `profiles` starts with the host profile; the same profile below any
-/// target triple a donor has built is seeded too, since a target chosen by
-/// Cargo configuration or `host-tuple` never appears as a directory name in
-/// the arguments. Each directory comes from the first donor, most recent
-/// first, that has usable units for it.
+/// Copy `packages`' units into the profiles, relative to `lane` in `view`, of
+/// a build that has built none of them. `lane` is empty for a build's own
+/// profiles, or the directory a check lane or the editor writes below the
+/// managed target, whose units come from the same directory in each donor;
+/// `lanes` names every such directory, so a build never takes another lane's
+/// profiles for a target triple's. `profiles` starts with the host profile;
+/// the same profile below any target triple a donor has built is seeded too,
+/// since a target chosen by Cargo configuration or `host-tuple` never appears
+/// as a directory name in the arguments.
+///
+/// Every profile comes from one donor: the first, most recent first, with
+/// usable units. rustc names each dependency of a crate by the crate hash it
+/// had in the build that compiled the crate, and two checkouts building the
+/// same registry unit can give it different crate hashes, since a crate that
+/// includes a file from its `OUT_DIR` hashes that file's path. A target's
+/// units read the host profile's proc macros, so a target profile copied from
+/// one checkout beside a host profile from another, or beside this checkout's
+/// own, is fresh to Cargo and fails in rustc with E0463. A dependency Cargo
+/// builds here instead is newer than the copies that read it, and Cargo
+/// rebuilds those.
 pub(crate) fn seed(
     view: &Path,
     lane: &Path,
+    lanes: &[&Path],
     profiles: &[PathBuf],
     packages: &BTreeSet<String>,
     donors: &[Donor],
 ) -> SeedOutcome {
-    let mut outcome = SeedOutcome::default();
     let Some(host) = profiles.first() else {
-        return outcome;
+        return SeedOutcome::default();
     };
     if packages.is_empty() {
-        return outcome;
+        return SeedOutcome::default();
     }
-    let view = view.join(lane);
-    let mut settled = BTreeSet::new();
+    let destination = view.join(lane);
+    let built = || {
+        profiles
+            .iter()
+            .cloned()
+            .chain(lane_profiles(view, lane, lanes, host))
+            .any(|profile| destination.join(profile).join("build").exists())
+    };
+    if built() {
+        return SeedOutcome::default();
+    }
     for donor in donors {
-        let donor_lane = donor.directory.join(lane);
-        let mut candidates = profiles.to_vec();
-        candidates.extend(
-            subdirectories(&donor_lane)
-                .into_iter()
-                .filter_map(|triple| Some(Path::new(triple.file_name()?).join(host)))
-                .filter(|candidate| candidate != host),
-        );
-        for profile in candidates {
-            if settled.contains(&profile) {
-                continue;
+        let source = donor.directory.join(lane);
+        let candidates = profiles
+            .iter()
+            .cloned()
+            .chain(lane_profiles(&donor.directory, lane, lanes, host))
+            .filter(|profile| has_units(&source.join(profile).join("build")))
+            .collect::<BTreeSet<_>>();
+        if candidates.is_empty() {
+            continue;
+        }
+        match seed_profiles(donor, &source, &destination, &candidates, packages, built) {
+            Ok(Copied::Units(0) | Copied::Busy) => {}
+            Ok(Copied::Units(units)) => {
+                return SeedOutcome {
+                    units,
+                    donor: Some(donor.workspace_root.clone()),
+                };
             }
-            let destination = view.join(&profile);
-            if destination.join("build").exists() {
-                settled.insert(profile);
-                continue;
-            }
-            let source = donor_lane.join(&profile);
-            if !has_units(&source.join("build")) {
-                continue;
-            }
-            match seed_profile(donor, &source, &destination, packages) {
-                Ok(Copied::Units(0) | Copied::Busy) => {}
-                Ok(Copied::Units(units)) => {
-                    outcome.units += units;
-                    outcome
-                        .donor
-                        .get_or_insert_with(|| donor.workspace_root.clone());
-                    settled.insert(profile);
-                }
-                Ok(Copied::Built) => {
-                    settled.insert(profile);
-                }
-                Err(error) => log::debug!(
-                    "could not copy build units from {}: {error}",
-                    source.display()
-                ),
-            }
+            Ok(Copied::Built) => return SeedOutcome::default(),
+            Err(error) => log::debug!(
+                "could not copy build units from {}: {error}",
+                source.display()
+            ),
         }
     }
-    outcome
+    SeedOutcome::default()
 }
 
-/// What seeding one profile directory from one donor came to.
+/// `host`, and the same profile below each directory of `lane` in `root`
+/// other than another lane: a target triple's.
+fn lane_profiles(root: &Path, lane: &Path, lanes: &[&Path], host: &Path) -> Vec<PathBuf> {
+    let others = lanes
+        .iter()
+        .map(|other| root.join(other))
+        .collect::<Vec<_>>();
+    let mut profiles = vec![host.to_path_buf()];
+    profiles.extend(
+        subdirectories(&root.join(lane))
+            .into_iter()
+            .filter(|directory| !others.contains(directory))
+            .filter_map(|triple| Some(Path::new(triple.file_name()?).join(host))),
+    );
+    profiles
+}
+
+/// What seeding a build's profiles from one donor came to.
 enum Copied {
     /// Units copied; none means the donor had nothing usable, and the next
     /// donor is worth trying.
     Units(u64),
-    /// A build holds one of the two profiles.
+    /// A build holds one of the profiles in either checkout.
     Busy,
-    /// A build in this checkout started the profile first.
+    /// A build in this checkout started one of the profiles first.
     Built,
 }
 
@@ -226,26 +253,55 @@ fn has_units(build: &Path) -> bool {
     })
 }
 
-/// Copy one profile's units, holding both profiles' Cargo locks so neither
-/// checkout builds meanwhile.
-fn seed_profile(
+/// Copy `profiles`' units from one donor, holding every one of their Cargo
+/// locks in both checkouts first, so neither builds any of them meanwhile.
+fn seed_profiles(
+    donor: &Donor,
+    source: &Path,
+    destination: &Path,
+    profiles: &BTreeSet<PathBuf>,
+    packages: &BTreeSet<String>,
+    built: impl Fn() -> bool,
+) -> std::io::Result<Copied> {
+    let mut locks = Vec::with_capacity(2 * profiles.len());
+    for profile in profiles {
+        let Some(lock) = try_lock(&source.join(profile).join(".cargo-lock"))? else {
+            return Ok(Copied::Busy);
+        };
+        locks.push(lock);
+        let into = destination.join(profile);
+        std::fs::create_dir_all(&into)?;
+        let Some(lock) = try_lock(&into.join(".cargo-lock"))? else {
+            return Ok(Copied::Busy);
+        };
+        locks.push(lock);
+    }
+    // A build that got a lock first may have started one of the profiles.
+    if built() {
+        return Ok(Copied::Built);
+    }
+    // A published unit can already be fresh to Cargo after an interrupted
+    // seed, so every profile's launcher dependencies come first. Nothing is
+    // copied yet if one fails, and the next donor is free to give them all.
+    for profile in profiles {
+        copy_build_script_shims(donor, &source.join(profile), &destination.join(profile))?;
+    }
+    let mut units = 0;
+    for profile in profiles {
+        let into = destination.join(profile);
+        remove_abandoned_staging(&into);
+        units += copy_units(donor, &source.join(profile), &into, packages);
+    }
+    Ok(Copied::Units(units))
+}
+
+/// Copy one profile's units, which the caller holds both Cargo locks of.
+fn copy_units(
     donor: &Donor,
     source: &Path,
     destination: &Path,
     packages: &BTreeSet<String>,
-) -> std::io::Result<Copied> {
-    let Some(_source_lock) = try_lock(&source.join(".cargo-lock"))? else {
-        return Ok(Copied::Busy);
-    };
-    std::fs::create_dir_all(destination)?;
-    let Some(_destination_lock) = try_lock(&destination.join(".cargo-lock"))? else {
-        return Ok(Copied::Busy);
-    };
-    // A build that got the lock first may have started this profile.
-    if destination.join("build").exists() {
-        return Ok(Copied::Built);
-    }
-    remove_abandoned_staging(destination);
+) -> u64 {
     // Only the units this profile's latest build read, when access times say
     // which those are: the ones read within a day of its most recent read. A
     // build of another profile or project in the donor does not move this.
@@ -264,7 +320,6 @@ fn seed_profile(
         None
     };
     let mut units = 0;
-    let mut shims_copied = false;
     for package in subdirectories(&source.join("build")) {
         let Some(name) = package.file_name().and_then(|name| name.to_str()) else {
             continue;
@@ -283,19 +338,13 @@ fn seed_profile(
             let Some(hash) = unit.file_name() else {
                 continue;
             };
-            // A published unit can already be fresh to Cargo after an
-            // interrupted seed. Publish every launcher dependency first.
-            if !shims_copied {
-                copy_build_script_shims(donor, source, destination)?;
-                shims_copied = true;
-            }
             match copy_unit(&unit, destination, name, hash, donor) {
                 Ok(()) => units += 1,
                 Err(error) => log::debug!("did not copy {}: {error}", unit.display()),
             }
         }
     }
-    Ok(Copied::Units(units))
+    units
 }
 
 /// Publish pinned identities individually, so a seed can resume or merge

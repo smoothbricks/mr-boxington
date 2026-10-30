@@ -879,10 +879,10 @@ pub(super) fn place_target_view(
     }
 }
 
-/// Copy registry build units from another checkout into each profile this
-/// build writes that the checkout has not built yet. `lane` is where those
-/// profiles sit below the managed target: nowhere for a build, or the check
-/// lane's or the editor's directory.
+/// Copy registry build units from another checkout into the profiles this
+/// build writes, when the checkout has built none of them yet. `lane` is
+/// where those profiles sit below the managed target: nowhere for a build, or
+/// the check lane's or the editor's directory.
 fn seed_target_view(
     config: &Config,
     cargo: &std::ffi::OsStr,
@@ -894,7 +894,7 @@ fn seed_target_view(
     let profiles = crate::target_seed::profile_directories(arguments);
     if profiles
         .iter()
-        .all(|profile| view.join(lane).join(profile).join("build").exists())
+        .any(|profile| view.join(lane).join(profile).join("build").exists())
     {
         return;
     }
@@ -929,7 +929,16 @@ fn seed_target_view(
     if !supported {
         return;
     }
-    let outcome = crate::target_seed::seed(view, lane, &profiles, &packages, &donors);
+    let lanes = [
+        super::CHECK_LANE_TARGET_DIR,
+        super::RUST_ANALYZER_TARGET_DIR,
+    ]
+    .map(|directory| {
+        Path::new(directory)
+            .strip_prefix("target")
+            .unwrap_or(Path::new(directory))
+    });
+    let outcome = crate::target_seed::seed(view, lane, &lanes, &profiles, &packages, &donors);
     if let Some(donor) = outcome.donor {
         crate::session::note(&format!(
             "mbx[target]: copied {} registry build units from {}",
