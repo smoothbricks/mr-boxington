@@ -512,6 +512,14 @@ pub(super) fn print_json(value: &impl serde::Serialize) -> Result<()> {
     Ok(())
 }
 
+/// How a recorded workspace's checkout stands, as the listings print it.
+fn presence_label(presence: store::CheckoutPresence) -> &'static str {
+    match presence {
+        store::CheckoutPresence::Present => "live",
+        store::CheckoutPresence::Unreachable => "unreachable",
+        store::CheckoutPresence::Gone => "stale",
+    }
+}
 pub(super) fn cache_projects(config: &Config) -> Result<()> {
     let projects = store::projects(&config.store_dir())?;
     if projects.is_empty() {
@@ -519,7 +527,7 @@ pub(super) fn cache_projects(config: &Config) -> Result<()> {
         return Ok(());
     }
     for project in projects {
-        let state = if project.live { "live" } else { "stale" };
+        let state = presence_label(project.presence);
         println!(
             "{}\t{} action cache\t{} managed targets\t{} identities\t{state}",
             project.workspace_root.display(),
@@ -666,7 +674,7 @@ fn select_projects(projects: &[store::ProjectUsage]) -> Result<Vec<PathBuf>> {
     let options = projects
         .iter()
         .map(|project| {
-            let state = if project.live { "live" } else { "stale" };
+            let state = presence_label(project.presence);
             let description = format!(
                 "{state} | {} build outputs | {} reusable cache (shared)",
                 ByteSize::b(project.target_bytes).display().iec(),

@@ -10,6 +10,9 @@ use std::path::Path;
 #[derive(Debug, Default, Serialize)]
 pub(crate) struct SharingEstimate {
     pub live_workspaces: u64,
+    /// Recorded workspaces absent but kept: possibly on a volume that is not
+    /// mounted now, so not proved deleted.
+    pub unreachable_workspaces: u64,
     pub independent_cache_bytes: u64,
     pub shared_store_bytes: u64,
     pub duplicate_cache_bytes_avoided_lower_bound: u64,
@@ -17,18 +20,20 @@ pub(crate) struct SharingEstimate {
 
 impl SharingEstimate {
     pub(crate) fn read(store: &Path, shared_store_bytes: u64) -> Result<Self> {
-        Ok(Self::from_live_projects(
-            &store::live_project_cache_bytes(store)?,
+        Ok(Self::from_census(
+            &store::workspace_census(store)?,
             shared_store_bytes,
         ))
     }
 
-    fn from_live_projects(live_cache_bytes: &[u64], shared_store_bytes: u64) -> Self {
-        let independent_cache_bytes = live_cache_bytes
+    fn from_census(census: &store::WorkspaceCensus, shared_store_bytes: u64) -> Self {
+        let independent_cache_bytes = census
+            .present_cache_bytes
             .iter()
             .fold(0u64, |total, bytes| total.saturating_add(*bytes));
         Self {
-            live_workspaces: live_cache_bytes.len() as u64,
+            live_workspaces: census.present_cache_bytes.len() as u64,
+            unreachable_workspaces: census.unreachable,
             independent_cache_bytes,
             shared_store_bytes,
             // The store also contains unclaimed objects. Subtracting all of it
@@ -80,14 +85,13 @@ pub(crate) fn collect(store: &Path, target_root: &Path) -> Result<Report> {
     // both bound by the filesystem, so they overlap.
     let (stats, targets, sharing) = std::thread::scope(|scope| {
         let targets = scope.spawn(|| target::stats(target_root));
-        let sharing = scope.spawn(|| store::live_project_cache_bytes(store));
+        let sharing = scope.spawn(|| store::workspace_census(store));
         let stats = store::stats(store);
         (stats, targets.join(), sharing.join())
     });
     let stats = stats?;
     let targets = targets.map_err(|_| eyre::eyre!("sizing target directories panicked"))??;
-    let live_cache_bytes =
-        sharing.map_err(|_| eyre::eyre!("sizing the cache store panicked"))??;
+    let census = sharing.map_err(|_| eyre::eyre!("sizing the cache store panicked"))??;
     Ok(Report {
         scheduler: None,
         version: 1,
@@ -99,7 +103,7 @@ pub(crate) fn collect(store: &Path, target_root: &Path) -> Result<Report> {
             managed_targets: targets.views,
             managed_target_bytes: targets.bytes,
         },
-        sharing: SharingEstimate::from_live_projects(&live_cache_bytes, stats.total_bytes()),
+        sharing: SharingEstimate::from_census(&census, stats.total_bytes()),
     })
 }
 
@@ -254,6 +258,10 @@ impl SharingEstimate {
     pub(crate) fn rows(&self) -> Vec<(&'static str, String)> {
         vec![
             ("live workspaces", self.live_workspaces.to_string()),
+            (
+                "unreachable workspaces",
+                self.unreachable_workspaces.to_string(),
+            ),
             ("with separate caches", size(self.independent_cache_bytes)),
             (
                 "duplication avoided",
@@ -272,12 +280,17 @@ mod tests {
 
     #[test]
     fn sharing_is_a_lower_bound() {
-        let sharing = SharingEstimate::from_live_projects(&[100, 100], 120);
+        let census = |present: Vec<u64>| store::WorkspaceCensus {
+            present_cache_bytes: present,
+            unreachable: 3,
+        };
+        let sharing = SharingEstimate::from_census(&census(vec![100, 100]), 120);
         assert_eq!(sharing.live_workspaces, 2);
+        assert_eq!(sharing.unreachable_workspaces, 3);
         assert_eq!(sharing.independent_cache_bytes, 200);
         assert_eq!(sharing.duplicate_cache_bytes_avoided_lower_bound, 80);
         assert_eq!(
-            SharingEstimate::from_live_projects(&[100, 100], 300)
+            SharingEstimate::from_census(&census(vec![100, 100]), 300)
                 .duplicate_cache_bytes_avoided_lower_bound,
             0
         );
