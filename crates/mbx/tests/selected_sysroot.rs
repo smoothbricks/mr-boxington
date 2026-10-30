@@ -387,6 +387,33 @@ printf 'target/libfixture.rmeta: lib.rs\n' > target/fixture.d
 /// resolves into `rust-src`'s own store path, outside the join.
 #[test]
 fn a_build_std_unit_of_a_joined_toolchain_stores_and_restores() {
+    build_std_unit_of_a_joined_toolchain_stores_and_restores(Leaves::Directories);
+}
+
+/// The join as Nix lays it out on the host whose wasm build-std units were not
+/// stored, 2026-10-31: the join's directories are its own down to each file,
+/// and every file links into `rust-src`'s store path, so Cargo names
+/// `/nix/store/<hash>-rust-nightly-<version>-<version>/lib/rustlib/src/rust/library/<crate>/src/lib.rs`.
+#[test]
+fn a_build_std_unit_of_a_nix_join_whose_files_are_links_stores_and_restores() {
+    build_std_unit_of_a_joined_toolchain_stores_and_restores(Leaves::Files);
+}
+
+/// The store names of that host's toolchain join and the `rust-src` it joins.
+const RUST_NIGHTLY: &str = "dh0b8lj8avd02zizqd7xb452z5fp13i0-rust-nightly-1.101.0-nightly-2026-10-04-1.101.0-nightly-2026-10-04";
+const RUST_SRC: &str =
+    "1p78ifxxkym8ad99nw8x4x0mhzy0v25q-rust-src-1.101.0-nightly-2026-10-04-aarch64-apple-darwin";
+
+/// How a toolchain join links what it joins.
+#[derive(Clone, Copy)]
+enum Leaves {
+    /// A directory of the join is a link into `rust-src`.
+    Directories,
+    /// The join's directories are its own, and each file is a link.
+    Files,
+}
+
+fn build_std_unit_of_a_joined_toolchain_stores_and_restores(leaves: Leaves) {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().canonicalize().unwrap();
     let workspace = root.join("workspace");
@@ -400,13 +427,23 @@ fn a_build_std_unit_of_a_joined_toolchain_stores_and_restores() {
         mbx::session::ShimLink::Tracking,
     )
     .unwrap();
-    let source = root.join("nix/store/rust-src/lib/rustlib/src/rust/library/core/src");
+    let source = root.join(format!(
+        "nix/store/{RUST_SRC}/lib/rustlib/src/rust/library/core/src"
+    ));
     std::fs::create_dir_all(&source).unwrap();
     std::fs::write(source.join("lib.rs"), "#![no_std]\n").unwrap();
-    let join = root.join("nix/store/rust-nightly");
+    let join = root.join(format!("nix/store/{RUST_NIGHTLY}"));
     let core = join.join("lib/rustlib/src/rust/library/core");
-    std::fs::create_dir_all(&core).unwrap();
-    symlink(&source, core.join("src")).unwrap();
+    match leaves {
+        Leaves::Directories => {
+            std::fs::create_dir_all(&core).unwrap();
+            symlink(&source, core.join("src")).unwrap();
+        }
+        Leaves::Files => {
+            std::fs::create_dir_all(core.join("src")).unwrap();
+            symlink(source.join("lib.rs"), core.join("src/lib.rs")).unwrap();
+        }
+    }
     std::fs::create_dir_all(join.join("bin")).unwrap();
     let compiler = join.join("bin/rustc");
     std::fs::write(
