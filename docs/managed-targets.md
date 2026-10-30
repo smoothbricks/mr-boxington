@@ -266,6 +266,15 @@ read. The same profile below each target triple the other checkout built is
 copied too, so a target chosen in Cargo configuration is covered. Copies are
 reflinks where the filesystem supports them.
 
+Every profile of the build, the host's and each target's, comes from that one
+checkout. rustc names each dependency of a crate by the crate hash it had in
+the build that compiled the crate, and two checkouts can give the same
+dependency unit different crate hashes. A target's units read the host
+profile's proc macros, so a target profile copied from one checkout beside a
+host profile from another is fresh to Cargo and fails in rustc with `can't find
+crate`. A dependency the build compiles instead of copying is newer than the
+copies that read it, and Cargo rebuilds those.
+
 The pinned mbx binaries that copied build-script launchers use are published
 before any build unit. If copying those binaries fails or is interrupted,
 Cargo never sees a fresh copied unit without its launcher dependency. A later
@@ -279,9 +288,10 @@ under `target/rust-analyzer`, are seeded the same way from that directory in
 the other checkout. The first `cargo check` in a new worktree then checks only
 the workspace's own crates. mbx skips this step when:
 
-- the profile already has a `build/` directory in this checkout
+- this checkout has built the profile, for the host or for any target
 - the Cargo running this build is older than 1.100
-- a build holds the Cargo lock of either profile
+- a build holds the Cargo lock of any of the profiles in either checkout; mbx
+  then tries the next checkout
 - no other checkout was built by Cargo 1.100 or later
 
 Path dependencies and workspace members are never copied. Cargo trusts their
