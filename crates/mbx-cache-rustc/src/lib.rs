@@ -144,6 +144,14 @@ const SUPPORTED_CODEGEN_OPTIONS: &[&str] = &[
     "tls-model",
 ];
 
+/// LLVM options `-C llvm-args` may carry. LLVM takes arbitrary options there,
+/// and some read files or change what the backend writes beside the object,
+/// so only ones described completely by their text are modeled.
+///
+/// `-addrsig` adds an address-significance table to each object, which lets
+/// lld fold identical functions whose addresses are never compared.
+const SUPPORTED_LLVM_ARGUMENTS: &[&str] = &["-addrsig"];
+
 const NATIVE_DIRECTORY_PREDICTION_PREFIX: &str = "@native-directory:";
 const MAX_PREDICTED_INPUTS: usize = 16 * 1024;
 const MAX_NATIVE_INPUT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
@@ -1565,7 +1573,13 @@ impl<'a> Parser<'a> {
                 // Cargo passes `force-unstable-if-unmarked` to every standard
                 // library unit under `-Zbuild-std`. It changes the stability
                 // recorded in the crate's metadata, so it stays in the key.
-                "embed-metadata=no"
+                // `binary-dep-depinfo` adds the dependency artifacts rustc
+                // loaded, sysroot crates included, to the dep-info it writes.
+                // Those files are inputs the key already digests; the flag
+                // changes only the dep-info, which is stored and restored like
+                // any other output.
+                "binary-dep-depinfo"
+                | "embed-metadata=no"
                 | "embed-metadata=yes"
                 | "force-unstable-if-unmarked"
                 | "shell-argfiles"
@@ -1593,6 +1607,18 @@ impl<'a> Parser<'a> {
             // directory's place, kept verbatim like `--remap-path-prefix`'s
             // destination.
             if option.starts_with("remap-cwd-prefix=") {
+                self.parsed.push(Argument::Plain(format!("-Z{option}")));
+                return Ok(());
+            }
+            // Which of a panic's file, line, and column the binary records:
+            // `none`, or a list of them. The text is the whole of it.
+            if let Some(details) = option.strip_prefix("location-detail=")
+                && (details == "none"
+                    || (!details.is_empty()
+                        && details
+                            .split(',')
+                            .all(|detail| matches!(detail, "file" | "line" | "column"))))
+            {
                 self.parsed.push(Argument::Plain(format!("-Z{option}")));
                 return Ok(());
             }
@@ -1704,6 +1730,20 @@ impl<'a> Parser<'a> {
                 flag: "-Cprofile-use".into(),
                 path,
             });
+            return Ok(());
+        }
+        if name == "llvm-args" {
+            let arguments = value.split_once('=').map_or("", |(_, arguments)| arguments);
+            let mut listed = arguments.split_whitespace().peekable();
+            if listed.peek().is_none()
+                || !listed.all(|argument| SUPPORTED_LLVM_ARGUMENTS.contains(&argument))
+            {
+                return Err(BypassReason::UnknownCodegenOption(format!(
+                    "llvm-args={arguments}"
+                )));
+            }
+            self.parsed
+                .push(Argument::Plain(format!("--codegen={value}")));
             return Ok(());
         }
         if SUPPORTED_CODEGEN_OPTIONS.binary_search(&name).is_err()
