@@ -47,9 +47,10 @@ const HOT_STREAK_THRESHOLD: u32 = 3;
 const WORKSPACE_HOT_STREAK_THRESHOLD: u32 = 1;
 
 /// Schema version of the per-checkout churn record. Version 2 fingerprints the
-/// environment a unit reads along with its sources; a version 1 record cannot
-/// be compared with it, so it starts the unit's streak afresh.
-const CHURN_STATE_VERSION: u8 = 2;
+/// environment a unit reads along with its sources; version 3 also records the
+/// commit HEAD named when the unit compiled. An older record cannot be compared
+/// with it, so it starts the unit's streak afresh.
+const CHURN_STATE_VERSION: u8 = 3;
 
 /// Schema version of a private-artifact marker.
 const PRIVATE_ARTIFACT_VERSION: u8 = 1;
@@ -65,7 +66,7 @@ struct LearnedPlan {
     /// Where that state lives, once somewhere to put it has been resolved.
     directory: Option<PathBuf>,
     /// Where to record what this compilation compiled, and what that was.
-    record: Option<(PathBuf, CacheDigest)>,
+    record: Option<ChurnRecord>,
 }
 
 impl LearnedPlan {
@@ -116,10 +117,10 @@ impl LearnedPlan {
     /// edited in between -- look like a crate that had settled, and drop it
     /// back to compiling from scratch.
     fn record_compiled(&self) {
-        let Some((path, sources)) = &self.record else {
+        let Some(record) = &self.record else {
             return;
         };
-        if let Err(error) = write_churn_state(path, sources, self.streak) {
+        if let Err(error) = write_churn_state(record, self.streak) {
             session::report_shim_warning(&format!(
                 "churn was not recorded for this crate: {error:#}"
             ));
@@ -149,6 +150,63 @@ struct ChurnState {
     sources: String,
     /// Consecutive compilations whose sources had changed.
     streak: u32,
+    /// The commit HEAD named when it compiled, for a workspace unit of a Git
+    /// checkout; `None` otherwise.
+    head: Option<String>,
+}
+
+/// What [`LearnedPlan::record_compiled`] writes once the compiler succeeds.
+#[derive(Clone, Debug)]
+struct ChurnRecord {
+    path: PathBuf,
+    sources: CacheDigest,
+    head: Option<String>,
+}
+
+/// How a unit's sources stand against what this checkout last compiled.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Churn {
+    /// Nothing recorded here: a first compilation is evidence of nothing.
+    First,
+    /// The sources it compiled last time.
+    Settled,
+    /// Changed by work in this checkout: under the HEAD the last compilation
+    /// saw, or uncommitted on top of a new one. Carries the streak recorded
+    /// before this change.
+    Edited { streak: u32 },
+    /// Changed because HEAD moved, with nothing of the crate uncommitted. A
+    /// rebase, merge, land or checkout brought history that every checkout at
+    /// that commit compiles alike, so it compiles and publishes normally.
+    Moved,
+}
+
+/// Decide [`Churn`] from what this checkout recorded and what it has now.
+///
+/// `head` is the commit HEAD names for this build, `None` outside Git or for a
+/// crate outside the workspace. A record made without one compares equal to
+/// none, so there every change stays an edit. `uncommitted` says whether the
+/// crate's tracked files differ from HEAD, and is asked only once HEAD moved:
+/// the edit-then-commit loop commits what was built and edits on top, and that
+/// edit is still this checkout's own work.
+fn churn(
+    recorded: Option<&ChurnState>,
+    sources: &CacheDigest,
+    head: Option<&str>,
+    uncommitted: impl FnOnce() -> bool,
+) -> Churn {
+    let Some(recorded) = recorded else {
+        return Churn::First;
+    };
+    if recorded.sources == sources.key() {
+        return Churn::Settled;
+    }
+    if recorded.head.as_deref() == head || uncommitted() {
+        Churn::Edited {
+            streak: recorded.streak,
+        }
+    } else {
+        Churn::Moved
+    }
 }
 
 /// An output this checkout last compiled with private incremental state.
@@ -1572,21 +1630,16 @@ fn install_build_script_shim(
 /// Unchanged sources are therefore never churn, however the compilation got
 /// here. A miss on them means something else lost the result -- a wiped target
 /// directory, a first build in this checkout -- and recompiling normally
-/// republishes it for everyone. The one exception is decided by the caller:
-/// a crate linking an artifact that was itself kept private, see
+/// republishes it for everyone. Neither are sources HEAD brought: see
+/// [`Churn::Moved`]. The one exception is decided by the caller: a crate
+/// linking an artifact that was itself kept private, see
 /// [`links_private_artifact`].
-fn learned_plan(
-    recorded: Option<&ChurnState>,
-    sources: &CacheDigest,
-    enabled: bool,
-    threshold: u32,
-) -> LearnedPlan {
-    let streak = match recorded {
-        Some(recorded) if recorded.sources == sources.key() => 0,
+fn learned_plan(churn: Churn, enabled: bool, threshold: u32) -> LearnedPlan {
+    let streak = match churn {
+        Churn::First | Churn::Settled | Churn::Moved => 0,
         // Capped at the threshold: the streak is a state, not a tally, and
         // letting it climb would only delay noticing that the churn stopped.
-        Some(recorded) => recorded.streak.saturating_add(1).min(threshold),
-        None => 0,
+        Churn::Edited { streak } => streak.saturating_add(1).min(threshold),
     };
     LearnedPlan {
         hot: enabled && streak >= threshold,
@@ -2090,21 +2143,31 @@ fn plan_learned_reuse(
         let Some(state_path) = churn_state_path(&unit) else {
             return Result::<LearnedPlan>::Ok(LearnedPlan::default());
         };
-        let threshold = if source_is_in_workspace(compilation) {
+        let in_workspace = source_is_in_workspace(compilation);
+        let threshold = if in_workspace {
             WORKSPACE_HOT_STREAK_THRESHOLD
         } else {
             HOT_STREAK_THRESHOLD
         };
+        let head = in_workspace.then(session::workspace_head).flatten();
         let plan = learned_plan(
-            read_churn_state(&state_path).as_ref(),
-            &sources,
+            churn(
+                read_churn_state(&state_path).as_ref(),
+                &sources,
+                head.as_deref(),
+                crate_has_uncommitted_changes,
+            ),
             enabled,
             threshold,
         );
         let hot = plan.hot || (enabled && links_private_artifact(compilation));
         Ok(LearnedPlan {
             hot,
-            record: Some((state_path, sources)),
+            record: Some(ChurnRecord {
+                path: state_path,
+                sources,
+                head,
+            }),
             ..plan
         }
         .resolved(compilation, &unit, mode))
@@ -2376,28 +2439,34 @@ fn reuse_hot_workspace_plan(
         }
         let (discovered, absent) = discover_for_churn(compilation, &dep_info)?;
         let sources = churn_fingerprint(compilation, &discovered, &absent);
-        let changed = recorded.sources != sources.key();
-        let edited = changed && recorded.streak >= WORKSPACE_HOT_STREAK_THRESHOLD;
+        let head = session::workspace_head();
+        let change = churn(
+            Some(&recorded),
+            &sources,
+            head.as_deref(),
+            crate_has_uncommitted_changes,
+        );
+        let edited = matches!(
+            change,
+            Churn::Edited { streak } if streak >= WORKSPACE_HOT_STREAK_THRESHOLD
+        );
         if !edited && !links_private_artifact(compilation) {
             return Ok(LearnedPlan::default());
         }
         // The streak keeps counting this unit's own sources, as the slower
         // path would: a unit riding along on a private artifact with settled
-        // sources records no churn of its own.
-        let streak = if changed {
-            recorded
-                .streak
-                .saturating_add(1)
-                .min(WORKSPACE_HOT_STREAK_THRESHOLD)
-        } else {
-            0
-        };
+        // or moved sources records no churn of its own.
+        let streak = learned_plan(change, true, WORKSPACE_HOT_STREAK_THRESHOLD).streak;
         Ok(LearnedPlan {
             hot: true,
             backstop_rejected: false,
             streak,
             directory: None,
-            record: Some((state_path, sources)),
+            record: Some(ChurnRecord {
+                path: state_path,
+                sources,
+                head,
+            }),
         }
         .resolved(compilation, &unit, mode))
     })();
@@ -2488,13 +2557,19 @@ fn record_learned_baseline(compilation: &Compilation<'_>, discovered: &Discovere
         let Some(path) = churn_state_path(&unit) else {
             return Result::<()>::Ok(());
         };
-        let sources = churn_fingerprint(compilation, discovered, &[]);
-        if read_churn_state(&path)
-            .is_some_and(|recorded| recorded.sources == sources.key() && recorded.streak == 0)
-        {
+        let record = ChurnRecord {
+            path,
+            sources: churn_fingerprint(compilation, discovered, &[]),
+            head: session::workspace_head(),
+        };
+        if read_churn_state(&record.path).is_some_and(|recorded| {
+            recorded.sources == record.sources.key()
+                && recorded.streak == 0
+                && recorded.head == record.head
+        }) {
             return Ok(());
         }
-        write_churn_state(&path, &sources, 0)
+        write_churn_state(&record, 0)
     })();
     if let Err(error) = recorded {
         session::report_shim_warning(&format!("initial churn state was not recorded: {error:#}"));
@@ -2608,18 +2683,69 @@ fn read_churn_state(path: &Path) -> Option<ChurnState> {
         .filter(|state| state.version == CHURN_STATE_VERSION)
 }
 
-fn write_churn_state(path: &Path, sources: &CacheDigest, streak: u32) -> Result<()> {
-    if let Some(parent) = path.parent() {
+fn write_churn_state(record: &ChurnRecord, streak: u32) -> Result<()> {
+    if let Some(parent) = record.path.parent() {
         std::fs::create_dir_all(parent)
             .wrap_err("failed to create the incremental state directory")?;
     }
     let state = ChurnState {
         version: CHURN_STATE_VERSION,
-        sources: sources.key(),
+        sources: record.sources.key(),
         streak,
+        head: record.head.clone(),
     };
-    crate::util::write_advisory(path, &serde_json::to_vec(&state)?)
+    crate::util::write_advisory(&record.path, &serde_json::to_vec(&state)?)
         .wrap_err("failed to record what this crate last compiled")
+}
+
+/// Whether the crate Cargo is compiling has tracked files that differ from
+/// HEAD: `git status` over its package directory, untracked files left out.
+///
+/// A check that cannot run answers yes and says why, keeping the crate on the
+/// edit path it took before HEAD was consulted at all.
+fn crate_has_uncommitted_changes() -> bool {
+    let Some(package) = std::env::var_os("CARGO_MANIFEST_DIR") else {
+        session::report_shim_debug(
+            "uncommitted changes were not checked: CARGO_MANIFEST_DIR is unset",
+        );
+        return true;
+    };
+    let status = Command::new("git")
+        .current_dir(&package)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .args([
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=no",
+            "--ignore-submodules=all",
+            "--",
+            ".",
+        ])
+        .stdin(Stdio::null())
+        .stderr(Stdio::piped())
+        .output();
+    match status {
+        Ok(output) if output.status.success() => !output.stdout.is_empty(),
+        Ok(output) => {
+            session::report_shim_debug(&format!(
+                "uncommitted changes were not checked in {}: git status {}: {}",
+                Path::new(&package).display(),
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+            true
+        }
+        Err(error) => {
+            session::report_shim_debug(&format!(
+                "uncommitted changes were not checked in {}: {error}",
+                Path::new(&package).display()
+            ));
+            true
+        }
+    }
 }
 
 fn restore_predicted_result(

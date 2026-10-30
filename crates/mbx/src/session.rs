@@ -116,6 +116,10 @@ pub const CACHE_LINKS_ENV: &str = "MBX_CACHE_LINKS";
 /// Group completed builds for one later cache export, used by CI actions.
 pub const CACHE_EXPORT_GROUP_ENV: &str = "MBX_CACHE_EXPORT_GROUP";
 pub(crate) const WORKSPACE_ROOT_ENV: &str = "MBX_WORKSPACE_ROOT";
+/// The commit HEAD named when the session began, or empty outside Git. The
+/// shim compares it with the one a unit last compiled under to tell an edit
+/// from history a moved HEAD brought.
+pub(crate) const WORKSPACE_HEAD_ENV: &str = "MBX_WORKSPACE_HEAD";
 pub(crate) const TARGET_DIR_ENV: &str = "MBX_TARGET_DIR";
 pub(crate) const BUILD_SCRIPT_REAL_SUFFIX: &str = ".mbx-real";
 const PREVIOUS_RUSTC_WRAPPER_ENV: &str = "MBX_PREVIOUS_RUSTC_WRAPPER";
@@ -483,6 +487,10 @@ impl CacheSession {
             workspace_root.to_string_lossy().into_owned(),
         );
         environment.insert(
+            WORKSPACE_HEAD_ENV.into(),
+            git_head(workspace_root).unwrap_or_default(),
+        );
+        environment.insert(
             TARGET_DIR_ENV.into(),
             target_dir.to_string_lossy().into_owned(),
         );
@@ -763,6 +771,10 @@ impl CacheSession {
         environment.insert(
             WORKSPACE_ROOT_ENV.into(),
             project_root.to_string_lossy().into_owned(),
+        );
+        environment.insert(
+            WORKSPACE_HEAD_ENV.into(),
+            git_head(project_root).unwrap_or_default(),
         );
         // A build tool that runs rustc through mbx's rustc shim hands it an
         // `OUT_DIR` of its own choosing, under a build directory whose path
@@ -2455,6 +2467,38 @@ pub(crate) fn forward_compiler_notifications_requested() -> bool {
 /// state instead of publishing it. Read the same way as verify mode.
 pub(crate) fn learned_incremental_requested() -> bool {
     std::env::var_os(LEARNED_INCREMENTAL_ENV).is_some_and(|value| !value.is_empty() && value != "0")
+}
+
+/// The commit HEAD named when this build began, if the workspace is a Git
+/// checkout with one.
+pub(crate) fn workspace_head() -> Option<String> {
+    std::env::var(WORKSPACE_HEAD_ENV)
+        .ok()
+        .filter(|head| !head.is_empty())
+}
+
+/// The commit HEAD names in the Git checkout holding `root`, if there is one.
+///
+/// Read once per session rather than by each shim: every compilation of one
+/// build compares against the same commit, and a commit made mid-build is the
+/// next build's.
+fn git_head(root: &Path) -> Option<String> {
+    let output = Command::new("git")
+        .current_dir(root)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .args(["rev-parse", "--verify", "--quiet", "HEAD^{commit}"])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let head = String::from_utf8(output.stdout).ok()?;
+    let head = head.trim();
+    (!head.is_empty() && head.bytes().all(|byte| byte.is_ascii_hexdigit())).then(|| head.to_owned())
 }
 
 /// Whether private state may be made portable automatically.

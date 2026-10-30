@@ -308,64 +308,126 @@ fn a_notification_is_forwarded_before_the_compiler_exits() {
     assert_eq!(seen.bytes(), output.stderr);
 }
 
-fn churn(sources: &str, streak: u32) -> ChurnState {
+fn recorded(sources: &str, streak: u32, head: Option<&str>) -> ChurnState {
     ChurnState {
         version: CHURN_STATE_VERSION,
         sources: CacheDigest::blake3(sources.as_bytes()).key(),
         streak,
+        head: head.map(str::to_owned),
     }
+}
+
+/// Never asked: the decision had what it needed before HEAD came into it.
+fn not_asked() -> bool {
+    panic!("uncommitted changes were checked although HEAD did not decide")
+}
+
+/// What separates this checkout's own edits from history a moved HEAD brought,
+/// row by row.
+#[test]
+fn a_change_is_an_edit_only_under_the_same_head_or_when_uncommitted() {
+    let now = CacheDigest::blake3(b"current sources");
+    let older = |head| recorded("older sources", 1, head);
+
+    // Nothing recorded, or the same sources: HEAD never comes into it.
+    assert_eq!(churn(None, &now, Some("b"), not_asked), Churn::First);
+    assert_eq!(
+        churn(
+            Some(&recorded("current sources", 1, Some("a"))),
+            &now,
+            Some("b"),
+            not_asked
+        ),
+        Churn::Settled
+    );
+    // Changed under the HEAD the last build saw: an edit.
+    assert_eq!(
+        churn(Some(&older(Some("a"))), &now, Some("a"), not_asked),
+        Churn::Edited { streak: 1 }
+    );
+    // Outside Git, as before HEAD was consulted: every change is an edit.
+    assert_eq!(
+        churn(Some(&older(None)), &now, None, not_asked),
+        Churn::Edited { streak: 1 }
+    );
+    // HEAD moved and the crate is clean: a rebase, a land or a checkout
+    // brought it, so it compiles and publishes like any other miss.
+    assert_eq!(
+        churn(Some(&older(Some("a"))), &now, Some("b"), || false),
+        Churn::Moved
+    );
+    assert_eq!(
+        churn(Some(&older(None)), &now, Some("b"), || false),
+        Churn::Moved
+    );
+    // HEAD moved under uncommitted work: what was built is committed and the
+    // edit goes on, so the private state keeps paying for itself.
+    assert_eq!(
+        churn(Some(&older(Some("a"))), &now, Some("b"), || true),
+        Churn::Edited { streak: 1 }
+    );
 }
 
 /// The streak is what separates a crate someone is editing from one that merely
 /// lost its result, and it only counts while that crate's own sources move.
 #[test]
-fn only_a_run_of_changed_sources_earns_incremental_state() {
-    let now = CacheDigest::blake3(b"current sources");
+fn only_a_run_of_edits_earns_incremental_state() {
+    // A first compilation in a checkout is not evidence of anything, and
+    // neither is a wiped target directory or a recompile of settled sources.
+    for change in [Churn::First, Churn::Settled] {
+        let plan = learned_plan(change, true, HOT_STREAK_THRESHOLD);
+        assert_eq!(plan.streak, 0);
+        assert!(!plan.hot);
+    }
 
-    // Nothing recorded here yet: a first compilation in a checkout is not
-    // evidence of anything, and neither is a wiped target directory.
-    assert_eq!(
-        learned_plan(None, &now, true, HOT_STREAK_THRESHOLD).streak,
-        0
-    );
-
-    // Recorded against the sources this compilation already has, so nobody
-    // edited it -- something else lost the result, and recompiling normally
-    // restores it for everyone.
-    let unchanged = churn("current sources", HOT_STREAK_THRESHOLD);
-    let plan = learned_plan(Some(&unchanged), &now, true, HOT_STREAK_THRESHOLD);
-    assert_eq!(plan.streak, 0);
-    assert!(!plan.hot);
-
-    // Changed sources climb the streak, and only its last step is hot.
+    // Edits climb the streak, and only its last step is hot.
     for previous in 0..HOT_STREAK_THRESHOLD - 1 {
-        let recorded = churn("older sources", previous);
-        let plan = learned_plan(Some(&recorded), &now, true, HOT_STREAK_THRESHOLD);
+        let plan = learned_plan(
+            Churn::Edited { streak: previous },
+            true,
+            HOT_STREAK_THRESHOLD,
+        );
         assert_eq!(plan.streak, previous + 1);
         assert!(!plan.hot);
     }
-    let recorded = churn("older sources", HOT_STREAK_THRESHOLD - 1);
-    assert!(learned_plan(Some(&recorded), &now, true, HOT_STREAK_THRESHOLD).hot);
+    assert!(
+        learned_plan(
+            Churn::Edited {
+                streak: HOT_STREAK_THRESHOLD - 1
+            },
+            true,
+            HOT_STREAK_THRESHOLD
+        )
+        .hot
+    );
 
     // The streak is a state rather than a tally, so it stops at the threshold.
-    let saturated = churn("older sources", HOT_STREAK_THRESHOLD);
+    let saturated = Churn::Edited {
+        streak: HOT_STREAK_THRESHOLD,
+    };
     assert_eq!(
-        learned_plan(Some(&saturated), &now, true, HOT_STREAK_THRESHOLD).streak,
+        learned_plan(saturated, true, HOT_STREAK_THRESHOLD).streak,
         HOT_STREAK_THRESHOLD
     );
 
     // Disabled, the streak is still tracked so that enabling it later works.
-    let plan = learned_plan(Some(&saturated), &now, false, HOT_STREAK_THRESHOLD);
+    let plan = learned_plan(saturated, false, HOT_STREAK_THRESHOLD);
     assert_eq!(plan.streak, HOT_STREAK_THRESHOLD);
+    assert!(!plan.hot);
+
+    // History a moved HEAD brought ends the streak, however hot it was.
+    let plan = learned_plan(Churn::Moved, true, WORKSPACE_HOT_STREAK_THRESHOLD);
+    assert_eq!(plan.streak, 0);
     assert!(!plan.hot);
 }
 
 #[test]
-fn one_changed_workspace_source_is_hot() {
-    let now = CacheDigest::blake3(b"current sources");
-    let recorded = churn("older sources", 0);
-
-    let plan = learned_plan(Some(&recorded), &now, true, WORKSPACE_HOT_STREAK_THRESHOLD);
+fn one_edited_workspace_source_is_hot() {
+    let plan = learned_plan(
+        Churn::Edited { streak: 0 },
+        true,
+        WORKSPACE_HOT_STREAK_THRESHOLD,
+    );
 
     assert_eq!(plan.streak, 1);
     assert!(plan.hot);
@@ -405,17 +467,27 @@ fn private_artifacts_are_recognized_only_while_marked() {
 #[test]
 fn an_unreadable_record_is_no_record() {
     let directory = tempfile::tempdir().unwrap();
-    let path = directory.path().join("state.json");
-    let sources = CacheDigest::blake3(b"sources");
+    let record = ChurnRecord {
+        path: directory.path().join("state.json"),
+        sources: CacheDigest::blake3(b"sources"),
+        head: Some("0123abcd".into()),
+    };
+    let path = &record.path;
 
-    write_churn_state(&path, &sources, 2).unwrap();
-    assert_eq!(read_churn_state(&path).unwrap().streak, 2);
+    write_churn_state(&record, 2).unwrap();
+    let written = read_churn_state(path).unwrap();
+    assert_eq!(written.streak, 2);
+    assert_eq!(written.head.as_deref(), Some("0123abcd"));
 
-    std::fs::write(&path, br#"{"version":99,"sources":"x","streak":3}"#).unwrap();
-    assert!(read_churn_state(&path).is_none());
+    // A version 2 record predates the HEAD it would be compared under.
+    std::fs::write(path, br#"{"version":2,"sources":"x","streak":3}"#).unwrap();
+    assert!(read_churn_state(path).is_none());
 
-    std::fs::write(&path, b"not json").unwrap();
-    assert!(read_churn_state(&path).is_none());
+    std::fs::write(path, br#"{"version":99,"sources":"x","streak":3}"#).unwrap();
+    assert!(read_churn_state(path).is_none());
+
+    std::fs::write(path, b"not json").unwrap();
+    assert!(read_churn_state(path).is_none());
 }
 
 #[test]

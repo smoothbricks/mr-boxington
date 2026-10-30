@@ -3157,6 +3157,66 @@ fn a_workspace_crate_is_incremental_on_its_first_edit_and_mbx_clean_resets_it() 
     );
 }
 
+/// A checkout whose tree moves by Git -- main after a land, a train after a
+/// rebase, a gate -- edits nothing, so the crates the new commit changed compile
+/// and publish like any miss, and the next checkout at that commit restores
+/// them. Work in the checkout stays private: an edit under the HEAD its last
+/// build saw, and the edit-then-commit loop, which commits what was built and
+/// edits on top of the new HEAD.
+#[test]
+fn a_change_a_moved_head_brought_publishes_and_uncommitted_edits_stay_private() {
+    let store = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let reports = tempfile::tempdir().unwrap();
+    write_project(project.path());
+    std::fs::write(project.path().join(".gitignore"), "target\n").unwrap();
+    let git = |arguments: &[&str]| fixture_git(project.path(), arguments);
+    git(&["init", "-q", "-b", "main"]);
+    git(&["add", "-A"]);
+    git(&["commit", "-q", "-m", "initial"]);
+    let build = |name: &str| {
+        build(
+            project.path(),
+            store.path(),
+            &reports.path().join(format!("{name}.json")),
+        )
+    };
+
+    let cold = build("cold");
+    assert_eq!(compiled_incrementally(&cold), 0, "{cold}");
+
+    // A landed change: HEAD moves and nothing is uncommitted.
+    edit_project(project.path(), 1);
+    git(&["commit", "-q", "-am", "landed"]);
+    let landed = build("landed");
+    assert_eq!(
+        compiled_incrementally(&landed),
+        0,
+        "a change HEAD brought is no edit: {landed}"
+    );
+    assert!(
+        landed["stored_bytes"].as_u64().unwrap_or(0) > 0,
+        "the landed change should be published for the next checkout: {landed}"
+    );
+
+    // An edit under that HEAD is this checkout's own work.
+    edit_project(project.path(), 2);
+    let edited = build("edited");
+    assert!(compiled_incrementally(&edited) > 0, "{edited}");
+    assert_eq!(edited["stored_bytes"].as_u64(), Some(0), "{edited}");
+
+    // Commit what was built and edit on top: HEAD moved, but the change is
+    // uncommitted work, so the crate keeps its private state.
+    git(&["commit", "-q", "-am", "edited"]);
+    edit_project(project.path(), 3);
+    let next = build("next");
+    assert!(
+        compiled_incrementally(&next) > 0,
+        "the edit after a commit should stay incremental: {next}"
+    );
+    assert_eq!(next["stored_bytes"].as_u64(), Some(0), "{next}");
+}
+
 /// The finished rustc sessions of one checkout's learned units:
 /// `<state>/blake3/<unit>/<crate>/s-...`, without those still being written.
 fn finished_learned_sessions(state: &Path) -> Vec<PathBuf> {
