@@ -3455,7 +3455,6 @@ pub(crate) fn scheduler_activity_report(config: &Config) -> SchedulerActivityRep
     }
 }
 
-
 fn scheduler_snapshot(
     dir: &Path,
     capacity: u64,

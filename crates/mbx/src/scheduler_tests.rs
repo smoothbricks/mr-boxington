@@ -23,7 +23,6 @@ pub(super) fn record_after_write(path: &Path) {
     });
 }
 
-
 fn wait_until(description: &str, mut ready: impl FnMut() -> bool) {
     // Wait for the event itself; the deadline only catches a stuck worker.
     let started = Instant::now();
@@ -2484,7 +2483,11 @@ fn scheduler_stats_rank_live_waiters_by_ticket_and_exclude_grants() {
 
     let json = serde_json::to_value(scheduler_snapshot(directory.path(), 1, 0, true)).unwrap();
     let activity = json["activity"].as_array().unwrap();
-    assert_eq!(activity.len(), 5, "granted and released rows are not pending");
+    assert_eq!(
+        activity.len(),
+        5,
+        "granted and released rows are not pending"
+    );
     let row = |name: &str| activity.iter().find(|row| row["name"] == name).unwrap();
     for (name, ticket, position, pid) in [
         ("first", 10, 1, 42001),
@@ -2515,7 +2518,10 @@ fn scheduler_stats_rank_live_waiters_by_ticket_and_exclude_grants() {
     let row = |name: &str| activity.iter().find(|row| row["name"] == name).unwrap();
     assert_eq!(row("first")["kind"], "lease");
     for field in ["pid", "ticket", "queue_position", "live"] {
-        assert!(row("first")[field].is_null(), "granted lease has no {field}");
+        assert!(
+            row("first")[field].is_null(),
+            "granted lease has no {field}"
+        );
     }
     assert_eq!(row("unknown")["queue_position"], 1);
     assert_eq!(row("second")["queue_position"], 2);
@@ -2532,7 +2538,11 @@ fn scheduler_stats_observe_queued_identity_with_events_disabled() {
     pool.events = false;
     let held = pool.try_admit(1, None).unwrap().unwrap();
     let mut queued = None;
-    assert!(pool.try_admit_queued(1, None, &mut queued).unwrap().is_none());
+    assert!(
+        pool.try_admit_queued(1, None, &mut queued)
+            .unwrap()
+            .is_none()
+    );
     let json = serde_json::to_value(scheduler_snapshot(directory.path(), 1, 0, true)).unwrap();
     let row = json["activity"]
         .as_array()
@@ -2575,7 +2585,10 @@ fn scheduler_stats_observe_a_new_waiter_only_under_its_publication_lock() {
         assert_eq!(row["pid"], std::process::id());
         assert_eq!(row["ticket"], 1);
         assert_eq!(row["queue_position"], 1);
-        assert_eq!(row["live"], true, "published bytes must already be owned: {json}");
+        assert_eq!(
+            row["live"], true,
+            "published bytes must already be owned: {json}"
+        );
         assert_eq!(std::fs::read(path).unwrap(), bytes);
         OBSERVED.with(|observed| observed.set(true));
     }
@@ -2586,10 +2599,17 @@ fn scheduler_stats_observe_a_new_waiter_only_under_its_publication_lock() {
     let held = pool.try_admit(1, None).unwrap().unwrap();
     let mut queued = None;
     RECORD_AFTER_WRITE.with(|probe| probe.set(Some(inspect_after_write)));
-    assert!(pool.try_admit_queued(1, None, &mut queued).unwrap().is_none());
+    assert!(
+        pool.try_admit_queued(1, None, &mut queued)
+            .unwrap()
+            .is_none()
+    );
     RECORD_AFTER_WRITE.with(|probe| probe.set(None));
     assert!(OBSERVED.with(|observed| observed.replace(false)));
-    assert!(queued.is_some(), "observation must not refuse queue publication");
+    assert!(
+        queued.is_some(),
+        "observation must not refuse queue publication"
+    );
     drop(queued);
     drop(held);
 }
@@ -2610,7 +2630,11 @@ fn scheduler_stats_omit_a_waiter_granted_after_its_record_was_read() {
     let pool = pool_at(directory.path(), 1, 0);
     let held = pool.try_admit(1, None).unwrap().unwrap();
     let mut queued = None;
-    assert!(pool.try_admit_queued(1, None, &mut queued).unwrap().is_none());
+    assert!(
+        pool.try_admit_queued(1, None, &mut queued)
+            .unwrap()
+            .is_none()
+    );
     drop(held);
     SNAPSHOT_AFTER_READ.with(|probe| probe.set(Some(grant_after_read)));
     let json = serde_json::to_value(scheduler_snapshot(directory.path(), 1, 0, true)).unwrap();
@@ -2635,13 +2659,20 @@ fn scheduler_stats_activity_only_excludes_history_and_full_report_fields() {
     let pool = pool_at(&config.cache_dir.join(SCHEDULER_DIR), 1, 0);
     let held = pool.try_admit(1, None).unwrap().unwrap();
     let mut queued = None;
-    assert!(pool.try_admit_queued(1, None, &mut queued).unwrap().is_none());
+    assert!(
+        pool.try_admit_queued(1, None, &mut queued)
+            .unwrap()
+            .is_none()
+    );
     let ledger_reads = LEDGER_READS.with(|reads| reads.get());
     let summary_reads = REPORT_SUMMARY_READS.with(|reads| reads.get());
 
     let json = serde_json::to_value(scheduler_activity_report(&config)).unwrap();
     assert_eq!(LEDGER_READS.with(|reads| reads.get()), ledger_reads);
-    assert_eq!(REPORT_SUMMARY_READS.with(|reads| reads.get()), summary_reads);
+    assert_eq!(
+        REPORT_SUMMARY_READS.with(|reads| reads.get()),
+        summary_reads
+    );
     assert_eq!(json.as_object().unwrap().len(), 2);
     assert_eq!(json["version"], 2);
     assert_eq!(json["scheduler"].as_object().unwrap().len(), 1);
@@ -2659,7 +2690,10 @@ fn scheduler_stats_activity_only_excludes_history_and_full_report_fields() {
 
     let _full_report = scheduler_report(&config);
     assert!(LEDGER_READS.with(|reads| reads.get()) > ledger_reads);
-    assert_eq!(REPORT_SUMMARY_READS.with(|reads| reads.get()), summary_reads + 2);
+    assert_eq!(
+        REPORT_SUMMARY_READS.with(|reads| reads.get()),
+        summary_reads + 2
+    );
     drop(queued);
     drop(held);
 }
