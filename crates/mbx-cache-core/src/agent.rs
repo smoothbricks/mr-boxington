@@ -41,8 +41,8 @@ pub use manifest::{
     update_task_predictions_in_order as merge_task_action_predictions,
 };
 use manifest::{
-    merge_task_manifests, task_manifest_dir, update_task_predictions, validate_task_identity,
-    validate_task_manifest,
+    exposed_predictions, merge_task_manifests, task_manifest_dir, update_task_predictions,
+    validate_task_identity, validate_task_manifest,
 };
 pub use stats::{AgentStats, CompilerStats};
 use wire::MAX_REQUEST_BYTES;
@@ -60,6 +60,10 @@ const MAX_TASK_ACTION_PREDICTIONS: usize = 16 * 1024;
 /// 16 MiB limit so whatever is published can always be read back.
 const MAX_TASK_MANIFEST_BYTES: usize = 15 * 1024 * 1024;
 const TASK_ACTION_LRU_REFRESH_MARGIN: usize = MAX_TASK_ACTION_PREDICTIONS / 16;
+/// The oldest entries' share of the byte budget that a hit-only run refreshes,
+/// in the same proportion as the entry margin. A manifest of large predictions
+/// reaches its byte budget long before its entry cap.
+const TASK_MANIFEST_LRU_REFRESH_BYTE_MARGIN: usize = MAX_TASK_MANIFEST_BYTES / 16;
 /// Longest shim diagnostic the agent accepts, in bytes.
 const MAX_DIAGNOSTIC_BYTES: usize = 4 * 1024;
 /// Most distinct shim diagnostics one session surfaces before going quiet.
@@ -540,6 +544,9 @@ struct TaskActionState {
     remote_publication_needed: bool,
     prefetched_adapters: BTreeSet<String>,
     remote_etag: Option<String>,
+    /// The baseline's oldest entries the next pruning could retire; see
+    /// [`exposed_predictions`].
+    exposed: BTreeSet<CacheDigest>,
 }
 
 /// Match an invocation and, on an adapter's first match, select its prefetch wave.
@@ -629,8 +636,19 @@ fn effective_task_updates(
         .collect()
 }
 
-fn should_refresh_task_prediction_order(prediction_count: usize, has_recorded: bool) -> bool {
-    has_recorded && prediction_count >= MAX_TASK_ACTION_PREDICTIONS - TASK_ACTION_LRU_REFRESH_MARGIN
+/// Whether a commit that only hit should still rewrite the manifest, moving
+/// what it hit to the back of the durable LRU order.
+///
+/// Only a hit among the entries the next pruning could retire changes what it
+/// retires. A hit anywhere else leaves the manifest as it was found, so a
+/// manifest held at its byte budget is not rewritten on every command.
+fn should_refresh_task_prediction_order(
+    exposed: &BTreeSet<CacheDigest>,
+    recorded: &BTreeMap<CacheDigest, ActionPrediction>,
+) -> bool {
+    recorded
+        .keys()
+        .any(|invocation| exposed.contains(invocation))
 }
 
 /// Choose the last remotely observed value for every prediction this run
@@ -1208,6 +1226,10 @@ impl CacheAgent {
                 (manifest, None, inherited)
             }
         };
+        let exposed = match &manifest {
+            Some(manifest) => exposed_predictions(&manifest.predictions)?,
+            None => BTreeSet::new(),
+        };
         let mut state = if let Some(manifest) = manifest {
             let write_only_baseline = self.remote_mode.writes()
                 && !self.remote_mode.reads()
@@ -1224,6 +1246,7 @@ impl CacheAgent {
                 changed_predictions: BTreeMap::new(),
                 remote_predictions,
                 remote_manifest: remote_publication_base,
+                exposed,
                 remote_publication_needed: self.remote.is_some()
                     && self.remote_mode.writes()
                     && (remote_missing || inherited || write_only_baseline),
@@ -1450,9 +1473,8 @@ impl CacheAgent {
             if !state.baseline_loaded {
                 bail!("task action manifest baseline was not loaded");
             }
-            // A hit-only run leaves a comfortably bounded manifest as it found
-            // it. Refresh durable LRU order only near the cap, where it can
-            // affect the next pruning decision, or when this task identity
+            // A hit-only run leaves the manifest as it found it unless it hit
+            // an entry the next pruning could retire, or this task identity
             // still needs its first remote publication.
             debug!(
                 "committing {} changed of {} recorded predictions for {}",
@@ -1460,10 +1482,8 @@ impl CacheAgent {
                 state.pending_predictions.len(),
                 state.manifest
             );
-            let refresh_hit_order = should_refresh_task_prediction_order(
-                state.predictions.len(),
-                !state.pending_predictions.is_empty(),
-            );
+            let refresh_hit_order =
+                should_refresh_task_prediction_order(&state.exposed, &state.pending_predictions);
             if state.changed_predictions.is_empty()
                 && !refresh_hit_order
                 && !state.remote_publication_needed
@@ -1535,10 +1555,7 @@ impl CacheAgent {
             .collect::<Vec<_>>();
         if write_only
             && state.changed_predictions.is_empty()
-            && !should_refresh_task_prediction_order(
-                state.predictions.len(),
-                !state.pending_predictions.is_empty(),
-            )
+            && !should_refresh_task_prediction_order(&state.exposed, &state.pending_predictions)
             && !state.remote_publication_needed
         {
             self.task_actions.lock().unwrap().remove(run);

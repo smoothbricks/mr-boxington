@@ -1,10 +1,58 @@
-use super::{MAX_TASK_ACTION_PREDICTIONS, MAX_TASK_MANIFEST_BYTES, TASK_ACTION_MANIFEST_VERSION};
+use super::{
+    MAX_TASK_ACTION_PREDICTIONS, MAX_TASK_MANIFEST_BYTES, TASK_ACTION_LRU_REFRESH_MARGIN,
+    TASK_ACTION_MANIFEST_VERSION, TASK_MANIFEST_LRU_REFRESH_BYTE_MARGIN,
+};
 use crate::{ActionPrediction, CacheDigest, TaskActionManifest, canonical_json};
 use eyre::{Context, Result, bail};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
+
+/// Each prediction's share of a serialized manifest: its canonical JSON and
+/// the separator after it.
+fn prediction_sizes(predictions: &[ActionPrediction]) -> Result<Vec<usize>> {
+    predictions
+        .iter()
+        .map(|prediction| Ok(canonical_json(prediction)?.len() + 1))
+        .collect()
+}
+
+/// The oldest predictions the next pruning could retire, oldest first.
+///
+/// Near the entry cap that is the oldest refresh-margin's worth of entries;
+/// near the byte budget, the oldest entries covering the byte refresh margin;
+/// near neither, none. Sizes are measured as pruning measures them.
+pub(super) fn exposed_predictions(
+    predictions: &[ActionPrediction],
+) -> Result<BTreeSet<CacheDigest>> {
+    let sizes = prediction_sizes(predictions)?;
+    let by_count =
+        if predictions.len() >= MAX_TASK_ACTION_PREDICTIONS - TASK_ACTION_LRU_REFRESH_MARGIN {
+            TASK_ACTION_LRU_REFRESH_MARGIN
+        } else {
+            0
+        };
+    let total = TASK_MANIFEST_OVERHEAD_BYTES + sizes.iter().sum::<usize>();
+    let by_bytes = if total >= MAX_TASK_MANIFEST_BYTES - TASK_MANIFEST_LRU_REFRESH_BYTE_MARGIN {
+        let mut covered = 0;
+        sizes
+            .iter()
+            .take_while(|size| {
+                let before = covered;
+                covered += **size;
+                before < TASK_MANIFEST_LRU_REFRESH_BYTE_MARGIN
+            })
+            .count()
+    } else {
+        0
+    };
+    Ok(predictions
+        .iter()
+        .take(by_count.max(by_bytes))
+        .map(|prediction| prediction.invocation.clone())
+        .collect())
+}
 
 /// Whether `task` is a well-formed task action identity.
 ///
@@ -171,10 +219,7 @@ pub fn update_task_predictions_in_order(
     // payload is adapter-defined. The remote reader refuses anything over its
     // own byte limit, so retire the oldest unprotected entries until what is
     // published fits.
-    let sizes = kept
-        .iter()
-        .map(|prediction| Ok(canonical_json(prediction)?.len() + 1))
-        .collect::<Result<Vec<_>>>()?;
+    let sizes = prediction_sizes(&kept)?;
     let mut total: usize = TASK_MANIFEST_OVERHEAD_BYTES + sizes.iter().sum::<usize>();
     if total > MAX_TASK_MANIFEST_BYTES {
         let mut retained = Vec::with_capacity(kept.len());
