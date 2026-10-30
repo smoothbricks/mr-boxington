@@ -2504,6 +2504,21 @@ fn record_bypass(error: &eyre::Report) {
     let _ = request_agent(&[AgentRequest::RecordBypass { kind: kind.into() }, diagnostic]);
 }
 
+/// rustc succeeded but its result could not be stored: say why, in the bypass
+/// log under the crate's name, as a C compilation's publication failure is
+/// said. The compilation already recorded its outcome, so nothing is counted
+/// a second time.
+pub(crate) fn report_rustc_store_failure(crate_name: &str, error: &eyre::Report) {
+    let reason = error.downcast_ref::<mbx_cache_rustc::BypassReason>();
+    append_bypass_log(
+        Some(crate_name),
+        reason.map_or("other", mbx_cache_rustc::BypassReason::kind),
+        error,
+        reason.and_then(mbx_cache_rustc::BypassReason::remediation),
+    );
+    report_shim_warning(&format!("result was not stored: {error:#}"));
+}
+
 /// Tell the session that a C or C++ compilation was not cacheable.
 ///
 /// Kinds are prefixed so that a reason the two adapters share by name, such as

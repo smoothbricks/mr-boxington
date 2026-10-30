@@ -81,6 +81,11 @@ out routine compiler probes (`compiler-query`, `standard-input`, and their `cc-`
 counterparts). The full summary (`MBX_SUMMARY=full`) groups bypasses by reason;
 set `MBX_BYPASS_LOG` to a file path for the per-action record.
 
+A compilation that ran but whose result could not be stored, such as one whose
+dep-info named a file outside every mapped root, is recorded in that file too:
+one line with the reason and the crate or C source as `unit=<name>`. It is not
+counted as a bypass as well, since it already counted as a compilation.
+
 To collect those records for one Cargo command, run it through `mbx explain`. It
 groups identical causes and prints guidance for every bypass category:
 
