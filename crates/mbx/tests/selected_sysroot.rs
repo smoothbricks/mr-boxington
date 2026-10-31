@@ -387,7 +387,10 @@ printf 'target/libfixture.rmeta: lib.rs\n' > target/fixture.d
 /// resolves into `rust-src`'s own store path, outside the join.
 #[test]
 fn a_build_std_unit_of_a_joined_toolchain_stores_and_restores() {
-    build_std_unit_of_a_joined_toolchain_stores_and_restores(Leaves::Directories);
+    build_std_unit_of_a_joined_toolchain_stores_and_restores(
+        Leaves::Directories,
+        Reached::Directly,
+    );
 }
 
 /// The join as Nix lays it out on the host whose wasm build-std units were not
@@ -396,11 +399,28 @@ fn a_build_std_unit_of_a_joined_toolchain_stores_and_restores() {
 /// `/nix/store/<hash>-rust-nightly-<version>-<version>/lib/rustlib/src/rust/library/<crate>/src/lib.rs`.
 #[test]
 fn a_build_std_unit_of_a_nix_join_whose_files_are_links_stores_and_restores() {
-    build_std_unit_of_a_joined_toolchain_stores_and_restores(Leaves::Files);
+    build_std_unit_of_a_joined_toolchain_stores_and_restores(Leaves::Files, Reached::Directly);
 }
 
-/// The store names of that host's toolchain join and the `rust-src` it joins.
+/// The host whose wasm build-std units were still not stored on 2026-10-31:
+/// Cargo runs a bare `rustc` that `PATH` finds in a devenv profile, whose
+/// `bin/rustc` and `lib/rustlib` link into the join. rustc finds its sysroot
+/// in the join and Cargo names the sources by it, while the profile holds a
+/// `lib/rustlib` of its own. A toolchain update relinks the profile into
+/// another join, whose unit compiles again and is then restored: equal version
+/// text and sources do not make it the first installation.
+#[test]
+fn a_build_std_unit_of_a_nix_join_found_through_a_profile_stores_and_restores() {
+    build_std_unit_of_a_joined_toolchain_stores_and_restores(
+        Leaves::Files,
+        Reached::ThroughProfile,
+    );
+}
+
+/// The store names of that host's toolchain join and the `rust-src` it joins,
+/// and of the join the AxE shell's profile linked next.
 const RUST_NIGHTLY: &str = "dh0b8lj8avd02zizqd7xb452z5fp13i0-rust-nightly-1.101.0-nightly-2026-10-04-1.101.0-nightly-2026-10-04";
+const NEXT_RUST_NIGHTLY: &str = "1kjmckrlwgq5202zbjb4gbn1sbr9ixdw-rust-nightly-1.101.0-nightly-2026-10-12-1.101.0-nightly-2026-10-12";
 const RUST_SRC: &str =
     "1p78ifxxkym8ad99nw8x4x0mhzy0v25q-rust-src-1.101.0-nightly-2026-10-04-aarch64-apple-darwin";
 
@@ -413,31 +433,25 @@ enum Leaves {
     Files,
 }
 
-fn build_std_unit_of_a_joined_toolchain_stores_and_restores(leaves: Leaves) {
-    let directory = tempfile::tempdir().unwrap();
-    let root = directory.path().canonicalize().unwrap();
-    let workspace = root.join("workspace");
-    let deps = workspace.join("target/debug/deps");
-    std::fs::create_dir_all(&workspace).unwrap();
-    std::fs::create_dir_all(root.join("home")).unwrap();
-    std::fs::create_dir_all(root.join("shims")).unwrap();
-    let shim = mbx::session::install_shim(
-        Path::new(env!("CARGO_BIN_EXE_mbx")),
-        &root.join("shims"),
-        mbx::session::ShimLink::Tracking,
-    )
-    .unwrap();
-    let source = root.join(format!(
-        "nix/store/{RUST_SRC}/lib/rustlib/src/rust/library/core/src"
-    ));
-    std::fs::create_dir_all(&source).unwrap();
-    std::fs::write(source.join("lib.rs"), "#![no_std]\n").unwrap();
-    let join = root.join(format!("nix/store/{RUST_NIGHTLY}"));
+/// How Cargo reaches the toolchain's compiler.
+#[derive(Clone, Copy)]
+enum Reached {
+    /// By the join's own `bin/rustc`.
+    Directly,
+    /// As a bare `rustc` that `PATH` finds in a profile linking into the join.
+    ThroughProfile,
+}
+
+/// The toolchain join `name` in `root`'s `nix/store`: `core`'s sources link
+/// into `source` as `leaves` lays them out, and its `bin/rustc` compiles a
+/// build-std unit by copying the source into `libcore.rmeta`.
+fn joined_toolchain(root: &Path, name: &str, source: &Path, leaves: Leaves) -> PathBuf {
+    let join = root.join(format!("nix/store/{name}"));
     let core = join.join("lib/rustlib/src/rust/library/core");
     match leaves {
         Leaves::Directories => {
             std::fs::create_dir_all(&core).unwrap();
-            symlink(&source, core.join("src")).unwrap();
+            symlink(source, core.join("src")).unwrap();
         }
         Leaves::Files => {
             std::fs::create_dir_all(core.join("src")).unwrap();
@@ -475,12 +489,66 @@ printf '%s: %s\n%s: %s\n\n%s:\n' "$out/core.d" "$source" "$out/libcore.rmeta" "$
     )
     .unwrap();
     std::fs::set_permissions(&compiler, std::fs::Permissions::from_mode(0o755)).unwrap();
+    join
+}
+
+/// Links a profile's `bin/rustc` and `lib/rustlib/src` into `join`, as Nix
+/// links a profile's leaves into the toolchain it holds, replacing the links
+/// to the toolchain it held before.
+fn link_profile(profile: &Path, join: &Path) {
+    for leaf in ["bin/rustc", "lib/rustlib/src"] {
+        let link = profile.join(leaf);
+        if link.is_symlink() {
+            std::fs::remove_file(&link).unwrap();
+        }
+        symlink(join.join(leaf), link).unwrap();
+    }
+}
+
+fn build_std_unit_of_a_joined_toolchain_stores_and_restores(leaves: Leaves, reached: Reached) {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let workspace = root.join("workspace");
+    let deps = workspace.join("target/debug/deps");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::create_dir_all(root.join("home")).unwrap();
+    std::fs::create_dir_all(root.join("shims")).unwrap();
+    let shim = mbx::session::install_shim(
+        Path::new(env!("CARGO_BIN_EXE_mbx")),
+        &root.join("shims"),
+        mbx::session::ShimLink::Tracking,
+    )
+    .unwrap();
+    let source = root.join(format!(
+        "nix/store/{RUST_SRC}/lib/rustlib/src/rust/library/core/src"
+    ));
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(source.join("lib.rs"), "#![no_std]\n").unwrap();
+    let join = joined_toolchain(&root, RUST_NIGHTLY, &source, leaves);
+    let profile = root.join("nix/store/devenv-profile");
+    let (spelled, path) = match reached {
+        Reached::Directly => (
+            join.join("bin/rustc").into_os_string(),
+            std::env::var_os("PATH").unwrap(),
+        ),
+        Reached::ThroughProfile => {
+            std::fs::create_dir_all(profile.join("bin")).unwrap();
+            std::fs::create_dir_all(profile.join("lib/rustlib")).unwrap();
+            link_profile(&profile, &join);
+            let mut path = profile.join("bin").into_os_string();
+            path.push(":");
+            path.push(std::env::var_os("PATH").unwrap());
+            ("rustc".into(), path)
+        }
+    };
     let compiles = root.join("compiles");
-    let compile = || {
+    let compiled = || std::fs::read_to_string(&compiles).unwrap().lines().count();
+    let compile = |join: &Path| {
+        let core = join.join("lib/rustlib/src/rust/library/core");
         let output = Command::new(&shim)
             .current_dir(&core)
             .env_clear()
-            .env("PATH", std::env::var_os("PATH").unwrap())
+            .env("PATH", path.clone())
             .env("HOME", root.join("home"))
             .env("RUSTUP_HOME", root.join("home/.rustup"))
             .env("CARGO_HOME", root.join("home/.cargo"))
@@ -490,7 +558,7 @@ printf '%s: %s\n%s: %s\n\n%s:\n' "$out/core.d" "$source" "$out/libcore.rmeta" "$
             .env("MBX_SCHEDULER", "0")
             .env("TEST_COMPILE_LOG", &compiles)
             .env("CARGO_MANIFEST_DIR", &core)
-            .arg(&compiler)
+            .arg(&spelled)
             .args([
                 "--crate-name",
                 "core",
@@ -511,17 +579,38 @@ printf '%s: %s\n%s: %s\n\n%s:\n' "$out/core.d" "$source" "$out/libcore.rmeta" "$
         String::from_utf8_lossy(&output.stderr).into_owned()
     };
 
-    let stored = compile();
+    let stored = compile(&join);
     assert!(!stored.contains("not stored"), "{stored}");
     std::fs::remove_dir_all(workspace.join("target")).unwrap();
-    let restored = compile();
+    let restored = compile(&join);
     assert_eq!(
         std::fs::read_to_string(deps.join("libcore.rmeta")).unwrap(),
         "#![no_std]\n"
     );
     assert_eq!(
-        std::fs::read_to_string(&compiles).unwrap().lines().count(),
+        compiled(),
         1,
         "the build-std unit should be stored once and restored, not compiled again:\n{stored}\n{restored}"
+    );
+    if !matches!(reached, Reached::ThroughProfile) {
+        return;
+    }
+
+    let next = joined_toolchain(&root, NEXT_RUST_NIGHTLY, &source, leaves);
+    link_profile(&profile, &next);
+    std::fs::remove_dir_all(workspace.join("target")).unwrap();
+    let switched = compile(&next);
+    assert!(!switched.contains("not stored"), "{switched}");
+    assert_eq!(
+        compiled(),
+        2,
+        "the next toolchain's build-std unit must compile, not restore the first toolchain's:\n{switched}"
+    );
+    std::fs::remove_dir_all(workspace.join("target")).unwrap();
+    let restored = compile(&next);
+    assert_eq!(
+        compiled(),
+        2,
+        "the next toolchain's build-std unit should be stored once and restored:\n{switched}\n{restored}"
     );
 }
