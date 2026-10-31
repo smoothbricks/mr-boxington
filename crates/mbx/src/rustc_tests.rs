@@ -626,6 +626,88 @@ fn sysroot_action_context(working_dir: &Path, mappings: Vec<PathMapping>) -> Act
     }
 }
 
+/// A toolchain linked into a profile (a Nix or devenv profile) is keyed where
+/// rustc finds its sysroot for the spelling Cargo runs: a bare `rustc` found on
+/// `PATH` through the profile uses the toolchain behind it, whose paths Cargo
+/// names `-Zbuild-std` sources by; a spelling of the profile's own link uses
+/// the profile; a compiler that shows no sysroot keeps the root it reported.
+#[cfg(unix)]
+#[test]
+fn the_default_sysroot_is_where_rustc_finds_it_for_the_spelling_cargo_runs() {
+    use std::os::unix::fs::symlink;
+
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let workspace = root.join("workspace");
+    let join = root.join("nix/store/rust-nightly");
+    let profile = root.join("nix/store/devenv-profile");
+    let core = Path::new("lib/rustlib/src/rust/library/core/src/lib.rs");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::create_dir_all(join.join("bin")).unwrap();
+    std::fs::create_dir_all(join.join(core).parent().unwrap()).unwrap();
+    std::fs::write(join.join("bin/rustc"), "compiler").unwrap();
+    std::fs::write(join.join(core), "pub fn fixture() {}\n").unwrap();
+    std::fs::create_dir_all(profile.join("bin")).unwrap();
+    std::fs::create_dir_all(profile.join("lib/rustlib")).unwrap();
+    symlink(join.join("bin/rustc"), profile.join("bin/rustc")).unwrap();
+    symlink(
+        join.join("lib/rustlib/src"),
+        profile.join("lib/rustlib/src"),
+    )
+    .unwrap();
+    let proxy = root.join("cargo/bin/rustc");
+    std::fs::create_dir_all(proxy.parent().unwrap()).unwrap();
+    std::fs::write(&proxy, "proxy").unwrap();
+    let reported = root.join("toolchains/reported");
+
+    let found = profile.join("bin/rustc");
+    let own = join.join("bin/rustc");
+    let cases = [
+        (
+            "a bare rustc found through the profile",
+            Path::new("rustc"),
+            &found,
+            &join,
+        ),
+        ("the profile's own link", found.as_path(), &found, &profile),
+        ("a toolchain's own rustc", own.as_path(), &own, &join),
+        (
+            "a proxy that shows no sysroot",
+            proxy.as_path(),
+            &proxy,
+            &reported,
+        ),
+    ];
+    for (name, spelled, executable, expected) in cases {
+        let sysroot = default_sysroot(spelled, executable, reported.clone());
+        assert_eq!(&sysroot, expected, "{name}");
+    }
+
+    // Each spelling's build-std sources, as Cargo names them, are keyed
+    // beneath the sysroot rustc finds for it.
+    for (spelled, sysroot) in [(Path::new("rustc"), &join), (found.as_path(), &profile)] {
+        let mapping =
+            default_sysroot_mapping(default_sysroot(spelled, &found, reported.clone())).unwrap();
+        let mappings = path_mappings_with_env(&workspace, None, None, Some(&mapping), |_| None);
+        let invocation = RustcInvocation::parse(&[
+            "--crate-name=core".into(),
+            "--crate-type=lib".into(),
+            "--emit=dep-info,metadata,link".into(),
+            "--out-dir=target".into(),
+            "-Zforce-unstable-if-unmarked".into(),
+            sysroot.join(core).into_os_string(),
+        ])
+        .unwrap();
+        assert!(
+            invocation
+                .invocation_digest(&sysroot_action_context(&workspace, mappings))
+                .is_ok(),
+            "{} is keyed beneath {}",
+            sysroot.join(core).display(),
+            mapping.root.display()
+        );
+    }
+}
 #[cfg(unix)]
 #[test]
 fn selected_default_sysroot_maps_aliases_archives_and_distinguishes_installations() {
