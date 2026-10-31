@@ -75,13 +75,28 @@ to stable placeholders before they enter a key. That is what lets equivalent
 worktrees share an action even though their absolute paths differ.
 
 For Rust compilers installed outside those roots, mbx also maps the selected
-compiler's physical default sysroot. Aliases of that root share its mapping,
-but distinct installations keep distinct path identities even when their
-version text matches. Cached backend identities follow the selected toolchain
-spelling, so retargeting an alias revalidates its backend selection. Existing
-home and rustup mappings are unchanged. An
-arbitrary `--sysroot` override does not become the selected compiler's default:
-it must already fall under a known mapping or the action bypasses the cache.
+compiler's physical default sysroot, and keys it by what it is rather than
+where it sits: by the toolchain parts a compilation uses, which are the
+compiler that runs, its `rustc_driver` library and every file the sysroot
+holds for the compilation's own target (`lib/rustlib/<target>`: its standard
+library, and a target specification or tools installed there), each by its
+contents. Two installations whose parts match share a key for that target
+wherever they are installed, so a unit built under a Nix join restores under
+another join of the same toolchain that adds the standard library of an
+unrelated target. A different compiler, driver or standard library for the
+target is a different key, even for a unit that names no path in the sysroot.
+mbx remembers the parts beside the compiler's identity, pinned to the files
+it read, so it hashes them again only when one of them changes.
+
+As with checkouts, an artifact restored from another installation names that
+installation's paths, in debug information and in `file!()` and panic
+locations of a `-Zbuild-std` unit, unless the build remaps the sysroot
+(`--remap-path-prefix=<sysroot>=...`). Cached backend identities follow the
+selected toolchain spelling, so retargeting an alias revalidates its backend
+selection. Existing home and rustup mappings, and their keys, are unchanged.
+An arbitrary `--sysroot` override does not become the selected compiler's
+default: it must already fall under a known mapping, where it is keyed by its
+path as before, or the action bypasses the cache.
 
 The selected sysroot's mapping also matches a path as it is spelled, not only
 as it resolves. A symlink-joined toolchain keeps its own directories and links

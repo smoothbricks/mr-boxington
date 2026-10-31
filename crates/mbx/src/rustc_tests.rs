@@ -614,6 +614,7 @@ fn sysroot_action_context(working_dir: &Path, mappings: Vec<PathMapping>) -> Act
             rustc_version: "rustc 1.97.0; commit-hash: abc".into(),
             host: "x86_64-unknown-linux-gnu".into(),
             driver: None,
+            toolchain_parts: None,
         },
         working_dir: working_dir.to_path_buf(),
         path_mappings: mappings,
@@ -704,7 +705,7 @@ fn the_default_sysroot_is_the_toolchain_the_compiler_resolves_into() {
 }
 #[cfg(unix)]
 #[test]
-fn selected_default_sysroot_maps_aliases_archives_and_distinguishes_installations() {
+fn selected_default_sysroot_maps_aliases_archives_and_keys_installations_by_their_parts() {
     use std::os::unix::fs::symlink;
 
     let directory = tempfile::tempdir().unwrap();
@@ -756,7 +757,8 @@ fn selected_default_sysroot_maps_aliases_archives_and_distinguishes_installation
     );
 
     let mappings = path_mappings_with_env(&workspace, None, None, Some(&mapping), |_| None);
-    let action = |sysroot: &Path, mappings: Vec<PathMapping>| {
+    // The key carries what the toolchain is, its parts, not where it sits.
+    let action = |sysroot: &Path, mappings: Vec<PathMapping>, parts: &[u8], version: &str| {
         let invocation = invocation(sysroot);
         let discovered = invocation
             .discover_inputs_with_mappings(
@@ -771,43 +773,224 @@ fn selected_default_sysroot_maps_aliases_archives_and_distinguishes_installation
                 && input.digest == CacheDigest::blake3(b"archive")
         }));
         let mut context = sysroot_action_context(&workspace, mappings);
+        context.compiler.toolchain_parts = Some(CacheDigest::blake3(parts));
+        context.compiler.rustc_version = version.into();
         discovered.apply_to(&mut context).unwrap();
         invocation.action(context).unwrap()
     };
-    let physical_action = action(&physical, mappings.clone());
-    assert_eq!(physical_action, action(&selected, mappings.clone()));
+    let version = "rustc 1.97.0; commit-hash: abc";
+    let physical_action = action(&physical, mappings.clone(), b"parts", version);
+    assert_eq!(
+        physical_action,
+        action(&selected, mappings.clone(), b"parts", version)
+    );
     assert!(
         String::from_utf8_lossy(&physical_action.bytes)
             .contains(&format!("${{{}}}/", mapping.placeholder))
     );
     assert!(normalize_mapped_path(&root.join("custom-sysroot"), &workspace, &mappings).is_err());
 
+    // Another installation of the same parts keys alike, wherever it sits.
     let other = root.join("nix/store/second-rustc");
     std::fs::create_dir_all(other.join(library)).unwrap();
     std::fs::write(other.join(library).join("libfixture.a"), b"archive").unwrap();
     let other_mapping = default_sysroot_mapping(other.canonicalize().unwrap()).unwrap();
     let other_mappings =
         path_mappings_with_env(&workspace, None, None, Some(&other_mapping), |_| None);
-    assert_ne!(
+    assert_eq!(
         physical_action.digest,
-        action(&other, other_mappings).digest
+        action(&other, other_mappings, b"parts", version).digest
     );
 
-    let mut other_compiler = sysroot_action_context(&workspace, mappings);
-    invocation(&physical)
-        .discover_inputs_with_mappings(
-            &dep_info,
-            &workspace,
-            &other_compiler.path_mappings,
+    // Other parts, or other version text, key apart.
+    assert_ne!(
+        physical_action.digest,
+        action(&physical, mappings.clone(), b"other parts", version).digest
+    );
+    assert_ne!(
+        physical_action.digest,
+        action(
+            &physical,
+            mappings,
+            b"parts",
+            "rustc 1.97.0; commit-hash: def"
+        )
+        .digest
+    );
+}
+
+/// A compilation for a target is keyed by the compiler, its driver and what
+/// the sysroot holds for that target. Two joins that differ only in another
+/// target's standard library, as a base shell and a cross shell of one
+/// nightly do, are one toolchain for it, links into one store path or copies
+/// alike; a different compiler, driver, standard library or target
+/// specification for the target is another. The pins cover every file read,
+/// and stop holding when one changes.
+#[cfg(unix)]
+#[test]
+fn toolchain_parts_are_the_compiler_its_driver_and_the_target_directory() {
+    use std::os::unix::fs::symlink;
+
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let rust_std = root.join("nix/store/rust-std-wasm32/lib");
+    std::fs::create_dir_all(&rust_std).unwrap();
+    std::fs::write(rust_std.join("libstd-fixture.rlib"), "std").unwrap();
+    #[derive(Clone, Copy)]
+    struct Join<'a> {
+        compiler: &'a str,
+        driver: &'a str,
+        std: Option<&'a str>,
+        specification: Option<&'a str>,
+        musl: bool,
+        linked_driver: bool,
+    }
+    let base = Join {
+        compiler: "rustc",
+        driver: "driver",
+        std: None,
+        specification: None,
+        musl: false,
+        linked_driver: false,
+    };
+    let join = |name: &str, spec: Join<'_>| {
+        let sysroot = root.join("nix/store").join(name);
+        let target = sysroot.join("lib/rustlib/wasm32-unknown-unknown");
+        let wasm = target.join("lib");
+        std::fs::create_dir_all(sysroot.join("bin")).unwrap();
+        std::fs::create_dir_all(wasm.join("self-contained")).unwrap();
+        std::fs::write(sysroot.join("bin/rustc"), spec.compiler).unwrap();
+        let driver = sysroot.join("lib/librustc_driver-fixture.so");
+        if spec.linked_driver {
+            // As a profile holds it: a link to the file in another store path.
+            let elsewhere = root.join("nix/store").join(format!("{name}-driver.so"));
+            std::fs::write(&elsewhere, spec.driver).unwrap();
+            symlink(elsewhere, driver).unwrap();
+        } else {
+            std::fs::write(driver, spec.driver).unwrap();
+        }
+        std::fs::write(wasm.join("self-contained/crt1.o"), "crt").unwrap();
+        match spec.std {
+            // As Nix joins it: the file links into the rust-std store path.
+            None => symlink(
+                rust_std.join("libstd-fixture.rlib"),
+                wasm.join("libstd-fixture.rlib"),
+            )
+            .unwrap(),
+            Some(std) => std::fs::write(wasm.join("libstd-fixture.rlib"), std).unwrap(),
+        }
+        if let Some(specification) = spec.specification {
+            std::fs::write(target.join("target.json"), specification).unwrap();
+        }
+        if spec.musl {
+            let musl = sysroot.join("lib/rustlib/x86_64-unknown-linux-musl/lib");
+            std::fs::create_dir_all(&musl).unwrap();
+            std::fs::write(musl.join("libstd-fixture.rlib"), "musl std").unwrap();
+        }
+        hash_toolchain_parts(
+            &sysroot,
+            &sysroot.join("bin/rustc"),
+            "wasm32-unknown-unknown",
             &mbx_cache_core::NoFileDigestCache,
         )
         .unwrap()
-        .apply_to(&mut other_compiler)
-        .unwrap();
-    other_compiler.compiler.rustc_version = "rustc 1.97.0; commit-hash: def".into();
-    assert_ne!(
-        physical_action.digest,
-        invocation(&physical).action(other_compiler).unwrap().digest
+    };
+    let (parts, pins) = join("base", base);
+    for (name, same) in [
+        (
+            "another target's std",
+            join("cross", Join { musl: true, ..base }),
+        ),
+        (
+            "a linked driver",
+            join(
+                "linked-driver",
+                Join {
+                    linked_driver: true,
+                    ..base
+                },
+            ),
+        ),
+        (
+            "a copy of the std",
+            join(
+                "copy",
+                Join {
+                    std: Some("std"),
+                    ..base
+                },
+            ),
+        ),
+    ] {
+        assert_eq!(parts, same.0, "{name} must not change the key");
+    }
+    for (name, other) in [
+        (
+            "compiler",
+            join(
+                "compiler",
+                Join {
+                    compiler: "other rustc",
+                    ..base
+                },
+            ),
+        ),
+        (
+            "driver",
+            join(
+                "driver",
+                Join {
+                    driver: "other driver",
+                    ..base
+                },
+            ),
+        ),
+        (
+            "std",
+            join(
+                "std",
+                Join {
+                    std: Some("other std"),
+                    ..base
+                },
+            ),
+        ),
+        (
+            "target specification",
+            join(
+                "specified",
+                Join {
+                    specification: Some("{}"),
+                    ..base
+                },
+            ),
+        ),
+    ] {
+        assert_ne!(parts, other.0, "a different {name} must change the key");
+    }
+
+    assert!(pins.iter().all(PinnedFile::holds));
+    let crt =
+        root.join("nix/store/base/lib/rustlib/wasm32-unknown-unknown/lib/self-contained/crt1.o");
+    assert!(pins.iter().any(|pin| pin.path == crt));
+    std::fs::write(&crt, "another crt").unwrap();
+    assert!(
+        !pins.iter().all(PinnedFile::holds),
+        "a changed file the parts read must invalidate them"
+    );
+}
+
+/// rustc looks a target's files up by the target's name, and a target
+/// specification's by the stem of its file.
+#[test]
+fn a_target_specification_names_its_directory_by_its_stem() {
+    assert_eq!(
+        target_directory_name("wasm32-unknown-unknown"),
+        "wasm32-unknown-unknown"
+    );
+    assert_eq!(
+        target_directory_name("specs/thumb-custom.json"),
+        "thumb-custom"
     );
 }
 
@@ -2059,7 +2242,8 @@ fn external_native_mappings_preserve_installation_identity() {
     .unwrap();
     let mut portable = Portable {
         mappings: vec![PathMapping::new(&workspace, "workspace")],
-        compiler_mappings: OnceLock::new(),
+        target: None,
+        compiler_key: OnceLock::new(),
         arguments: vec![],
         build_script_inputs: None,
     };
@@ -2104,7 +2288,8 @@ fn relative_external_native_paths_are_mapped_from_the_working_directory() {
     .unwrap();
     let mut portable = Portable {
         mappings: vec![PathMapping::new(&workspace, "workspace")],
-        compiler_mappings: OnceLock::new(),
+        target: None,
+        compiler_key: OnceLock::new(),
         arguments: vec![],
         build_script_inputs: None,
     };
@@ -2133,7 +2318,8 @@ fn relative_external_native_paths_are_mapped_from_the_working_directory() {
     .unwrap();
     let mut absolute_portable = Portable {
         mappings: vec![PathMapping::new(&workspace, "workspace")],
-        compiler_mappings: OnceLock::new(),
+        target: None,
+        compiler_key: OnceLock::new(),
         arguments: vec![],
         build_script_inputs: None,
     };

@@ -13,6 +13,10 @@ struct Fixture {
 
 impl Fixture {
     fn compile(&self, compiler: &Path, sysroot: Option<&Path>) {
+        self.compile_for(compiler, sysroot, None);
+    }
+
+    fn compile_for(&self, compiler: &Path, sysroot: Option<&Path>, target: Option<&str>) {
         let mut command = Command::new(&self.shim);
         command
             .current_dir(&self.workspace)
@@ -36,6 +40,9 @@ impl Fixture {
             ]);
         if let Some(sysroot) = sysroot {
             command.arg("--sysroot").arg(sysroot);
+        }
+        if let Some(target) = target {
+            command.arg("--target").arg(target);
         }
         let output = command.arg("lib.rs").output().unwrap();
         assert!(
@@ -71,8 +78,11 @@ impl Fixture {
 fn compiler(root: &Path, name: &str) -> PathBuf {
     let sysroot = root.join("nix/store").join(name);
     std::fs::create_dir_all(sysroot.join("bin")).unwrap();
-    std::fs::create_dir_all(sysroot.join("lib/rustlib")).unwrap();
-    std::fs::write(sysroot.join("marker"), name).unwrap();
+    // What the installation compiles against: its host's standard library,
+    // one of the toolchain parts a key names.
+    let library = sysroot.join("lib/rustlib/x86_64-unknown-linux-gnu/lib");
+    std::fs::create_dir_all(&library).unwrap();
+    std::fs::write(library.join("marker"), name).unwrap();
     let compiler = sysroot.join("bin/rustc");
     std::fs::write(
         &compiler,
@@ -96,7 +106,7 @@ while [ "$#" -gt 0 ]; do
 done
 printf 'compile\n' >> "$TEST_COMPILE_LOG"
 mkdir -p target
-cat "$sysroot/marker" > target/libfixture.rmeta
+cat "$sysroot/lib/rustlib/x86_64-unknown-linux-gnu/lib/marker" > target/libfixture.rmeta
 printf 'target/libfixture.rmeta: lib.rs\n' > target/fixture.d
 "#,
     )
@@ -153,11 +163,172 @@ fn selected_physical_sysroot_stores_and_restores_without_conflating_roots() {
     // Explicit overrides are not aliases for the selected compiler's default root.
     for (index, name) in ["custom-a", "custom-b", "custom-a"].into_iter().enumerate() {
         let custom = fixture.root.join(name);
-        std::fs::create_dir_all(&custom).unwrap();
-        std::fs::write(custom.join("marker"), name).unwrap();
+        let library = custom.join("lib/rustlib/x86_64-unknown-linux-gnu/lib");
+        std::fs::create_dir_all(&library).unwrap();
+        std::fs::write(library.join("marker"), name).unwrap();
         fixture.wipe_outputs();
         fixture.compile(&first, Some(&custom));
         fixture.assert_artifact(name, 3 + index);
+    }
+}
+
+/// A Nix join of a toolchain at `root/nix/store/<name>`: its `bin/rustc`
+/// says `rustc` in every artifact, its `lib` holds a `rustc_driver`, and
+/// `lib/rustlib/<target>/lib` holds a standard library saying what
+/// `libraries` gives for each target. The compiler writes what it says beside
+/// what the standard library for the target it compiles for says, in the
+/// sysroot it compiles against.
+fn toolchain(root: &Path, name: &str, rustc: &str, libraries: &[(&str, &str)]) -> PathBuf {
+    let sysroot = root.join("nix/store").join(name);
+    std::fs::create_dir_all(sysroot.join("bin")).unwrap();
+    std::fs::create_dir_all(sysroot.join("lib")).unwrap();
+    std::fs::write(
+        sysroot.join("lib/librustc_driver-fixture.so"),
+        "compiler driver",
+    )
+    .unwrap();
+    for (target, std) in libraries {
+        let library = sysroot.join("lib/rustlib").join(target).join("lib");
+        std::fs::create_dir_all(&library).unwrap();
+        std::fs::write(library.join("libstd-fixture.rlib"), std).unwrap();
+    }
+    let compiler = sysroot.join("bin/rustc");
+    std::fs::write(
+        &compiler,
+        r#"#!/bin/sh
+set -eu
+default=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)
+case "$1" in
+    -vV)
+        printf 'rustc 1.97.0 (abc 2026-08-01)\ncommit-hash: abc\nhost: x86_64-unknown-linux-gnu\nrelease: 1.97.0\nLLVM version: 22.0.0\n'
+        exit 0
+        ;;
+    --print) printf '%s\n' "$default"; exit 0 ;;
+esac
+sysroot=$default
+target=x86_64-unknown-linux-gnu
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --sysroot) shift; sysroot=$1 ;;
+        --sysroot=*) sysroot=${1#--sysroot=} ;;
+        --target) shift; target=$1 ;;
+        --target=*) target=${1#--target=} ;;
+    esac
+    shift
+done
+printf 'compile\n' >> "$TEST_COMPILE_LOG"
+mkdir -p target
+printf '%s, %s' '@RUSTC@' "$(cat "$sysroot/lib/rustlib/$target/lib/libstd-fixture.rlib")" > target/libfixture.rmeta
+printf 'target/libfixture.rmeta: lib.rs\n' > target/fixture.d
+"#
+        .replace("@RUSTC@", rustc),
+    )
+    .unwrap();
+    std::fs::set_permissions(&compiler, std::fs::Permissions::from_mode(0o755)).unwrap();
+    compiler
+}
+
+const HOST: &str = "x86_64-unknown-linux-gnu";
+const WASM: &str = "wasm32-unknown-unknown";
+
+/// One toolchain installed twice, as AxE's base shell and its `devenv -P
+/// linux-cross` shell install one nightly: the second join adds a rust-std
+/// for musl. A unit is keyed by the parts it uses, the compiler, its driver
+/// and the standard library for its own target, the host's or its
+/// `--target`'s, so what one join compiled the other restores, whether or not
+/// the unit names the join, as a `--sysroot` or a remap of it does. A join
+/// whose compiler or whose standard library for the unit's target differs
+/// compiles again, even for a unit that names no path in it, while one whose
+/// standard library differs only for another target restores.
+#[test]
+fn a_toolchain_is_keyed_by_the_parts_a_unit_uses_not_where_it_is_installed() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let workspace = root.join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::create_dir_all(root.join("home")).unwrap();
+    std::fs::create_dir_all(root.join("shims")).unwrap();
+    std::fs::write(workspace.join("lib.rs"), "pub fn fixture() {}\n").unwrap();
+    let shim = mbx::session::install_shim(
+        Path::new(env!("CARGO_BIN_EXE_mbx")),
+        &root.join("shims"),
+        mbx::session::ShimLink::Tracking,
+    )
+    .unwrap();
+    let base = toolchain(
+        &root,
+        "base",
+        "rustc 1",
+        &[(HOST, "std 1"), (WASM, "wasm 1")],
+    );
+    let cross = toolchain(
+        &root,
+        "cross",
+        "rustc 1",
+        &[
+            (HOST, "std 1"),
+            (WASM, "wasm 1"),
+            ("x86_64-unknown-linux-musl", "musl 1"),
+        ],
+    );
+    let other_host = toolchain(
+        &root,
+        "other-host",
+        "rustc 1",
+        &[(HOST, "std 2"), (WASM, "wasm 1")],
+    );
+    let other_wasm = toolchain(
+        &root,
+        "other-wasm",
+        "rustc 1",
+        &[(HOST, "std 1"), (WASM, "wasm 2")],
+    );
+    let other_rustc = toolchain(
+        &root,
+        "other-rustc",
+        "rustc 2",
+        &[(HOST, "std 1"), (WASM, "wasm 1")],
+    );
+    let fixture = Fixture {
+        root,
+        workspace,
+        shim,
+    };
+
+    let mut compilations = 0;
+    for names_the_join in [false, true] {
+        for (target, steps) in [
+            (
+                None,
+                [
+                    (&base, "rustc 1, std 1", true),
+                    (&cross, "rustc 1, std 1", false),
+                    (&other_host, "rustc 1, std 2", true),
+                    (&other_wasm, "rustc 1, std 1", false),
+                    (&other_rustc, "rustc 2, std 1", true),
+                ],
+            ),
+            (
+                Some(WASM),
+                [
+                    (&base, "rustc 1, wasm 1", true),
+                    (&cross, "rustc 1, wasm 1", false),
+                    (&other_host, "rustc 1, wasm 1", false),
+                    (&other_wasm, "rustc 1, wasm 2", true),
+                    (&other_rustc, "rustc 2, wasm 1", true),
+                ],
+            ),
+        ] {
+            for (compiler, artifact, compiles) in steps {
+                if compilations > 0 {
+                    fixture.wipe_outputs();
+                }
+                let sysroot = compiler.parent().unwrap().parent().unwrap();
+                fixture.compile_for(compiler, names_the_join.then_some(sysroot), target);
+                compilations += usize::from(compiles);
+                fixture.assert_artifact(artifact, compilations);
+            }
+        }
     }
 }
 
@@ -407,8 +578,8 @@ fn a_build_std_unit_of_a_nix_join_whose_files_are_links_stores_and_restores() {
 /// `bin/rustc` and `lib/rustlib` link into the join. rustc finds its sysroot
 /// in the join and Cargo names the sources by it, while the profile holds a
 /// `lib/rustlib` of its own. A toolchain update relinks the profile into
-/// another join, whose unit compiles again and is then restored: equal version
-/// text and sources do not make it the first installation.
+/// another join, whose compiler differs, so its unit compiles again and is
+/// then restored.
 #[test]
 fn a_build_std_unit_of_a_nix_join_found_through_a_profile_stores_and_restores() {
     build_std_unit_of_a_joined_toolchain_stores_and_restores(
@@ -457,9 +628,10 @@ enum Reached {
 }
 
 /// The toolchain join `name` in `root`'s `nix/store`: `core`'s sources link
-/// into `source` as `leaves` lays them out, and its `bin/rustc` compiles a
-/// build-std unit by copying the source into `libcore.rmeta` and, as rustc
-/// does, reports the join its own file sits in as its sysroot.
+/// into `source` as `leaves` lays them out, and its `bin/rustc`, a build of
+/// its own for each name, compiles a build-std unit by copying the source into
+/// `libcore.rmeta` and, as rustc does, reports the join its own file sits in
+/// as its sysroot.
 fn joined_toolchain(root: &Path, name: &str, source: &Path, leaves: Leaves) -> PathBuf {
     let join = root.join(format!("nix/store/{name}"));
     let core = join.join("lib/rustlib/src/rust/library/core");
@@ -478,6 +650,7 @@ fn joined_toolchain(root: &Path, name: &str, source: &Path, leaves: Leaves) -> P
     std::fs::write(
         &compiler,
         r#"#!/bin/sh
+# @NAME@
 set -eu
 executable=$0
 while [ -L "$executable" ]; do
@@ -508,7 +681,8 @@ printf 'compile\n' >> "$TEST_COMPILE_LOG"
 mkdir -p "$out"
 cat "$source" > "$out/libcore.rmeta"
 printf '%s: %s\n%s: %s\n\n%s:\n' "$out/core.d" "$source" "$out/libcore.rmeta" "$source" "$source" > "$out/core.d"
-"#,
+"#
+        .replace("@NAME@", name),
     )
     .unwrap();
     std::fs::set_permissions(&compiler, std::fs::Permissions::from_mode(0o755)).unwrap();

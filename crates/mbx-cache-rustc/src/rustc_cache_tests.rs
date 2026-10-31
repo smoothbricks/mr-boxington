@@ -106,6 +106,7 @@ fn context(inputs: &[(&str, &str)]) -> ActionContext {
             rustc_version: "1.97.1 (8bab26f4f 2026-07-14)".into(),
             host: "x86_64-unknown-linux-gnu".into(),
             driver: None,
+            toolchain_parts: None,
         },
         working_dir: workspace(),
         path_mappings: vec![
@@ -1448,6 +1449,7 @@ fn predicts_inputs_without_reusing_stale_contents() {
         rustc_version: "rustc test".into(),
         host: "test-host".into(),
         driver: None,
+        toolchain_parts: None,
     };
     let context = ActionContext {
         compiler,
