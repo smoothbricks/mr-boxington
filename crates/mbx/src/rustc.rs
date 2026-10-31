@@ -1535,32 +1535,23 @@ fn compiler_sysroot(rustc: &OsStr) -> Option<PathBuf> {
         .then(|| PathBuf::from(String::from_utf8_lossy(&output.stdout).trim()))
 }
 
-/// The default sysroot rustc finds as Cargo runs it, by rustc's own rule
-/// (`rustc_session::filesearch::default_sysroot`): a spelling that is itself
-/// a link, whose grandparent holds a `lib/rustlib`, names the sysroot as
-/// spelled, which is keyed by that directory with its links resolved;
-/// otherwise it is the toolchain the compiler's `executable` resolves into
-/// (standing in for rustc's driver library, which a toolchain keeps beside
-/// it), when that holds a `lib/rustlib`; otherwise `selected`, the root the
-/// compiler was found or reported in. Cargo names `-Zbuild-std` sources by
+/// The default sysroot rustc finds: the toolchain its driver library resolves
+/// into (`rustc_session::filesearch::default_sysroot`), for which the
+/// compiler's `executable`, with its links resolved, stands in when that holds
+/// a `lib/rustlib`; otherwise `selected`, the root the compiler was found or
+/// reported in, as for a rustup proxy. Cargo names `-Zbuild-std` sources by
 /// that sysroot. A profile that links a toolchain's files into a tree of its
-/// own (a Nix or devenv profile) holds a `lib/rustlib` too: a bare `rustc`
-/// found through it on `PATH` uses the toolchain behind it, a spelling of the
-/// profile's own link the profile. It depends on the spelling, so it is worked
-/// out for each one and not kept with the identity, which is the executable's.
-fn default_sysroot(spelled: &Path, executable: &Path, selected: PathBuf) -> PathBuf {
-    let holds_rustlib = |root: &Path| root.join("lib/rustlib").is_dir();
-    if std::fs::read_link(spelled).is_ok()
-        && let Some(root) = spelled.parent().and_then(Path::parent)
-        && holds_rustlib(root)
-        && let Ok(root) = std::fs::canonicalize(root)
-    {
-        return root;
-    }
+/// own (a Nix or devenv profile) holds a `lib/rustlib` too, but rustc takes the
+/// toolchain behind it however Cargo spells the compiler: its check of a
+/// linked spelling looks for `lib/rustlib` in the working directory, not beside
+/// the link, so only a working directory holding one would differ. Worked out
+/// each time the identity is read, not kept with it, so an identity recorded
+/// under an earlier rule leaves no stale root.
+fn default_sysroot(executable: &Path, selected: PathBuf) -> PathBuf {
     std::fs::canonicalize(executable)
         .ok()
         .and_then(|executable| Some(executable.parent()?.parent()?.to_path_buf()))
-        .filter(|root| holds_rustlib(root))
+        .filter(|root| root.join("lib/rustlib").is_dir())
         .unwrap_or(selected)
 }
 
@@ -4207,7 +4198,7 @@ fn query_compiler_identity(rustc: &OsStr) -> Result<SelectedCompiler> {
                 .map(str::to_string),
         },
         sysroot: sysroot
-            .map(|selected| default_sysroot(Path::new(rustc), &executable, selected))
+            .map(|selected| default_sysroot(&executable, selected))
             .and_then(default_sysroot_mapping),
     })
 }

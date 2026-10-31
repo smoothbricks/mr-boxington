@@ -671,13 +671,13 @@ fn sysroot_action_context(working_dir: &Path, mappings: Vec<PathMapping>) -> Act
 }
 
 /// A toolchain linked into a profile (a Nix or devenv profile) is keyed where
-/// rustc finds its sysroot for the spelling Cargo runs: a bare `rustc` found on
-/// `PATH` through the profile uses the toolchain behind it, whose paths Cargo
-/// names `-Zbuild-std` sources by; a spelling of the profile's own link uses
-/// the profile; a compiler that shows no sysroot keeps the root it reported.
+/// rustc finds its sysroot, the toolchain behind the profile, whose paths Cargo
+/// names `-Zbuild-std` sources by, whether Cargo runs a bare `rustc` found
+/// through the profile on `PATH` or the profile's own link; a compiler that
+/// shows no toolchain of its own keeps the root it reported.
 #[cfg(unix)]
 #[test]
-fn the_default_sysroot_is_where_rustc_finds_it_for_the_spelling_cargo_runs() {
+fn the_default_sysroot_is_the_toolchain_the_compiler_resolves_into() {
     use std::os::unix::fs::symlink;
 
     let directory = tempfile::tempdir().unwrap();
@@ -704,53 +704,47 @@ fn the_default_sysroot_is_where_rustc_finds_it_for_the_spelling_cargo_runs() {
     std::fs::write(&proxy, "proxy").unwrap();
     let reported = root.join("toolchains/reported");
 
-    let found = profile.join("bin/rustc");
+    let linked = profile.join("bin/rustc");
     let own = join.join("bin/rustc");
-    let cases = [
-        (
-            "a bare rustc found through the profile",
-            Path::new("rustc"),
-            &found,
-            &join,
-        ),
-        ("the profile's own link", found.as_path(), &found, &profile),
-        ("a toolchain's own rustc", own.as_path(), &own, &join),
-        (
-            "a proxy that shows no sysroot",
-            proxy.as_path(),
-            &proxy,
-            &reported,
-        ),
-    ];
-    for (name, spelled, executable, expected) in cases {
-        let sysroot = default_sysroot(spelled, executable, reported.clone());
-        assert_eq!(&sysroot, expected, "{name}");
-    }
-
-    // Each spelling's build-std sources, as Cargo names them, are keyed
-    // beneath the sysroot rustc finds for it.
-    for (spelled, sysroot) in [(Path::new("rustc"), &join), (found.as_path(), &profile)] {
-        let mapping =
-            default_sysroot_mapping(default_sysroot(spelled, &found, reported.clone())).unwrap();
-        let mappings = path_mappings_with_env(&workspace, None, None, Some(&mapping), |_| None);
-        let invocation = RustcInvocation::parse(&[
-            "--crate-name=core".into(),
-            "--crate-type=lib".into(),
-            "--emit=dep-info,metadata,link".into(),
-            "--out-dir=target".into(),
-            "-Zforce-unstable-if-unmarked".into(),
-            sysroot.join(core).into_os_string(),
-        ])
-        .unwrap();
-        assert!(
-            invocation
-                .invocation_digest(&sysroot_action_context(&workspace, mappings))
-                .is_ok(),
-            "{} is keyed beneath {}",
-            sysroot.join(core).display(),
-            mapping.root.display()
+    for (name, executable, expected) in [
+        ("a profile's link into the toolchain", &linked, &join),
+        ("a toolchain's own rustc", &own, &join),
+        ("a proxy that shows no sysroot", &proxy, &reported),
+    ] {
+        assert_eq!(
+            &default_sysroot(executable, reported.clone()),
+            expected,
+            "{name}"
         );
     }
+
+    // The build-std sources Cargo names beneath that toolchain are keyed
+    // beneath its placeholder.
+    let mapping = default_sysroot_mapping(default_sysroot(&linked, reported)).unwrap();
+    let mappings = path_mappings_with_env(&workspace, None, None, Some(&mapping), |_| None);
+    let source = join.join(core);
+    assert!(
+        normalize_mapped_path(&source, &workspace, &mappings)
+            .unwrap()
+            .starts_with(&format!("${{{}}}/", mapping.placeholder)),
+        "{} is keyed beneath {}",
+        source.display(),
+        mapping.root.display()
+    );
+    let invocation = RustcInvocation::parse(&[
+        "--crate-name=core".into(),
+        "--crate-type=lib".into(),
+        "--emit=dep-info,metadata,link".into(),
+        "--out-dir=target".into(),
+        "-Zforce-unstable-if-unmarked".into(),
+        source.into_os_string(),
+    ])
+    .unwrap();
+    assert!(
+        invocation
+            .invocation_digest(&sysroot_action_context(&workspace, mappings))
+            .is_ok()
+    );
 }
 #[cfg(unix)]
 #[test]

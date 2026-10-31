@@ -91,14 +91,14 @@ directory by the join's paths, and a build that remaps the sysroot names the
 join itself. Those key beneath the sysroot's placeholder, so a build-std unit
 is stored and restored like any other compilation.
 
-That physical sysroot is the one rustc finds as Cargo runs it, by rustc's own
-rule: a compiler spelled by a link whose grandparent holds `lib/rustlib` uses
-that directory, keyed with its links resolved, and any other spelling uses the
-toolchain the compiler's executable resolves into. A profile that links a
-toolchain's files into a tree of its own, such as a Nix or devenv profile on
-`PATH`, holds a `lib/rustlib` too: a bare `rustc` found through it maps the
-toolchain behind it, whose paths Cargo names `-Zbuild-std` sources by, and the
-profile's own link maps the profile.
+That physical sysroot is the one rustc finds: the toolchain the compiler
+resolves into, where rustc's driver library sits, whichever spelling Cargo
+runs. A profile that links a toolchain's files into a tree of its own, such as
+a Nix or devenv profile on `PATH`, holds a `lib/rustlib` too, but rustc takes
+the toolchain behind it for its sysroot, whether Cargo runs a bare `rustc`
+found through the profile or the profile's own link. mbx maps that toolchain,
+whose paths Cargo names `-Zbuild-std` sources by. A compiler that shows no
+toolchain of its own, such as a rustup proxy, keeps the root it reports.
 
 An input file in the Nix store keeps its own path in the key, for Rust as for
 C and C++: its contents are hashed like any input's, and a store path is
