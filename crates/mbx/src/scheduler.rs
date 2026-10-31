@@ -16,7 +16,7 @@
 //! leak capacity; a lease whose lock can be taken is stale and is reclaimed
 //! by the next admission scan. Admission itself serializes on one registrar
 //! lock, held only long enough to scan and grant. Whoever holds it grants
-//! every queued request the ordering rule admits, in ticket order, not only
+//! every queued request the pool rule admits, in the pool's order, not only
 //! its own: a granted waiter's queue record becomes its lease, renamed into
 //! the leases directory under the lock its holder already keeps, and the
 //! holder finds it when a lease-directory notification wakes it. It starts as
@@ -80,8 +80,6 @@ const WAITERS_DIR: &str = "waiters";
 const INFLIGHT_DIR: &str = "inflight";
 /// Registrar lock serializing admission scans.
 const POOL_LOCK: &str = "pool.lock";
-/// Stamp a waiting normal-priority build touches so low-priority builds yield.
-const PRIORITY_WAIT_STAMP: &str = "priority-wait";
 /// Stamp every admission pass touches: something is serving the queue.
 const SERVED_STAMP: &str = "served";
 /// Ledger of peak compiler RSS by crate name.
@@ -171,10 +169,6 @@ const UNMEASURED_TEST_WEIGHT: u64 = 2;
 const TEST_HISTORY_REFRESH: Duration = Duration::from_secs(24 * 60 * 60);
 /// Most test names retained for one nextest binary.
 const MAX_TEST_HISTORY_ENTRIES: usize = 16_384;
-/// How recently the stamp must have been touched to hold low priority back.
-const PRIORITY_WAIT_FRESHNESS: Duration = Duration::from_secs(2);
-/// How often one waiter refreshes that stamp, well inside its freshness.
-const PRIORITY_STAMP_INTERVAL: Duration = Duration::from_millis(500);
 /// How recently an admission pass must have run for a queued request to
 /// leave the registrar to whoever holds it rather than wait to hold it.
 const SERVED_FRESHNESS: Duration = Duration::from_secs(1);
@@ -394,6 +388,17 @@ impl Permit {
     pub(crate) fn announce(&mut self) {
         self.announced = grant::announce(grant::Event::Granted);
     }
+
+    /// What the pool granted this hold, as its lease records it: the cores
+    /// and memory it holds, fewer cores than it asked for when its request
+    /// was moldable, and the legacy scalar older readers charge.
+    pub(crate) fn granted(&self) -> Result<(Resources, u64)> {
+        let bytes = std::fs::read(&self.path)
+            .wrap_err_with(|| format!("failed to read lease {}", self.path.display()))?;
+        let lease: Lease = serde_json::from_slice(&bytes)
+            .wrap_err_with(|| format!("failed to parse lease {}", self.path.display()))?;
+        Ok((lease.resources(), lease.weight))
+    }
 }
 
 impl Drop for Permit {
@@ -466,11 +471,15 @@ struct Waiting {
     /// holder's behalf. Absent from versions that admit only themselves.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     handoff: Option<Handoff>,
+    /// How many of its cores it may start on; `None` from a version before
+    /// the pool rule, which orders its own requests by ticket.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    shape: Option<Shape>,
 }
 
 /// What any registrar holder needs to admit a queued request on its holder's
-/// behalf: the global budget its holder judges itself against before a
-/// low-priority yield, and the available-memory gate it is still subject to.
+/// behalf: the global budget its holder judges itself against, and the
+/// available-memory gate it is still subject to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct Handoff {
     budget: Resources,
@@ -484,6 +493,20 @@ struct Handoff {
 struct Gate {
     bytes: u64,
     until_ms: u64,
+}
+
+/// How many of its cores a request may start on: Feitelson's rigid and
+/// moldable jobs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum Shape {
+    /// All of them or none: a compiler or test process runs every thread it
+    /// was charged for, whatever it is granted.
+    #[default]
+    Rigid,
+    /// Any number from one up: the command `mbx reserve` runs reads the cores
+    /// it was granted from `MBX_RESERVE_CPUS` and runs on them.
+    Moldable,
 }
 
 struct QueueEntry {
@@ -522,7 +545,10 @@ impl Drop for QueueEntry {
 
 struct AdmissionState {
     queued: Option<QueueEntry>,
+    /// When the request first asked, on the pool clock: the age that orders
+    /// it once it reaches the aging bound.
     first_arrival_ms: u64,
+    shape: Shape,
     /// When the available-memory gate stops applying, on the pool clock.
     gate_until_ms: u64,
     last_gate: Option<&'static str>,
@@ -533,10 +559,11 @@ struct AdmissionState {
 }
 
 impl AdmissionState {
-    fn new(now_ms: u64, events: bool) -> Self {
+    fn new(now_ms: u64, shape: Shape) -> Self {
         Self {
             queued: None,
-            first_arrival_ms: if events { now_ms } else { 0 },
+            first_arrival_ms: now_ms,
+            shape,
             gate_until_ms: now_ms
                 .saturating_add(u64::try_from(GATE_DEADLINE.as_millis()).unwrap_or(u64::MAX)),
             last_gate: None,
@@ -622,29 +649,6 @@ impl Waiting {
     }
 }
 
-/// A low-priority budget while normal-priority work waits: a quarter of each
-/// axis stays free for that work.
-///
-/// Never the whole axis. A reserve equal to the capacity -- which a
-/// single-permit machine would otherwise get -- stops a low-priority build
-/// admitting through the ordinary path at all, leaving the oversized-demand
-/// escape as the only way it ever runs, and that one hands over the entire
-/// machine at once. Yielding a quarter must not become yielding everything
-/// and then taking everything.
-fn yielded(budget: Resources, yielding: bool) -> Resources {
-    let keep = |total: u64| {
-        if yielding {
-            total - (total / 4).max(1).min(total.saturating_sub(1))
-        } else {
-            total
-        }
-    };
-    Resources {
-        cpu: keep(budget.cpu),
-        memory_bytes: keep(budget.memory_bytes),
-    }
-}
-
 impl From<&Waiting> for Lease {
     /// The lease a granted request holds: the charge and identity its record
     /// asked for.
@@ -670,189 +674,6 @@ struct Plan {
     weight: u64,
     predicted: Option<u64>,
     source: &'static str,
-}
-
-const MEMORY_QUANTUM: u64 = 16 * 1024 * 1024;
-
-// Match the scalar charge an old reader computes after a permit-unit change.
-fn weight_in_units(weight: u64, original_unit: u64, unit: u64) -> u64 {
-    if unit == 0 {
-        weight
-    } else {
-        weight.max(weight.saturating_mul(original_unit).div_ceil(unit))
-    }
-}
-
-#[cfg(test)]
-fn can_pass_waiters(capacity: u64, live: &[u64], older: &[u64], weight: u64) -> bool {
-    can_pass_quantized(capacity, live, older, weight, 1)
-}
-
-/// Protect every older prefix against every possible completion subset.
-#[cfg(test)]
-fn can_pass_quantized(capacity: u64, live: &[u64], older: &[u64], charge: u64, unit: u64) -> bool {
-    pass_quantized(
-        capacity,
-        live,
-        older,
-        &vec![0; older.len()],
-        charge,
-        unit,
-        |_, _| {},
-    )
-}
-
-/// Per prefix of `heads`, a lower bound on how much of one axis completes
-/// before that prefix of older requests can start, from what it waits for on
-/// the other axis.
-///
-/// A prefix short of room on `other` starts only once completions free the
-/// shortfall. No set of completions frees it with fewer than
-/// `ceil(shortfall / largest)` holders of that axis, `largest` being the
-/// biggest such hold among the live leases and the older requests admitted
-/// before the prefix, and each of those frees at least the smallest `this`
-/// charge any holder of `other` carries. Every completion set that lets the
-/// prefix start frees its `other` shortfall, so it frees at least that much
-/// of `this` too.
-fn freed_alongside(
-    capacity: u64,
-    live: &[Resources],
-    heads: &[Resources],
-    other: fn(&Resources) -> u64,
-    this: fn(&Resources) -> u64,
-) -> Vec<u64> {
-    let free = capacity.saturating_sub(live.iter().map(other).fold(0, u64::saturating_add));
-    let mut largest = 0;
-    let mut smallest = u64::MAX;
-    let hold = |item: &Resources, largest: &mut u64, smallest: &mut u64| {
-        if other(item) > 0 {
-            *largest = (*largest).max(other(item));
-            *smallest = (*smallest).min(this(item));
-        }
-    };
-    for item in live {
-        hold(item, &mut largest, &mut smallest);
-    }
-    let mut prefix = 0_u64;
-    heads
-        .iter()
-        .map(|head| {
-            prefix = prefix.saturating_add(other(head));
-            let shortfall = prefix.saturating_sub(free);
-            let freed = if shortfall == 0 || largest == 0 {
-                0
-            } else {
-                shortfall.div_ceil(largest).saturating_mul(smallest)
-            };
-            hold(head, &mut largest, &mut smallest);
-            freed
-        })
-        .collect()
-}
-
-/// `freed[index]` bounds from below what completes on this axis before the
-/// older prefix ending at `index` can start; see `freed_alongside`.
-fn pass_quantized(
-    capacity: u64,
-    live: &[u64],
-    older: &[u64],
-    freed: &[u64],
-    charge: u64,
-    unit: u64,
-    mut record: impl FnMut(usize, u64),
-) -> bool {
-    if older.is_empty() {
-        return true;
-    }
-    const MAX_BITS: u64 = 1 << 16;
-    let Some(total) = live.iter().chain(older).try_fold(0_u64, |sum, w| {
-        sum.checked_add(w.div_ceil(unit))
-            .filter(|sum| *sum < MAX_BITS)
-    }) else {
-        return false;
-    };
-    let Some(used) = live.iter().try_fold(0_u64, |sum, w| sum.checked_add(*w)) else {
-        return false;
-    };
-    let Some(free) = capacity.checked_sub(used) else {
-        return false;
-    };
-    if charge > free {
-        return false;
-    }
-    let mut sums = vec![0_u64; (total as usize + 1).div_ceil(64)];
-    sums[0] = 1;
-    for w in live {
-        add_subset_weight(&mut sums, w.div_ceil(unit) as usize);
-    }
-    let mut prefix = 0_u64;
-    for (index, h) in older.iter().enumerate() {
-        let Some(next) = prefix.checked_add(*h) else {
-            return false;
-        };
-        prefix = next;
-        let slack = if prefix <= free {
-            free - prefix
-        } else {
-            let threshold = prefix - free;
-            let quantized_threshold = threshold.div_ceil(unit) as usize;
-            let first_word = quantized_threshold / 64;
-            let Some(sum) = (first_word..sums.len()).find_map(|index| {
-                let bits = if index == first_word {
-                    sums[index] & (u64::MAX << (quantized_threshold % 64))
-                } else {
-                    sums[index]
-                };
-                (bits != 0).then(|| index * 64 + bits.trailing_zeros() as usize)
-            }) else {
-                return false;
-            };
-            // Every eligible exact subset S >= threshold has rounded-up sum
-            // Q(S) >= ceil(threshold/unit). Thus the minimum DP sum is no
-            // larger than Q(S). Each item adds at most unit-1 rounding bytes;
-            // subtracting n*(unit-1) makes this a LOWER bound on every eligible
-            // exact sum, hence on slack. Extra ineligible subsets only reduce
-            // the bound. Saturation must refuse, not manufacture slack.
-            let Some(error) = (live.len() + index)
-                .try_into()
-                .ok()
-                .and_then(|count: u64| count.checked_mul(unit - 1))
-            else {
-                return false;
-            };
-            let Some(lower) = (sum as u64)
-                .checked_mul(unit)
-                .and_then(|sum| sum.checked_sub(error))
-            else {
-                return false;
-            };
-            let Some(slack) = lower.checked_sub(threshold) else {
-                return false;
-            };
-            slack
-        };
-        // The room the prefix finds once its other axis lets it start: the
-        // completions it waits for there free at least `freed` here too.
-        let slack = slack.max(free.saturating_add(freed[index]).saturating_sub(prefix));
-        record(index, slack);
-        if charge > slack {
-            return false;
-        }
-        add_subset_weight(&mut sums, h.div_ceil(unit) as usize);
-    }
-    true
-}
-
-fn add_subset_weight(sums: &mut [u64], weight: usize) {
-    let words = weight / 64;
-    let shift = weight % 64;
-    for index in (words..sums.len()).rev() {
-        let mut shifted = sums[index - words] << shift;
-        if shift != 0 && index > words {
-            shifted |= sums[index - words - 1] >> (64 - shift);
-        }
-        sums[index] |= shifted;
-    }
 }
 
 fn scope_used<'a>(leases: impl Iterator<Item = &'a Lease>) -> Resources {
@@ -886,11 +707,13 @@ fn build_fits(live: &[Lease], build: &Option<(String, u64)>, cpu: u64) -> bool {
     })
 }
 
+/// How a grant stood to the requests queued before it, for the decision log.
 #[derive(Debug, PartialEq, Eq)]
 enum AdmissionDecision {
+    /// No older request was waiting.
     Ordered,
+    /// It started while an older request waited.
     Passing,
-    Waiting,
 }
 
 fn priority_exception(older: &Waiting, request: &Waiting) -> bool {
@@ -915,285 +738,6 @@ fn older_exception(live: &[Lease], older: &Waiting, request: &Waiting) -> Option
     None
 }
 
-/// Both physical axes must fit before queue order or safe passing is checked.
-#[cfg(test)]
-fn admission_decision<'a>(
-    capacity: u64,
-    live: &[Lease],
-    waiting: impl Iterator<Item = &'a Waiting>,
-    request: &Waiting,
-) -> AdmissionDecision {
-    admission_decision_traced(capacity, live, waiting, request, None)
-}
-
-/// Tracing observes the very same predicates and slack bounds as admission.
-fn admission_decision_traced<'a>(
-    capacity: u64,
-    live: &[Lease],
-    waiting: impl Iterator<Item = &'a Waiting>,
-    request: &Waiting,
-    trace: Option<&std::cell::RefCell<decisions::Trace>>,
-) -> AdmissionDecision {
-    let fallback = Resources {
-        cpu: capacity,
-        memory_bytes: capacity.saturating_mul(request.bytes_per_permit),
-    };
-    let budget = request.global_budget(fallback);
-    let charge = request.resources();
-    if !build_fits(live, &request.build, charge.cpu)
-        || !request
-            .domain_budget()
-            .fits(domain_used(live, &request.domain), charge)
-        || !budget.fits(scope_used(live.iter()), charge)
-    {
-        return AdmissionDecision::Waiting;
-    }
-    let mut older: Vec<_> = if let Some(trace) = trace {
-        let all_older: Vec<_> = waiting
-            .filter(|older| older.ticket < request.ticket)
-            .collect();
-        trace.borrow_mut().initialize(&all_older, live, request);
-        all_older
-            .into_iter()
-            .filter(|older| !priority_exception(older, request))
-            .collect()
-    } else {
-        waiting
-            .filter(|older| older.ticket < request.ticket && !priority_exception(older, request))
-            .collect()
-    };
-    older.sort_unstable_by_key(|older| older.ticket);
-    let ordered_blocked = older
-        .iter()
-        .any(|older| older_exception(live, older, request).is_none());
-    if !ordered_blocked {
-        return AdmissionDecision::Ordered;
-    }
-    let scope_allows = |budget: Resources, build: Option<&str>, domain: Option<&str>| {
-        let live: Vec<_> = live
-            .iter()
-            .filter(|lease| {
-                build.is_none_or(|id| lease.build_id.as_deref() == Some(id))
-                    && domain.is_none_or(|id| {
-                        lease
-                            .domain
-                            .as_deref()
-                            .is_none_or(|lease_id| lease_id == id)
-                    })
-            })
-            .map(Lease::resources)
-            .collect();
-        let heads: Vec<_> = older
-            .iter()
-            .filter(|waiter| {
-                build.is_none_or(|id| waiter.build.as_ref().map(|(id, _)| id.as_str()) == Some(id))
-                    && domain.is_none_or(|id| waiter.domain == id)
-            })
-            .map(|waiter| waiter.resources())
-            .collect();
-        let tickets = trace.map(|_| {
-            older
-                .iter()
-                .filter(|waiter| {
-                    build.is_none_or(|id| {
-                        waiter.build.as_ref().map(|(id, _)| id.as_str()) == Some(id)
-                    }) && domain.is_none_or(|id| waiter.domain == id)
-                })
-                .map(|w| w.ticket)
-                .collect::<Vec<_>>()
-        });
-        let scope = if build.is_some() {
-            "build"
-        } else if domain.is_some() {
-            "domain"
-        } else {
-            "global"
-        };
-        let cpus: Vec<_> = live.iter().map(|r| r.cpu).collect();
-        let head_cpus: Vec<_> = heads.iter().map(|r| r.cpu).collect();
-        let memory: Vec<_> = live.iter().map(|r| r.memory_bytes).collect();
-        let head_memory: Vec<_> = heads.iter().map(|r| r.memory_bytes).collect();
-        // Subsets sufficient on both axes are a subset of those sufficient
-        // on either one. Independent minima are therefore no larger than
-        // the joint minimum; requiring both independent slack bounds is safe.
-        // The same containment gives each axis a second bound: a completion
-        // set that lets an older prefix start also frees the other axis's
-        // shortfall, and with it at least `freed_alongside` of this one.
-        let cores_freed = if budget.memory_bytes == 0 {
-            vec![0; heads.len()]
-        } else {
-            freed_alongside(
-                budget.memory_bytes,
-                &live,
-                &heads,
-                |r| r.memory_bytes,
-                |r| r.cpu,
-            )
-        };
-        let memory_freed =
-            freed_alongside(budget.cpu, &live, &heads, |r| r.cpu, |r| r.memory_bytes);
-        pass_quantized(
-            budget.cpu,
-            &cpus,
-            &head_cpus,
-            &cores_freed,
-            charge.cpu,
-            1,
-            |i, slack| {
-                if let (Some(trace), Some(tickets)) = (trace, tickets.as_ref()) {
-                    trace
-                        .borrow_mut()
-                        .slack(tickets[i], scope, budget, "cpu", slack);
-                }
-            },
-        ) && (budget.memory_bytes == 0
-            || pass_quantized(
-                budget.memory_bytes,
-                &memory,
-                &head_memory,
-                &memory_freed,
-                charge.memory_bytes,
-                MEMORY_QUANTUM,
-                |i, slack| {
-                    if let (Some(trace), Some(tickets)) = (trace, tickets.as_ref()) {
-                        trace
-                            .borrow_mut()
-                            .slack(tickets[i], scope, budget, "memory_bytes", slack);
-                    }
-                },
-            ))
-    };
-    if !scope_allows(budget, None, None) {
-        return AdmissionDecision::Waiting;
-    }
-    // Queue entries commonly share budgets. Evaluate each physical scope's
-    // distinct ceilings once, as in the scalar policy.
-    let mut checked_global = std::collections::BTreeSet::from([(budget.cpu, budget.memory_bytes)]);
-    let mut checked = std::collections::BTreeSet::new();
-    for waiter in &older {
-        let global = waiter.global_budget(budget);
-        if checked_global.insert((global.cpu, global.memory_bytes))
-            && !scope_allows(global, None, None)
-        {
-            return AdmissionDecision::Waiting;
-        }
-        let domain = waiter.domain_budget();
-        if waiter.domain == request.domain
-            && checked.insert((false, domain.cpu, domain.memory_bytes))
-            && !scope_allows(domain, None, Some(&waiter.domain))
-        {
-            return AdmissionDecision::Waiting;
-        }
-        if let (Some((id, ceiling)), Some((request_id, _))) = (&waiter.build, &request.build)
-            && id == request_id
-            && checked.insert((true, *ceiling, 0))
-            && !scope_allows(
-                Resources {
-                    cpu: *ceiling,
-                    memory_bytes: 0,
-                },
-                Some(id),
-                None,
-            )
-        {
-            return AdmissionDecision::Waiting;
-        }
-    }
-    // Old writers still decide their own admission using scalar weights.
-    // Vector slack cannot protect them: max(cpu, memory permits) is not
-    // additive across leases with different dominant resources.
-    let scalar_scope_allows = |capacity, unit, build: Option<&str>, domain: Option<&str>| {
-        let weights: Vec<_> = live
-            .iter()
-            .filter(|lease| {
-                build.is_none_or(|id| lease.build_id.as_deref() == Some(id))
-                    && domain
-                        .is_none_or(|id| lease.domain.as_deref().is_none_or(|other| other == id))
-            })
-            .map(|lease| weight_in_units(lease.weight, lease.bytes_per_permit, unit))
-            .collect();
-        let heads: Vec<_> = older
-            .iter()
-            .filter(|waiter| {
-                build.is_none_or(|id| waiter.build.as_ref().map(|(id, _)| id.as_str()) == Some(id))
-                    && domain.is_none_or(|id| waiter.domain == id)
-            })
-            .map(|waiter| weight_in_units(waiter.weight, waiter.bytes_per_permit, unit))
-            .collect();
-        let tickets = trace.map(|_| {
-            older
-                .iter()
-                .filter(|waiter| {
-                    build.is_none_or(|id| {
-                        waiter.build.as_ref().map(|(id, _)| id.as_str()) == Some(id)
-                    }) && domain.is_none_or(|id| waiter.domain == id)
-                })
-                .map(|w| w.ticket)
-                .collect::<Vec<_>>()
-        });
-        let scope = if build.is_some() {
-            "legacy:build"
-        } else if domain.is_some() {
-            "legacy:domain"
-        } else {
-            "legacy:global"
-        };
-        pass_quantized(
-            capacity,
-            &weights,
-            &heads,
-            &vec![0; heads.len()],
-            weight_in_units(request.weight, request.bytes_per_permit, unit),
-            1,
-            |i, slack| {
-                if let (Some(trace), Some(tickets)) = (trace, tickets.as_ref()) {
-                    trace.borrow_mut().slack(
-                        tickets[i],
-                        scope,
-                        Resources {
-                            cpu: capacity,
-                            memory_bytes: unit,
-                        },
-                        "weight",
-                        slack,
-                    );
-                }
-            },
-        )
-    };
-    let mut scalar_checked = std::collections::BTreeSet::new();
-    for waiter in &older {
-        // New waiters need only the vector checks. An old scalar passer
-        // reading their legacy weights is conservative: weight >= cpu and
-        // weight * bytes_per_permit >= memory (subject to the existing
-        // legacy capacity clamp for oversized demands).
-        if waiter.cpu.is_some() && waiter.memory_bytes.is_some() {
-            continue;
-        }
-        let unit = waiter.bytes_per_permit;
-        let global = waiter.global_capacity.unwrap_or(capacity);
-        if scalar_checked.insert((0, global, unit))
-            && !scalar_scope_allows(global, unit, None, None)
-        {
-            return AdmissionDecision::Waiting;
-        }
-        if waiter.domain == request.domain
-            && scalar_checked.insert((1, waiter.domain_capacity, unit))
-            && !scalar_scope_allows(waiter.domain_capacity, unit, None, Some(&waiter.domain))
-        {
-            return AdmissionDecision::Waiting;
-        }
-        if let (Some((id, ceiling)), Some((request_id, _))) = (&waiter.build, &request.build)
-            && id == request_id
-            && scalar_checked.insert((2, *ceiling, unit))
-            && !scalar_scope_allows(*ceiling, unit, Some(id), None)
-        {
-            return AdmissionDecision::Waiting;
-        }
-    }
-    AdmissionDecision::Passing
-}
-
 /// Who one grant of an admission pass went to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Grantee {
@@ -1216,8 +760,6 @@ struct PassGrant {
 #[derive(Clone, Copy)]
 struct PassContext {
     now_ms: u64,
-    /// A normal-priority request is waiting, so low-priority budgets yield.
-    normal_waiting: bool,
     /// The reading every request's available-memory gate compares.
     available_memory: Option<u64>,
     /// Pressure recovery or resuming suspended work spaces admissions out:
@@ -1237,18 +779,37 @@ struct Pass {
     grants: Vec<PassGrant>,
 }
 
-/// One admission pass: every request the ordered/passing rule admits, in
-/// ticket order, judged against the live leases and the grants this pass made
-/// before it.
+/// How long a request waits before it goes ahead of the fresher requests of
+/// its priority and, unable to start even so, holds back the requests behind
+/// it in the scopes it is short of: the starvation bound.
+const AGING_MS: u64 = 30_000;
+
+/// One admission pass: the pool rule over every live queued request and the
+/// caller's own (`POOL_RULE` of SmoothBricks' admission simulator, the
+/// reference policy, over mbx's scopes and request shapes).
 ///
-/// The rule is `admission_decision_traced`'s; the pass decides who applies
-/// it. A queued request is admitted as soon as any participant sees room for
-/// it, not when its own process next wins the registrar, so a younger request
-/// waits only behind an older one the rule protects -- one that does not fit
-/// yet -- never behind one that fits and has not polled. A record the pass
-/// may not grant on its holder's behalf stays queued as published, and order
-/// binds it exactly as before: one from another memory domain, whose pressure
-/// this process does not see, or from a version that admits only itself.
+/// - **Order.** `normal` before `low`. Within a priority, requests that have
+///   waited [`AGING_MS`] go first, oldest first, then the rest by ticket.
+/// - **Grant.** Each request is judged against what the grants before it
+///   leave of every scope it is charged in: the global pool, its memory
+///   domain and its build. A rigid request starts when all of it fits; a
+///   moldable one as soon as one core is free, on as many of its cores as are
+///   free. Memory is charged whole either way: a process's predicted peak
+///   does not shrink with its cores. A request that cannot start is passed by
+///   the requests behind it that can, so no core idles while a request that
+///   could start on it waits.
+/// - **Hold.** An aged request that cannot start holds back the requests
+///   behind it in each scope it is short of, which bounds its wait: every
+///   request when it is short of the global pool, only those of its domain or
+///   its build when it is short of only that ceiling.
+///
+/// A queued request is admitted as soon as any participant sees room for it,
+/// not when its own process next wins the registrar. One from another memory
+/// domain, whose pressure this process does not see, is left to its own
+/// process, but still takes its turn: the room it could start on is left for
+/// that process to claim. One from a version before this rule, which orders
+/// by ticket and would wait for ours, is left to that version when this
+/// process may not grant it.
 fn admission_pass(
     live: Vec<Lease>,
     queue: &[Waiting],
@@ -1257,22 +818,23 @@ fn admission_pass(
     context: PassContext,
     trace: bool,
 ) -> Pass {
-    // A record as its holder would judge itself right now.
-    let judge = |record: &Waiting, handoff: Handoff| {
-        let budget = yielded(
-            handoff.budget,
-            context.normal_waiting && record.priority == "low",
-        );
-        let record = Waiting {
-            global_capacity: Some(budget.cpu),
-            cpu_cap: Some(budget.cpu),
-            mem_cap: Some(budget.memory_bytes),
-            handoff: Some(handoff),
-            ..record.clone()
-        };
-        (record, budget.cpu)
+    // A record as its holder would judge itself: against its holder's budget.
+    let judge = |record: &Waiting, handoff: Handoff| Waiting {
+        global_capacity: Some(handoff.budget.cpu),
+        cpu_cap: Some(handoff.budget.cpu),
+        mem_cap: Some(handoff.budget.memory_bytes),
+        handoff: Some(handoff),
+        ..record.clone()
     };
-    let (request, request_capacity) = judge(&request, handoff);
+    let request = judge(&request, handoff);
+    let queue: Vec<Waiting> = queue
+        .iter()
+        .map(|record| {
+            record
+                .handoff
+                .map_or_else(|| record.clone(), |handoff| judge(record, handoff))
+        })
+        .collect();
     // The caller's own published record, when it has one, is superseded by
     // its request.
     let mut waiting: Vec<bool> = queue
@@ -1280,59 +842,103 @@ fn admission_pass(
         .map(|record| record.ticket != request.ticket)
         .collect();
     let mut request_waiting = true;
-    let mut order = vec![(request.ticket, Grantee::Request, request_capacity)];
-    let queue: Vec<Waiting> = queue
-        .iter()
-        .enumerate()
-        .map(|(index, record)| match record.handoff {
-            Some(handoff) if waiting[index] && record.domain == request.domain => {
-                let (record, capacity) = judge(record, handoff);
-                order.push((record.ticket, Grantee::Queued(index), capacity));
-                record
-            }
-            _ => record.clone(),
-        })
+    let record_of = |grantee: Grantee| match grantee {
+        Grantee::Queued(index) => &queue[index],
+        Grantee::Request => &request,
+    };
+    let since = |record: &Waiting| record.first_arrival_ms.unwrap_or(context.now_ms);
+    let aged = |record: &Waiting| context.now_ms.saturating_sub(since(record)) >= AGING_MS;
+    let mut order: Vec<Grantee> = std::iter::once(Grantee::Request)
+        .chain(
+            (0..queue.len())
+                .filter(|&index| waiting[index])
+                .map(Grantee::Queued),
+        )
         .collect();
-    order.sort_unstable_by_key(|(ticket, _, _)| *ticket);
+    order.sort_unstable_by_key(|&grantee| {
+        let record = record_of(grantee);
+        let aged = aged(record);
+        (
+            record.priority != "normal",
+            !aged,
+            if aged { since(record) } else { 0 },
+            record.ticket,
+        )
+    });
     let mut live = live;
+    // What this pass leaves to the requests it may not grant.
+    let mut left: Vec<Lease> = Vec::new();
+    // The scopes aged requests that could not start hold back.
+    let mut held: Vec<Scope<'_>> = Vec::new();
     let mut grants = Vec::new();
-    for (_, grantee, capacity) in order {
+    for grantee in order {
         if context.single && !grants.is_empty() {
             break;
         }
-        let record = match grantee {
-            Grantee::Queued(index) => &queue[index],
-            Grantee::Request => &request,
-        };
-        let gated = record
-            .handoff
-            .and_then(|handoff| handoff.gate)
-            .is_some_and(|gate| {
-                context.now_ms < gate.until_ms
-                    && !live.is_empty()
-                    && context
-                        .available_memory
-                        .is_some_and(|available| available < gate.bytes)
-            });
+        let record = record_of(grantee);
+        if held.iter().any(|scope| scope.covers(record)) {
+            continue;
+        }
+        let grantable = grantee == Grantee::Request
+            || (record.handoff.is_some() && record.domain == request.domain);
+        if !grantable && record.shape.is_none() {
+            continue;
+        }
+        // Only this domain's reading can judge an available-memory gate.
+        // Another domain's process takes its request out of the queue while
+        // its gate applies.
+        let gated = grantable
+            && record
+                .handoff
+                .and_then(|handoff| handoff.gate)
+                .is_some_and(|gate| {
+                    context.now_ms < gate.until_ms
+                        && !live.is_empty()
+                        && context
+                            .available_memory
+                            .is_some_and(|available| available < gate.bytes)
+                });
         if gated {
             continue;
         }
-        let others = || {
-            queue
-                .iter()
-                .zip(&waiting)
-                .filter_map(|(other, waiting)| waiting.then_some(other))
-                .chain(request_waiting.then_some(&request))
+        let want = record.resources();
+        let shape = record.shape.unwrap_or_default();
+        let scopes = scopes(record, live.iter().chain(&left), handoff.budget);
+        let Some(charge) = grant(
+            want,
+            shape,
+            scopes.clone().map(|(_, budget, used)| (budget, used)),
+        ) else {
+            if aged(record) {
+                held.extend(
+                    scopes
+                        .filter(|&(_, budget, used)| grant(want, shape, [(budget, used)]).is_none())
+                        .map(|(scope, ..)| scope),
+                );
+            }
+            continue;
         };
-        let decision = admission_decision_traced(capacity, &live, others(), record, None);
-        if decision == AdmissionDecision::Waiting {
+        if !grantable {
+            left.push(granted_lease(record, charge));
             continue;
         }
-        // Tracing observes the very same predicates; only grants are logged.
+        let mut older = queue
+            .iter()
+            .zip(&waiting)
+            .filter_map(|(other, &waiting)| waiting.then_some(other))
+            .chain(request_waiting.then_some(&request))
+            .filter(|other| other.ticket < record.ticket)
+            .peekable();
+        let decision = if older.peek().is_none() {
+            AdmissionDecision::Ordered
+        } else {
+            AdmissionDecision::Passing
+        };
         let trace = trace.then(|| {
-            let trace = std::cell::RefCell::new(decisions::Trace::default());
-            admission_decision_traced(capacity, &live, others(), record, Some(&trace));
-            trace.into_inner()
+            let older: Vec<&Waiting> = older.collect();
+            let mut trace = decisions::Trace::default();
+            trace.initialize(&older, &live, record);
+            trace
         });
         grants.push(PassGrant {
             grantee,
@@ -1340,7 +946,7 @@ fn admission_pass(
             live_before: live.len(),
             trace,
         });
-        live.push(Lease::from(record));
+        live.push(granted_lease(record, charge));
         match grantee {
             Grantee::Queued(index) => waiting[index] = false,
             Grantee::Request => request_waiting = false,
@@ -1351,6 +957,139 @@ fn admission_pass(
         queue,
         request,
         grants,
+    }
+}
+
+/// The scopes a request is charged in, with its budget in each and what the
+/// leases use of it.
+type Scopes<'r> = std::iter::Chain<
+    std::array::IntoIter<(Scope<'r>, Resources, Resources), 2>,
+    std::option::IntoIter<(Scope<'r>, Resources, Resources)>,
+>;
+/// A scope a request is charged in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Scope<'a> {
+    Global,
+    Domain(&'a str),
+    Build(&'a str),
+}
+
+impl Scope<'_> {
+    /// Whether `record` is charged in this scope, and so held back with it.
+    fn covers(&self, record: &Waiting) -> bool {
+        match *self {
+            Scope::Global => true,
+            Scope::Domain(domain) => record.domain == domain,
+            Scope::Build(build) => record
+                .build
+                .as_ref()
+                .is_some_and(|(id, _)| id.as_str() == build),
+        }
+    }
+}
+
+/// Every scope `record` is charged in, with its budget there and what
+/// `leases` use of it: the global pool; its memory domain, where a lease of
+/// no domain counts in every domain; and its build's cores. `fallback` is the
+/// global budget of a record from a version that names none.
+fn scopes<'r, 'l>(
+    record: &'r Waiting,
+    leases: impl Iterator<Item = &'l Lease>,
+    fallback: Resources,
+) -> Scopes<'r> {
+    let add = |sum: Resources, charge: Resources| Resources {
+        cpu: sum.cpu.saturating_add(charge.cpu),
+        memory_bytes: sum.memory_bytes.saturating_add(charge.memory_bytes),
+    };
+    let build = record
+        .build
+        .as_ref()
+        .map(|(id, ceiling)| (id.as_str(), *ceiling));
+    let (mut global, mut domain, mut build_cpu) = (Resources::default(), Resources::default(), 0);
+    for lease in leases {
+        let charge = lease.resources();
+        global = add(global, charge);
+        if lease.domain.as_deref().is_none_or(|id| id == record.domain) {
+            domain = add(domain, charge);
+        }
+        if build.is_some_and(|(id, _)| lease.build_id.as_deref() == Some(id)) {
+            build_cpu += charge.cpu;
+        }
+    }
+    [
+        (Scope::Global, record.global_budget(fallback), global),
+        (
+            Scope::Domain(&record.domain),
+            record.domain_budget(),
+            domain,
+        ),
+    ]
+    .into_iter()
+    .chain(build.map(|(id, ceiling)| {
+        (
+            Scope::Build(id),
+            Resources {
+                cpu: ceiling,
+                memory_bytes: 0,
+            },
+            Resources {
+                cpu: build_cpu,
+                memory_bytes: 0,
+            },
+        )
+    }))
+}
+
+/// What `want` starts on in scopes with these budgets and uses: all of it,
+/// or for a moldable request as many of its cores as every scope has free,
+/// at least one; `None` when it cannot start. Memory is charged whole, and a
+/// zero memory budget is unbounded. An axis nobody in a scope holds takes any
+/// request there, so an oversize request runs alone: a rigid one whole, a
+/// moldable one on the scope's whole budget.
+fn grant(
+    want: Resources,
+    shape: Shape,
+    scopes: impl IntoIterator<Item = (Resources, Resources)>,
+) -> Option<Resources> {
+    let mut cpu = want.cpu;
+    for (budget, used) in scopes {
+        if budget.memory_bytes > 0
+            && !fits(used.memory_bytes, want.memory_bytes, budget.memory_bytes)
+        {
+            return None;
+        }
+        let free = budget.cpu.saturating_sub(used.cpu);
+        cpu = match shape {
+            Shape::Rigid if used.cpu == 0 => cpu,
+            Shape::Moldable if used.cpu == 0 => cpu.min(free.max(1)),
+            Shape::Rigid | Shape::Moldable => cpu.min(free),
+        };
+    }
+    let least = match shape {
+        Shape::Rigid => want.cpu,
+        Shape::Moldable => want.cpu.min(1),
+    };
+    (cpu >= least).then_some(Resources { cpu, ..want })
+}
+
+/// The lease a grant of `charge` to `record` holds: the one its record asks
+/// for when the grant is whole. A narrower grant holds fewer cores, and the
+/// legacy scalar older readers charge counts what it holds on either axis,
+/// never more than the whole request's.
+fn granted_lease(record: &Waiting, charge: Resources) -> Lease {
+    let lease = Lease::from(record);
+    if charge == record.resources() {
+        return lease;
+    }
+    let memory_permits = match record.bytes_per_permit {
+        0 => 0,
+        unit => charge.memory_bytes.div_ceil(unit),
+    };
+    Lease {
+        cpu: Some(charge.cpu),
+        memory_bytes: Some(charge.memory_bytes),
+        weight: record.weight.min(charge.cpu.max(memory_permits)),
+        ..lease
     }
 }
 
@@ -1891,8 +1630,8 @@ pub(crate) fn pool() -> Option<&'static Pool> {
 ///
 /// Reservations are explicit user requests, unlike compiler shims where a
 /// broken scheduler must fail open. Keep their priority separate from the
-/// configured default: an unattended external job may deliberately yield to
-/// normal builds without changing the priority of every later Cargo command.
+/// configured default: an unattended external job may go after normal builds
+/// without changing the priority of every later Cargo command.
 pub(crate) fn reservation_pool(config: &Config, priority: SchedulerPriority) -> Option<Pool> {
     let scheduler = &config.scheduler;
     scheduler.enabled.then(|| {
@@ -2144,7 +1883,7 @@ impl Pool {
             local_memory_ceiling(memory, crate::util::memory_total_bytes());
     }
 
-    /// The configured global budget, before any low-priority yield.
+    /// The configured global budget.
     fn budget(&self) -> Resources {
         Resources {
             cpu: self.capacity,
@@ -2214,9 +1953,8 @@ impl Pool {
         let _phase = crate::phase_timing::phase("permit_wait");
         demand.observation.set(None);
         let started = Instant::now();
-        let mut state = AdmissionState::new((self.clock)(), self.events);
+        let mut state = AdmissionState::new((self.clock)(), Shape::Rigid);
         let mut wake: Option<wait::Wait> = None;
-        let mut stamped: Option<Instant> = None;
         let mut complained = false;
         let mut ledger_cache = None;
         loop {
@@ -2255,15 +1993,6 @@ impl Pool {
                     debug!("compiling without a machine-wide permit: {error:#}");
                     return None;
                 }
-            }
-            // Refreshed well inside the freshness window rather than on every
-            // attempt: this says "somebody is waiting", which does not become
-            // truer for being written forty times a second by every waiter.
-            if self.priority == SchedulerPriority::Normal
-                && stamped.is_none_or(|last| last.elapsed() >= PRIORITY_STAMP_INTERVAL)
-            {
-                let _ = std::fs::write(self.dir.join(PRIORITY_WAIT_STAMP), b"");
-                stamped = Some(Instant::now());
             }
             // A pool that is genuinely full is a pool doing its job, so this
             // waits rather than giving up. Said once, because the alternative
@@ -2322,9 +2051,8 @@ impl Pool {
         let weight = self.reservation_weight(cpus, memory_bytes)?;
 
         let started = Instant::now();
-        let mut state = AdmissionState::new((self.clock)(), self.events);
+        let mut state = AdmissionState::new((self.clock)(), Shape::Moldable);
         let mut wake: Option<wait::Wait> = None;
-        let mut stamped: Option<Instant> = None;
         loop {
             // Like compiler admission, a persistently low available-memory
             // reading must not turn an advisory gate into permanent starvation.
@@ -2340,12 +2068,6 @@ impl Pool {
                 None,
             )? {
                 return Ok(permit);
-            }
-            if self.priority == SchedulerPriority::Normal
-                && stamped.is_none_or(|last| last.elapsed() >= PRIORITY_STAMP_INTERVAL)
-            {
-                let _ = std::fs::write(self.dir.join(PRIORITY_WAIT_STAMP), b"");
-                stamped = Some(Instant::now());
             }
             if let Some(wake) = &mut wake {
                 state.periodic = wake.pause();
@@ -2570,13 +2292,18 @@ impl Pool {
         queued: &mut Option<QueueEntry>,
         demand: Option<&Demand>,
     ) -> Result<Option<Permit>> {
+        // A queued request keeps its age across attempts, as its record says.
         let first_arrival_ms = queued
             .as_ref()
-            .and_then(|entry| entry.record.as_ref()?.first_arrival_ms)
+            .and_then(|entry| {
+                serde_json::from_slice::<Waiting>(&entry.serialized_record)
+                    .ok()?
+                    .first_arrival_ms
+            })
             .unwrap_or_else(|| (self.clock)());
         let mut state = AdmissionState {
             queued: queued.take(),
-            ..AdmissionState::new(first_arrival_ms, true)
+            ..AdmissionState::new(first_arrival_ms, Shape::Rigid)
         };
         let result = self.try_admit_state(resources, weight, predicted, &mut state, demand);
         *queued = state.queued;
@@ -2647,6 +2374,7 @@ impl Pool {
         let live = scan_leases(&leases)?;
         let now = (self.clock)();
         let first_arrival_ms = state.first_arrival_ms;
+        let shape = state.shape;
         // Broken sensing disables only this advisory gate, never CPU scheduling.
         let pressure_state = (self.pressure && self.bytes_per_permit > 0)
             .then(|| crate::pressure::domain_state(&self.dir, self.pressure_domain));
@@ -2658,7 +2386,7 @@ impl Pool {
             && crate::supervision::resumes_pending(&self.dir, now);
         if resuming && !live.is_empty() {
             self.gated(state, "resumes-pending", events, || {
-                self.waiting_record(resources, weight, demand, first_arrival_ms, u64::MAX)
+                self.waiting_record(resources, weight, demand, first_arrival_ms, shape, u64::MAX)
             });
             return Ok(None);
         }
@@ -2672,7 +2400,7 @@ impl Pool {
                     })))
         {
             self.gated(state, "pressure", events, || {
-                self.waiting_record(resources, weight, demand, first_arrival_ms, u64::MAX)
+                self.waiting_record(resources, weight, demand, first_arrival_ms, shape, u64::MAX)
             });
             return Ok(None);
         }
@@ -2692,7 +2420,7 @@ impl Pool {
             && available < needed
         {
             self.gated(state, "available-memory", events, || {
-                self.waiting_record(resources, weight, demand, first_arrival_ms, u64::MAX)
+                self.waiting_record(resources, weight, demand, first_arrival_ms, shape, u64::MAX)
             });
             return Ok(None);
         }
@@ -2705,7 +2433,7 @@ impl Pool {
         let pass = admission_pass(
             live,
             &records,
-            self.waiting_record(resources, weight, demand, first_arrival_ms, ticket),
+            self.waiting_record(resources, weight, demand, first_arrival_ms, shape, ticket),
             Handoff {
                 budget: self.budget(),
                 gate: predicted.map(|bytes| Gate {
@@ -2715,7 +2443,6 @@ impl Pool {
             },
             PassContext {
                 now_ms: now,
-                normal_waiting: self.priority_wait_is_fresh(),
                 available_memory,
                 // Each admission spaces out the next: recovery admits one at a
                 // time, and once anything runs, pressure or work waiting to
@@ -2805,10 +2532,11 @@ impl Pool {
         weight: u64,
         demand: Option<&Demand>,
         first_arrival_ms: u64,
+        shape: Shape,
         ticket: u64,
     ) -> Waiting {
         Waiting {
-            first_arrival_ms: self.events.then_some(first_arrival_ms),
+            first_arrival_ms: Some(first_arrival_ms),
             pid: Some(std::process::id()),
             name: demand.map(|d| d.name.clone()),
             mode_key: demand.map(|d| {
@@ -2831,6 +2559,7 @@ impl Pool {
             bytes_per_permit: self.bytes_per_permit,
             build: self.build.clone(),
             handoff: None,
+            shape: Some(shape),
         }
     }
 
@@ -2888,10 +2617,6 @@ impl Pool {
         }
         Err(last.expect("a name is only retried after a collision"))
             .wrap_err("failed to name a lease that was not already taken")
-    }
-
-    fn priority_wait_is_fresh(&self) -> bool {
-        stamp_is_fresh(&self.dir.join(PRIORITY_WAIT_STAMP), PRIORITY_WAIT_FRESHNESS)
     }
 
     /// Only a pass in this pressure domain can grant this queued request.

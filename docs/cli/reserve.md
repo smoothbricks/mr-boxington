@@ -5,7 +5,7 @@
 
 Hold scheduler capacity while an external command runs.
 
-This is for work such as a VM, Docker build, or another compiler that consumes the same machine resources but does not run through mbx. It waits for the requested capacity, runs the command, and releases that capacity whenever the command or its mbx parent exits.
+This is for work such as a VM, Docker build, or another compiler that consumes the same machine resources but does not run through mbx. It waits for capacity, runs the command, and releases that capacity whenever the command or its mbx parent exits. `--cpus` is a maximum: the command starts on as many of those cores as are free, at least one, and reads that count from `MBX_RESERVE_CPUS`.
 
 `--memory` is charged against `scheduler.memory`, so it needs that setting to be enabled. Specify one or both resource flags, as in `mbx reserve --memory 6GiB --cpus 4 -- ./run-windows-build-in-vm.sh`.
 
@@ -13,9 +13,9 @@ This is for work such as a VM, Docker build, or another compiler that consumes t
 - **`<COMMAND>…`** — Command and arguments to run while capacity is reserved.
 
 ## Flags
-- **`--cpus <N>`** — CPU cores to hold while the command runs.
+- **`--cpus <N>`** — Most CPU cores to hold while the command runs. The pool may grant fewer, at least one, as soon as one is free; the command reads the count it was granted from `MBX_RESERVE_CPUS`.
 - **`--memory <SIZE>`** — Memory to hold from the configured scheduler budget.
-- **`--priority <PRIORITY>`** — Whether this reservation yields capacity to normal-priority builds.
+- **`--priority <PRIORITY>`** — Priority in the machine-wide pool: `low` goes after waiting normal-priority work.
 
   **Default:** `normal`
 - **`--grant-fd <FD>`** — Descriptor to announce the reservation on: one byte, `g`, once capacity is granted, and `r` once it is released after the command.

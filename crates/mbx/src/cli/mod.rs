@@ -203,8 +203,10 @@ enum Commands {
     ///
     /// This is for work such as a VM, Docker build, or another compiler that
     /// consumes the same machine resources but does not run through mbx.
-    /// It waits for the requested capacity, runs the command, and releases
-    /// that capacity whenever the command or its mbx parent exits.
+    /// It waits for capacity, runs the command, and releases that capacity
+    /// whenever the command or its mbx parent exits. `--cpus` is a maximum:
+    /// the command starts on as many of those cores as are free, at least one,
+    /// and reads that count from `MBX_RESERVE_CPUS`.
     ///
     /// `--memory` is charged against `scheduler.memory`, so it needs that
     /// setting to be enabled. Specify one or both resource flags, as in

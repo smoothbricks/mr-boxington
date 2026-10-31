@@ -339,6 +339,28 @@ mod unix {
         assert_eq!(locked_lease_files(&cache), Vec::<PathBuf>::new());
     }
 
+    /// `--cpus` is a maximum: the command reads the cores it was granted, and
+    /// a reservation nested in it reads its share of that grant.
+    #[test]
+    fn a_reservation_tells_its_command_the_cores_it_was_granted() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = temp.path().join("cache");
+        let output = reserve(temp.path(), &cache, "2")
+            .args(["--cpus", "8", "--", "sh", "-c"])
+            .arg(format!(
+                "echo \"$MBX_RESERVE_CPUS\"; '{}' reserve --cpus 1 -- sh -c 'echo \"$MBX_RESERVE_CPUS\"'",
+                env!("CARGO_BIN_EXE_mbx")
+            ))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "2\n1\n");
+    }
+
     /// The descriptor the grant tests name with `--grant-fd 5`, as Nx's
     /// bounded-exec executor does.
     const GRANT_FD: i32 = 5;
