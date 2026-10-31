@@ -234,7 +234,7 @@ releases its permits, so a crashed build cannot wedge its siblings.
 On macOS and Linux, queued work blocks on lease-directory notifications rather
 than repeatedly opening scheduler records. A bounded seconds-scale recheck
 recovers locks released by a process that died without removing its lease;
-notifications do not change the pool's FIFO admission rules.
+notifications do not change the pool's admission rules.
 
 Concurrent builds also stop repeating each other. Separate CI jobs with fresh
 targets can otherwise repeat the same dependency compilations. With mbx, a

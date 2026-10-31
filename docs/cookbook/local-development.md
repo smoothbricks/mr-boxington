@@ -129,9 +129,9 @@ budget, so other builds can keep it waiting. Builds started with larger
 settings are not limited by it and can still fill the machine.
 
 `scheduler.priority = "low"` suits unattended or background builds, but it is
-not a power limit. A low-priority build yields capacity to normal-priority
-builds and may still use the whole configured pool when nothing else is
-waiting.
+not a power limit. Normal-priority work waiting for the pool goes before a
+low-priority build, which may still use the whole configured pool when nothing
+else is waiting.
 
 ## Debug a binary restored from another checkout
 

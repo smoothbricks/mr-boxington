@@ -17,6 +17,13 @@ pub(crate) struct Admission {
     pub started: Instant,
 }
 
+impl Admission {
+    /// The cores this admission holds.
+    pub(crate) fn cpus(&self) -> u64 {
+        self.resources.cpu
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct Observation {
     v: u8,
@@ -107,9 +114,9 @@ impl Pool {
         cpus: Option<u64>,
         memory_bytes: Option<u64>,
     ) -> Result<(super::Permit, Admission)> {
-        let weight = self.reservation_weight(cpus, memory_bytes)?;
         let requested_at = Instant::now();
         let permit = self.reserve(cpus, memory_bytes)?;
+        let (resources, weight) = permit.granted()?;
         let wait_ms = requested_at
             .elapsed()
             .as_millis()
@@ -119,10 +126,7 @@ impl Pool {
             permit,
             Admission {
                 weight,
-                resources: Resources {
-                    cpu: cpus.unwrap_or(0),
-                    memory_bytes: memory_bytes.unwrap_or(0),
-                },
+                resources,
                 predicted: None,
                 source: "reservation",
                 wait_ms,
@@ -752,6 +756,22 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_reservation_records_the_cores_it_was_granted_not_those_it_asked_for() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = pool(dir.path(), 100);
+        // Wider than the pool: a moldable request starts on all of it, where
+        // a rigid one would run alone on all it asked for.
+        let (permit, admission) = pool.reserve_observed(Some(20), None).unwrap();
+        assert_eq!(admission.cpus(), 16);
+        assert_eq!(permit.granted().unwrap().0.cpu, 16);
+        drop(permit);
+        pool.observe_reservation(admission, Some(&status(0)));
+        let line = std::fs::read_to_string(dir.path().join(FILE)).unwrap();
+        let value: serde_json::Value = serde_json::from_str(line.lines().next().unwrap()).unwrap();
+        assert_eq!(value["charged_cpu"], 16);
+        assert_eq!(value["charged_permits"], 16);
+    }
     #[test]
     fn summary_prefers_exact_memory_charge_and_supports_legacy_lines() {
         let dir = tempfile::tempdir().unwrap();

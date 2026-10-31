@@ -450,9 +450,9 @@ struct RawScheduler {
     memory: Option<String>,
     /// Priority of this build's compilations in the machine-wide permit pool.
     ///
-    /// While a normal-priority build is waiting, a `low` build leaves about a
-    /// quarter of the pool free for it. This may also be set in workspace
-    /// `.mbx.toml`; the environment variable wins.
+    /// A waiting normal-priority request goes before every `low` one, which
+    /// starts only on room no waiting normal-priority request can use. This
+    /// may also be set in workspace `.mbx.toml`; the environment variable wins.
     #[usage(
         env = "MBX_SCHEDULER_PRIORITY",
         default = "normal",
@@ -936,8 +936,8 @@ impl Default for SchedulerSettings {
 /// Whose compilations wait when the machine is contended.
 ///
 /// `Low` is for builds nobody is sitting at, such as CI on a shared box or an
-/// editor's background check. They leave a share of the permit pool free
-/// whenever a normal-priority build is waiting for it.
+/// editor's background check. Normal-priority work waiting for the pool goes
+/// before them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SchedulerPriority {
     #[default]

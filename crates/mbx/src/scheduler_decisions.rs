@@ -13,16 +13,6 @@ const ADMITTED_LINE_BYTES: usize = 4096;
 const MAX_OVERTAKES: usize = 16;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct Slack {
-    scope: String,
-    capacity: Resources,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    bytes_per_permit: Option<u64>,
-    #[serde(flatten)]
-    dimensions: BTreeMap<String, u64>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 struct Overtake {
     ticket: u64,
     name: Option<String>,
@@ -41,8 +31,6 @@ struct Overtake {
     priority: Option<String>,
     waited_ms: u64,
     reason: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    slack: Vec<Slack>,
     #[serde(skip)]
     first_arrival_ms: Option<u64>,
 }
@@ -84,48 +72,9 @@ impl Trace {
                     reason: older_exception(live, older, request)
                         .unwrap_or("pass")
                         .into(),
-                    slack: Vec::new(),
                 }
             })
             .collect();
-    }
-
-    pub(super) fn slack(
-        &mut self,
-        ticket: u64,
-        scope: &str,
-        capacity: Resources,
-        dimension: &str,
-        value: u64,
-    ) {
-        let bytes_per_permit = scope
-            .starts_with("legacy:")
-            .then_some(capacity.memory_bytes);
-        let capacity = if bytes_per_permit.is_some() {
-            Resources {
-                cpu: capacity.cpu,
-                memory_bytes: 0,
-            }
-        } else {
-            capacity
-        };
-        if let Some(waiter) = self.overtook.iter_mut().find(|w| w.ticket == ticket) {
-            if waiter.reason != "pass" {
-                return;
-            }
-            if let Some(slack) = waiter.slack.iter_mut().find(|s| {
-                s.scope == scope && s.capacity == capacity && s.bytes_per_permit == bytes_per_permit
-            }) {
-                slack.dimensions.insert(dimension.into(), value);
-            } else {
-                waiter.slack.push(Slack {
-                    scope: scope.into(),
-                    capacity,
-                    bytes_per_permit,
-                    dimensions: BTreeMap::from([(dimension.into(), value)]),
-                });
-            }
-        }
     }
 }
 
@@ -322,7 +271,6 @@ impl Pool {
             match decision {
                 AdmissionDecision::Ordered => "ordered",
                 AdmissionDecision::Passing => "passing",
-                AdmissionDecision::Waiting => unreachable!("only granted permits are logged"),
             }
             .into(),
         );
@@ -656,6 +604,9 @@ impl Summary {
 mod tests {
     use super::*;
 
+    /// One memory share of these tests' pools.
+    const SHARE: u64 = 16 * 1024 * 1024;
+
     fn admit_event(
         pool: &Pool,
         request: &Waiting,
@@ -677,15 +628,10 @@ mod tests {
     }
 
     fn pool(dir: &Path, capacity: u64) -> Pool {
-        let mut pool = Pool::new(
-            dir.into(),
-            capacity,
-            MEMORY_QUANTUM,
-            SchedulerPriority::Normal,
-        );
+        let mut pool = Pool::new(dir.into(), capacity, SHARE, SchedulerPriority::Normal);
         pool.domain_capacity = capacity;
         pool.legacy_domain_capacity = capacity;
-        pool.domain_memory_capacity = capacity * MEMORY_QUANTUM;
+        pool.domain_memory_capacity = capacity * SHARE;
         pool.available_memory = || None;
         pool.pressure = false;
         pool.clock = || 1_000;
@@ -695,11 +641,11 @@ mod tests {
     fn record(ticket: u64, cpu: u64) -> Waiting {
         serde_json::from_value(serde_json::json!({
             "pid": 123, "first_arrival_ms": 100, "name": "crate", "mode_key": "crate [compile mode]",
-            "ticket": ticket, "weight": cpu, "cpu": cpu, "memory_bytes": cpu * MEMORY_QUANTUM,
+            "ticket": ticket, "weight": cpu, "cpu": cpu, "memory_bytes": cpu * SHARE,
             "priority": "normal", "domain": "host", "domain_capacity": 120,
-            "domain_cpu_cap": 120, "domain_memory_cap": 120 * MEMORY_QUANTUM,
-            "cpu_cap": 120, "mem_cap": 120 * MEMORY_QUANTUM,
-            "bytes_per_permit": MEMORY_QUANTUM, "build": ["build", 120]
+            "domain_cpu_cap": 120, "domain_memory_cap": 120 * SHARE,
+            "cpu_cap": 120, "mem_cap": 120 * SHARE,
+            "bytes_per_permit": SHARE, "build": ["build", 120]
         })).unwrap()
     }
 
@@ -795,7 +741,7 @@ mod tests {
     }
 
     #[test]
-    fn older_exceptions_share_admission_predicates() {
+    fn overtakes_name_the_exception_that_let_a_younger_request_start() {
         let request = record(10, 1);
         let mut older = record(1, 119);
         let mut occupied = record(0, 2);
@@ -819,83 +765,34 @@ mod tests {
                     occupied.domain = older.domain.clone();
                 }
             }
-            let trace = std::cell::RefCell::new(Trace::default());
-            assert_eq!(
-                admission_decision_traced(
-                    120,
-                    &[lease(&occupied)],
-                    [&older].into_iter(),
-                    &request,
-                    Some(&trace)
-                ),
-                AdmissionDecision::Ordered
-            );
-            let trace = trace.into_inner();
+            let mut trace = Trace::default();
+            trace.initialize(&[&older], &[lease(&occupied)], &request);
             assert_eq!(trace.overtook.len(), 1);
             assert_eq!(trace.overtook[0].reason, reason);
-            assert!(trace.overtook[0].slack.is_empty());
         }
     }
 
     #[test]
-    fn passing_reports_actual_prefix_slack_in_all_dimensions_and_scopes() {
+    fn an_admission_logs_its_free_scopes_and_the_requests_it_overtook() {
         let dir = tempfile::tempdir().unwrap();
         let pool = pool(dir.path(), 120);
         let mut request = record(10, 12);
-        request.memory_bytes = Some(8 * MEMORY_QUANTUM);
+        request.memory_bytes = Some(8 * SHARE);
         let older = record(1, 54);
         let live = [lease(&record(0, 54)), lease(&record(0, 54))];
-        let trace = std::cell::RefCell::new(Trace::default());
-        let decision =
-            admission_decision_traced(120, &live, [&older].into_iter(), &request, Some(&trace));
-        assert_eq!(decision, AdmissionDecision::Passing);
-        let trace = trace.into_inner();
-        let waiter = &trace.overtook[0];
-        assert_eq!(waiter.reason, "pass");
-        for scope in ["global", "domain"] {
-            let slack = waiter.slack.iter().find(|s| s.scope == scope).unwrap();
-            assert_eq!(slack.dimensions["cpu"], 12);
-            // The older request starts only once a 54-core lease completes,
-            // which frees 54 permits of memory: the cross-axis bound is exact
-            // where the quantized subset sum gave up its rounding.
-            assert_eq!(slack.dimensions["memory_bytes"], 12 * MEMORY_QUANTUM);
-        }
-        assert_eq!(
-            waiter
-                .slack
-                .iter()
-                .find(|s| s.scope == "build")
-                .unwrap()
-                .dimensions["cpu"],
-            12
-        );
-        admit_event(&pool, &request, &live, decision, trace);
+        let mut trace = Trace::default();
+        trace.initialize(&[&older], &live, &request);
+        assert_eq!(trace.overtook[0].reason, "pass");
+        admit_event(&pool, &request, &live, AdmissionDecision::Passing, trace);
         let logged = events(dir.path()).pop().unwrap();
+        assert_eq!(logged.rule.as_deref(), Some("passing"));
         assert_eq!(logged.free[0].cpu, 12);
-        assert_eq!(logged.free[0].memory_bytes, Some(12 * MEMORY_QUANTUM));
+        assert_eq!(logged.free[0].memory_bytes, Some(12 * SHARE));
         assert_eq!(logged.overtook.as_ref().unwrap()[0].waited_ms, 900);
         let json = serde_json::to_value(logged).unwrap();
         assert!(json["overtook"][0].get("domain").is_none());
         assert!(json["overtook"][0].get("build").is_none());
         assert!(json["overtook"][0].get("priority").is_none());
-        let mut legacy = older.clone();
-        legacy.cpu = None;
-        legacy.memory_bytes = None;
-        let trace = std::cell::RefCell::new(Trace::default());
-        assert_eq!(
-            admission_decision_traced(120, &live, [&legacy].into_iter(), &request, Some(&trace)),
-            AdmissionDecision::Passing
-        );
-        let trace = trace.into_inner();
-        for scope in ["legacy:global", "legacy:domain", "legacy:build"] {
-            let slack = trace.overtook[0]
-                .slack
-                .iter()
-                .find(|s| s.scope == scope)
-                .unwrap();
-            assert_eq!(slack.dimensions["weight"], 12);
-            assert_eq!(slack.bytes_per_permit, Some(MEMORY_QUANTUM));
-        }
     }
 
     #[test]
@@ -940,42 +837,15 @@ mod tests {
     }
 
     #[test]
-    fn oversized_first_overtake_keeps_the_decision_with_totals_only() {
-        let dir = tempfile::tempdir().unwrap();
-        let pool = pool(dir.path(), 120);
-        let request = record(100, 1);
-        let older = record(1, 1);
-        let mut trace = Trace::default();
-        trace.initialize(&[&older], &[], &request);
-        for i in 0..100 {
-            trace.slack(
-                older.ticket,
-                "global",
-                Resources {
-                    cpu: i,
-                    memory_bytes: i,
-                },
-                "cpu",
-                1,
-            );
-        }
-        admit_event(&pool, &request, &[], AdmissionDecision::Passing, trace);
-        let event = events(dir.path()).pop().unwrap();
-        assert_eq!(event.overtook_total, Some(1));
-        assert_eq!(event.overtook_logged, Some(0));
-        assert!(event.overtook.unwrap().is_empty());
-    }
-
-    #[test]
     fn queue_transitions_and_gate_requeues_preserve_first_arrival() {
         for reason in ["available-memory", "pressure", "resumes-pending", "error"] {
             let dir = tempfile::tempdir().unwrap();
             let mut pool = pool(dir.path(), 4);
             let held = pool.try_admit(3, None).unwrap().unwrap();
-            let mut state = AdmissionState::new(100, true);
+            let mut state = AdmissionState::new(100, Shape::Rigid);
             let resources = Resources {
                 cpu: 2,
-                memory_bytes: 2 * MEMORY_QUANTUM,
+                memory_bytes: 2 * SHARE,
             };
             for _ in 0..3 {
                 assert!(
@@ -1029,8 +899,7 @@ mod tests {
             } else {
                 None
             };
-            let outcome =
-                pool.try_admit_state(resources, 2, Some(2 * MEMORY_QUANTUM), &mut state, None);
+            let outcome = pool.try_admit_state(resources, 2, Some(2 * SHARE), &mut state, None);
             assert_eq!(outcome.is_err(), reason == "error");
             assert!(state.queued.is_none(), "{reason} must dequeue");
             let logged = events(dir.path());
@@ -1038,8 +907,7 @@ mod tests {
             assert_eq!(dequeued.event, "dequeued");
             assert_eq!(dequeued.reason.as_deref(), Some(reason));
             assert_eq!(dequeued.waited_ms, 900);
-            let retry =
-                pool.try_admit_state(resources, 2, Some(2 * MEMORY_QUANTUM), &mut state, None);
+            let retry = pool.try_admit_state(resources, 2, Some(2 * SHARE), &mut state, None);
             assert_eq!(retry.is_err(), reason == "error");
             assert_eq!(
                 events(dir.path()).len(),
@@ -1169,7 +1037,7 @@ mod tests {
         );
         pool.available_memory = || Some(0);
         assert!(
-            pool.try_admit_queued(2, Some(2 * MEMORY_QUANTUM), &mut queued)
+            pool.try_admit_queued(2, Some(2 * SHARE), &mut queued)
                 .unwrap()
                 .is_none()
         );
@@ -1276,15 +1144,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut pool = pool(dir.path(), 4);
         let held = pool.try_admit(3, None).unwrap().unwrap();
-        let mut state = AdmissionState::new(100, true);
+        let mut state = AdmissionState::new(100, Shape::Rigid);
         let resources = Resources {
             cpu: 1,
-            memory_bytes: 2 * MEMORY_QUANTUM,
+            memory_bytes: 2 * SHARE,
         };
         pool.available_memory = || Some(0);
         for _ in 0..3 {
             assert!(
-                pool.try_admit_state(resources, 2, Some(2 * MEMORY_QUANTUM), &mut state, None)
+                pool.try_admit_state(resources, 2, Some(2 * SHARE), &mut state, None)
                     .unwrap()
                     .is_none()
             );
@@ -1314,7 +1182,7 @@ mod tests {
         std::fs::write(suspended.join("fixture"), "1000").unwrap();
         for _ in 0..2 {
             assert!(
-                pool.try_admit_state(resources, 2, Some(2 * MEMORY_QUANTUM), &mut state, None)
+                pool.try_admit_state(resources, 2, Some(2 * SHARE), &mut state, None)
                     .unwrap()
                     .is_none()
             );
@@ -1322,14 +1190,14 @@ mod tests {
         std::fs::remove_file(suspended.join("fixture")).unwrap();
         for _ in 0..2 {
             assert!(
-                pool.try_admit_state(resources, 2, Some(2 * MEMORY_QUANTUM), &mut state, None)
+                pool.try_admit_state(resources, 2, Some(2 * SHARE), &mut state, None)
                     .unwrap()
                     .is_none()
             );
         }
         pool.pressure = false;
         assert!(
-            pool.try_admit_state(resources, 2, Some(2 * MEMORY_QUANTUM), &mut state, None)
+            pool.try_admit_state(resources, 2, Some(2 * SHARE), &mut state, None)
                 .unwrap()
                 .is_none()
         );
@@ -1343,7 +1211,7 @@ mod tests {
         pool.available_memory = || Some(0);
         for _ in 0..3 {
             assert!(
-                pool.try_admit_state(resources, 2, Some(2 * MEMORY_QUANTUM), &mut state, None)
+                pool.try_admit_state(resources, 2, Some(2 * SHARE), &mut state, None)
                     .unwrap()
                     .is_none()
             );
@@ -1412,11 +1280,11 @@ mod tests {
         let mut pool = pool(dir.path(), 4);
         pool.events = false;
         let held = pool.try_admit(3, None).unwrap().unwrap();
-        let mut state = AdmissionState::new(0, true);
+        let mut state = AdmissionState::new(0, Shape::Rigid);
         let mut pending = Vec::new();
         let resources = Resources {
             cpu: 2,
-            memory_bytes: 2 * MEMORY_QUANTUM,
+            memory_bytes: 2 * SHARE,
         };
         assert!(
             pool.try_admit_inner(resources, 2, None, &mut state, None, &mut pending)
@@ -1427,17 +1295,17 @@ mod tests {
         assert!(entry.record.is_none());
         let value: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&entry._guard.path).unwrap()).unwrap();
-        // The live activity route reports each pending waiter's pid, so the
-        // record carries it whether or not decision events are kept; only
-        // the event-history fields stay out.
+        // The live activity route reports each pending waiter's pid, and the
+        // pool orders a waiter by its first arrival, so the record carries
+        // both whether or not decision events are kept.
         assert_eq!(value["pid"], std::process::id());
-        assert!(value.get("first_arrival_ms").is_none());
+        assert_eq!(value["first_arrival_ms"], 0);
         pool.available_memory = || Some(0);
         assert!(
             pool.try_admit_inner(
                 resources,
                 2,
-                Some(2 * MEMORY_QUANTUM),
+                Some(2 * SHARE),
                 &mut state,
                 None,
                 &mut pending

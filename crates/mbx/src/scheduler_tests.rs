@@ -219,25 +219,6 @@ fn a_memory_reservation_needs_a_memory_budget() {
 }
 
 #[test]
-fn a_waiting_normal_reservation_holds_low_priority_work_back() {
-    let directory = tempfile::tempdir().unwrap();
-    let normal = pool_at(directory.path(), 1, 0);
-    let held = normal.try_admit(1, None).unwrap().expect("first permit");
-    let waiting_dir = directory.path().to_path_buf();
-    let waiter = std::thread::spawn(move || {
-        let pool = pool_at(&waiting_dir, 1, 0);
-        pool.reserve(Some(1), None).unwrap()
-    });
-
-    wait_until(
-        "the normal reservation to announce it is waiting for capacity",
-        || directory.path().join(PRIORITY_WAIT_STAMP).exists(),
-    );
-    drop(held);
-    drop(waiter.join().unwrap());
-}
-
-#[test]
 fn blocked_reservations_sleep_and_wake_in_fifo_order() {
     static SCANS: AtomicU64 = AtomicU64::new(0);
     const WAITERS: usize = 8;
@@ -342,7 +323,7 @@ fn a_foreign_domain_pass_cannot_defer_periodic_recovery() {
         cpu: 1,
         memory_bytes: 0,
     };
-    let mut state = AdmissionState::new((local.clock)(), local.events);
+    let mut state = AdmissionState::new((local.clock)(), Shape::Rigid);
     assert!(
         local
             .try_admit_state(resources, 1, None, &mut state, None)
@@ -439,42 +420,6 @@ fn a_demand_heavier_than_the_pool_runs_alone_rather_than_never() {
 }
 
 #[test]
-fn low_priority_leaves_the_reserve_even_on_an_idle_pool() {
-    let directory = tempfile::tempdir().unwrap();
-    let mut low = Pool::new(directory.path().to_path_buf(), 4, 0, SchedulerPriority::Low);
-    low.available_memory = || None;
-    std::fs::write(directory.path().join(PRIORITY_WAIT_STAMP), b"").unwrap();
-
-    // An idle pool is the ordinary state between two compilations, so it is
-    // no licence to stop yielding: three of the four permits are what a
-    // low-priority build may take while somebody is waiting.
-    let admitted = low.try_admit(3, None).unwrap();
-    assert!(admitted.is_some(), "what fits beside the reserve is taken");
-    let leases = std::fs::read_dir(directory.path().join(LEASES_DIR))
-        .unwrap()
-        .count();
-    assert_eq!(leases, 1);
-    drop(admitted);
-}
-
-#[test]
-fn a_weight_the_reserve_would_never_admit_still_runs_alone() {
-    let directory = tempfile::tempdir().unwrap();
-    let mut low = Pool::new(directory.path().to_path_buf(), 4, 0, SchedulerPriority::Low);
-    low.available_memory = || None;
-    std::fs::write(directory.path().join(PRIORITY_WAIT_STAMP), b"").unwrap();
-
-    // Four permits out of four never fits beside a reserve of one, and a
-    // weight is already clamped to the capacity, so refusing here would not
-    // be yielding -- it would be a compilation that never runs at all for as
-    // long as anybody keeps waiting. It goes alone instead.
-    assert!(
-        low.try_admit(4, None).unwrap().is_some(),
-        "a demand the reserve excludes outright runs by itself"
-    );
-}
-
-#[test]
 fn a_predicted_heavy_compile_does_not_wait_out_the_gate_on_an_idle_machine() {
     let directory = tempfile::tempdir().unwrap();
     let bytes_per_permit = 1024;
@@ -496,35 +441,6 @@ fn a_predicted_heavy_compile_does_not_wait_out_the_gate_on_an_idle_machine() {
         pool.try_admit(weight, predicted).unwrap().is_some(),
         "an idle machine admits it rather than waiting out the gate deadline"
     );
-}
-
-#[test]
-fn the_reserve_never_swallows_the_whole_pool() {
-    let directory = tempfile::tempdir().unwrap();
-    std::fs::write(directory.path().join(PRIORITY_WAIT_STAMP), b"").unwrap();
-
-    // A quarter of one permit rounds up to one, which would leave a
-    // single-permit machine reserving everything -- and then the only way a
-    // low-priority build could ever run would be the oversized-demand escape,
-    // which hands it the whole machine at once. Yielding must not invert.
-    for capacity in 1..=8 {
-        let mut low = Pool::new(
-            directory.path().to_path_buf(),
-            capacity,
-            0,
-            SchedulerPriority::Low,
-        );
-        low.available_memory = || None;
-        assert!(
-            yielded(low.budget(), true).cpu > 0,
-            "capacity {capacity} reserved all of itself"
-        );
-        let permit = low.try_admit(1, None).unwrap();
-        assert!(
-            permit.is_some(),
-            "low priority makes progress at capacity {capacity}"
-        );
-    }
 }
 
 #[test]
@@ -561,23 +477,31 @@ fn the_memory_gate_defers_predicted_heavy_work() {
 }
 
 #[test]
-fn low_priority_leaves_the_reserve_while_a_normal_build_waits() {
+fn a_waiting_normal_request_starts_before_an_older_low_one() {
     let directory = tempfile::tempdir().unwrap();
-    let normal = pool_at(directory.path(), 4, 0);
-    let mut low = Pool::new(directory.path().to_path_buf(), 4, 0, SchedulerPriority::Low);
-    low.available_memory = || None;
-
-    let held = normal.try_admit(2, None).unwrap().expect("two permits");
-    std::fs::write(directory.path().join(PRIORITY_WAIT_STAMP), b"").unwrap();
-
-    // capacity 4 minus a reserve of 1: the two held plus one more would fit,
-    // but low priority must leave the reserve for whoever stamped.
-    assert!(low.try_admit(2, None).unwrap().is_none());
-    let admitted = low.try_admit(1, None).unwrap();
-    assert!(admitted.is_some(), "low priority still uses spare capacity");
-    // The normal build takes the reserved permit low priority left alone.
-    assert!(normal.try_admit(1, None).unwrap().is_some());
-    drop(held);
+    let normal = pool_at(directory.path(), 2, 0);
+    let mut low = pool_at(directory.path(), 2, 0);
+    low.priority = SchedulerPriority::Low;
+    let first = normal.try_admit(1, None).unwrap().unwrap();
+    let second = normal.try_admit(1, None).unwrap().unwrap();
+    let mut older = None;
+    assert!(low.try_admit_queued(1, None, &mut older).unwrap().is_none());
+    let mut newer = None;
+    assert!(
+        normal
+            .try_admit_queued(1, None, &mut newer)
+            .unwrap()
+            .is_none()
+    );
+    drop(first);
+    // The low request's own pass grants the freed core to the normal one.
+    assert!(low.try_admit_queued(1, None, &mut older).unwrap().is_none());
+    let admitted = normal
+        .try_admit_queued(1, None, &mut newer)
+        .unwrap()
+        .unwrap();
+    drop(second);
+    assert!(low.try_admit_queued(1, None, &mut older).unwrap().is_some());
     drop(admitted);
 }
 
@@ -778,7 +702,7 @@ fn a_cold_test_binary_starts_beside_a_live_compilation() {
     let held = pool.try_admit(1, None).unwrap().unwrap();
     let demand = Demand::test("cold-suite", Some(18));
     let plan = pool.demand_vector(&demand);
-    let mut state = AdmissionState::new((pool.clock)(), pool.events);
+    let mut state = AdmissionState::new((pool.clock)(), Shape::Rigid);
     let admitted = pool
         .try_admit_state(
             plan.resources,
@@ -1293,7 +1217,6 @@ fn an_oversized_idle_grant_spaces_the_next_pools_admission() {
     low.pressure = true;
     low.priority = SchedulerPriority::Low;
     low.clock = || 7_000;
-    std::fs::write(directory.path().join(PRIORITY_WAIT_STAMP), b"").unwrap();
     // Establish a recovered state without granting a compilation in the ramp.
     let state = crate::pressure::domain_state(directory.path(), low.pressure_domain);
     crate::pressure::sample(&state, 1_000, || crate::pressure::Reading {
@@ -1819,11 +1742,14 @@ fn a_test_that_raises_nothing_records_without_the_history_lock() {
 }
 
 // Regression: S40's eight-permit analysis compile waited over an hour while
-// newer small compiles repeatedly refilled the shared pool.
+// newer small compiles repeatedly refilled the shared pool. They may pass it
+// until it has waited the aging bound; from then on none starts before it.
 #[test]
 fn a_heavy_waiter_drains_the_pool_before_new_small_compilations() {
+    static CLOCK: AtomicU64 = AtomicU64::new(1_000);
     let directory = tempfile::tempdir().unwrap();
-    let pool = pool_at(directory.path(), 4, 0);
+    let mut pool = pool_at(directory.path(), 4, 0);
+    pool.clock = || CLOCK.load(Ordering::SeqCst);
     let first = pool.try_admit(2, None).unwrap().unwrap();
     let second = pool.try_admit(1, None).unwrap().unwrap();
     let mut heavy = None;
@@ -1832,6 +1758,8 @@ fn a_heavy_waiter_drains_the_pool_before_new_small_compilations() {
             .unwrap()
             .is_none()
     );
+    assert!(pool.try_admit(1, None).unwrap().is_some());
+    CLOCK.fetch_add(AGING_MS, Ordering::SeqCst);
     for _ in 0..10 {
         assert!(pool.try_admit(1, None).unwrap().is_none());
     }
@@ -1851,8 +1779,10 @@ fn a_heavy_waiter_drains_the_pool_before_new_small_compilations() {
 
 #[test]
 fn cancelled_and_crashed_waiters_release_their_queue_positions() {
+    static CLOCK: AtomicU64 = AtomicU64::new(1_000);
     let directory = tempfile::tempdir().unwrap();
-    let pool = pool_at(directory.path(), 4, 0);
+    let mut pool = pool_at(directory.path(), 4, 0);
+    pool.clock = || CLOCK.load(Ordering::SeqCst);
     let held = pool.try_admit(3, None).unwrap().unwrap();
     let mut queued = None;
     assert!(
@@ -1860,9 +1790,9 @@ fn cancelled_and_crashed_waiters_release_their_queue_positions() {
             .unwrap()
             .is_none()
     );
-    // The only live lease returns three permits; the head needs two, so
-    // using the remaining one cannot delay it.
-    assert!(pool.try_admit(1, None).unwrap().is_some());
+    // Aged, the head holds back the core it cannot start on yet.
+    CLOCK.fetch_add(AGING_MS, Ordering::SeqCst);
+    assert!(pool.try_admit(1, None).unwrap().is_none());
     drop(queued.take());
     assert!(
         scan_waiters(&directory.path().join(WAITERS_DIR))
@@ -1870,13 +1800,12 @@ fn cancelled_and_crashed_waiters_release_their_queue_positions() {
             .is_empty()
     );
     assert!(pool.try_admit(1, None).unwrap().is_some());
-    // A full-pool waiter has zero slack, preserving the crash-recovery
-    // assertion that removing its queue position lets a small request pass.
     assert!(
         pool.try_admit_queued(4, None, &mut queued)
             .unwrap()
             .is_none()
     );
+    CLOCK.fetch_add(AGING_MS, Ordering::SeqCst);
     assert!(pool.try_admit(1, None).unwrap().is_none());
     // Leave the file behind with its lock released, as after process death.
     let mut crashed = queued.take().unwrap();
@@ -1887,22 +1816,29 @@ fn cancelled_and_crashed_waiters_release_their_queue_positions() {
 
 #[test]
 fn container_limits_cover_separate_builds_without_blocking_other_containers() {
+    static CLOCK: AtomicU64 = AtomicU64::new(1_000);
     let directory = tempfile::tempdir().unwrap();
     let mut a = pool_at(directory.path(), 8, 0);
     a.pressure_domain = "container-a";
     a.domain_capacity = 3;
     a.build = Some(("build-a1".into(), 8));
+    a.clock = || CLOCK.load(Ordering::SeqCst);
     let mut a2 = pool_at(directory.path(), 8, 0);
     a2.pressure_domain = "container-a";
     a2.domain_capacity = 3;
     a2.build = Some(("build-a2".into(), 8));
+    a2.clock = || CLOCK.load(Ordering::SeqCst);
     let mut b = pool_at(directory.path(), 8, 0);
     b.pressure_domain = "container-b";
     b.domain_capacity = 3;
+    b.clock = || CLOCK.load(Ordering::SeqCst);
     let held = a.try_admit(2, None).unwrap().unwrap();
     let mut queued = None;
     assert!(a2.try_admit_queued(3, None, &mut queued).unwrap().is_none());
-    // Do not refill a's last slot; let its oldest request run. b can progress.
+    // Until a2's request has waited the aging bound, a's last slot is a's.
+    assert!(a.try_admit(1, None).unwrap().is_some());
+    // Then nothing else of container a takes it, while b can progress.
+    CLOCK.fetch_add(AGING_MS, Ordering::SeqCst);
     assert!(a.try_admit(1, None).unwrap().is_none());
     let other = b.try_admit(3, None).unwrap().unwrap();
     assert!(b.try_admit(1, None).unwrap().is_none());
@@ -1913,13 +1849,20 @@ fn container_limits_cover_separate_builds_without_blocking_other_containers() {
 
 #[test]
 fn a_build_ceiling_does_not_reserve_the_host_for_that_build() {
+    static CLOCK: AtomicU64 = AtomicU64::new(1_000);
     let directory = tempfile::tempdir().unwrap();
     let mut a = pool_at(directory.path(), 8, 0);
     a.build = Some(("a".into(), 3));
-    let b = pool_at(directory.path(), 8, 0);
+    a.clock = || CLOCK.load(Ordering::SeqCst);
+    let mut b = pool_at(directory.path(), 8, 0);
+    b.clock = || CLOCK.load(Ordering::SeqCst);
     let held = a.try_admit(2, None).unwrap().unwrap();
     let mut queued = None;
     assert!(a.try_admit_queued(3, None, &mut queued).unwrap().is_none());
+    assert!(a.try_admit(1, None).unwrap().is_some());
+    // Aged, the request short of its build's ceiling holds back that build
+    // alone.
+    CLOCK.fetch_add(AGING_MS, Ordering::SeqCst);
     assert!(a.try_admit(1, None).unwrap().is_none());
     assert!(b.try_admit(3, None).unwrap().is_some());
     drop(held);
@@ -1967,11 +1910,14 @@ fn a_budget_change_preserves_the_memory_and_cpu_charges_of_live_leases() {
 
 #[test]
 fn queued_domain_limits_use_the_waiters_original_byte_budget() {
+    static CLOCK: AtomicU64 = AtomicU64::new(1_000);
     let directory = tempfile::tempdir().unwrap();
     let mut old = pool_at(directory.path(), 4, 1024);
     old.pressure_domain = "a";
+    old.clock = || CLOCK.load(Ordering::SeqCst);
     let mut new = pool_at(directory.path(), 16, 4096);
     new.pressure_domain = "a";
+    new.clock = || CLOCK.load(Ordering::SeqCst);
     let held = new.try_admit(1, None).unwrap().unwrap();
     let mut queued = None;
     assert!(
@@ -1979,10 +1925,18 @@ fn queued_domain_limits_use_the_waiters_original_byte_budget() {
             .unwrap()
             .is_none()
     );
-    assert!(new.try_admit(1, None).unwrap().is_none());
-    // The old request is waiting for container a, not for the host pool.
-    new.pressure_domain = "b";
+    // Another process's pass judges the queued request by the byte budget it
+    // was published with, which the held lease fills, and leaves it queued.
     assert!(new.try_admit(1, None).unwrap().is_some());
+    assert_eq!(
+        scan_waiters(&directory.path().join(WAITERS_DIR))
+            .unwrap()
+            .len(),
+        1
+    );
+    // Aged, it holds back what it is short of.
+    CLOCK.fetch_add(AGING_MS, Ordering::SeqCst);
+    assert!(new.try_admit(1, None).unwrap().is_none());
     drop(held);
     assert!(
         old.try_admit_queued(2, None, &mut queued)
@@ -2471,6 +2425,7 @@ fn scheduler_stats_rank_live_waiters_by_ticket_and_exclude_grants() {
             1,
             None,
             0,
+            Shape::Rigid,
             ticket,
         );
         record.pid = Some(pid);
@@ -2495,6 +2450,7 @@ fn scheduler_stats_rank_live_waiters_by_ticket_and_exclude_grants() {
         1,
         None,
         0,
+        Shape::Rigid,
         5,
     );
     abandoned.name = Some("abandoned".into());
@@ -2914,42 +2870,6 @@ fn scheduler_stats_compile_charges_match_admission_predictions() {
 }
 
 #[test]
-fn idle_capacity_slack_uses_every_possible_completion_subset() {
-    assert!(can_pass_waiters(120, &[54, 54], &[54], 12));
-    assert!(!can_pass_waiters(120, &[54, 54], &[54], 13));
-    assert!(can_pass_waiters(120, &[54, 54, 1], &[54], 11));
-    assert!(!can_pass_waiters(120, &[54, 54, 1], &[54], 12));
-    let mut live = vec![54];
-    live.extend([1; 54]);
-    assert!(!can_pass_waiters(120, &live, &[54], 1));
-}
-
-#[test]
-fn idle_capacity_protects_each_prefix_instead_of_individual_or_summed_heads() {
-    // Individual checks would admit two permits, delaying the second waiter
-    // when the eight-permit lease ends: both older requests need all ten.
-    assert!(!can_pass_waiters(10, &[8], &[6, 4], 2));
-    // Summing the heads would admit one permit, delaying the first waiter
-    // when the six-permit lease ends while the two-permit lease stays live.
-    assert!(!can_pass_waiters(10, &[6, 2], &[8, 1], 1));
-}
-
-#[test]
-fn idle_capacity_bitset_handles_word_boundaries_and_refuses_excessive_work() {
-    assert!(can_pass_waiters(160, &[64, 64], &[64], 32));
-    assert!(!can_pass_waiters(160, &[64, 64], &[64], 33));
-    assert!(can_pass_waiters(65_536, &[65_534], &[1], 1));
-    assert!(!can_pass_waiters(65_537, &[65_535], &[1], 1));
-    assert!(!can_pass_waiters(u64::MAX, &[u64::MAX], &[1], 1));
-    assert!(!can_pass_waiters(4, &[5], &[4], 1));
-    assert!(!can_pass_waiters(4, &[3], &[5], 1));
-    assert!(
-        can_pass_waiters(4, &[], &[], 5),
-        "no waiters leaves admission to fits"
-    );
-}
-
-#[test]
 fn queued_builds_share_only_capacity_they_cannot_use_in_each_scope() {
     for scope in ["global", "domain", "build"] {
         let directory = tempfile::tempdir().unwrap();
@@ -2997,680 +2917,32 @@ fn queued_builds_share_only_capacity_they_cannot_use_in_each_scope() {
     }
 }
 
-#[test]
-fn queued_builds_refuse_passing_when_small_live_leases_can_fill_the_head() {
-    let directory = tempfile::tempdir().unwrap();
-    let pool = pool_at(directory.path(), 120, 0);
-    let large = pool.try_admit(54, None).unwrap().unwrap();
-    let small: Vec<_> = (0..54)
-        .map(|_| pool.try_admit(1, None).unwrap().unwrap())
-        .collect();
-    let mut head = None;
-    assert!(
-        pool.try_admit_queued(54, None, &mut head)
-            .unwrap()
-            .is_none()
-    );
-    let mut newer = None;
-    assert!(
-        pool.try_admit_queued(1, None, &mut newer)
-            .unwrap()
-            .is_none()
-    );
-    drop((large, small));
-}
-
-#[derive(Clone)]
-struct SimRequest {
-    arrival: u64,
-    duration: u64,
-    record: Waiting,
-}
-
-fn sim_request(
-    ticket: u64,
-    arrival: u64,
-    weight: u64,
-    duration: u64,
-    domain: (&str, u64),
-    build: Option<(&str, u64)>,
-) -> SimRequest {
-    SimRequest {
-        arrival,
-        duration,
-        record: Waiting {
-            first_arrival_ms: None,
-            pid: None,
-            name: None,
-            mode_key: None,
-            ticket,
-            weight,
-            cpu: None,
-            memory_bytes: None,
-            cpu_cap: None,
-            mem_cap: None,
-            domain_memory_cap: None,
-            domain_cpu_cap: None,
-            priority: "normal".into(),
-            domain: domain.0.into(),
-            domain_capacity: domain.1,
-            global_capacity: None,
-            bytes_per_permit: 0,
-            build: build.map(|(id, capacity)| (id.into(), capacity)),
-            handoff: None,
-        },
-    }
-}
-
-fn sim_lease(record: &Waiting) -> Lease {
-    Lease {
-        version: LEASE_VERSION,
+/// A waiting request as a version that names no exact charge or cap
+/// publishes it.
+fn waiter(ticket: u64, weight: u64, domain: (&str, u64), build: Option<(&str, u64)>) -> Waiting {
+    Waiting {
+        first_arrival_ms: None,
+        pid: None,
         name: None,
         mode_key: None,
-        weight: record.weight,
-        cpu: record.cpu,
-        memory_bytes: record.memory_bytes,
-        priority: record.priority.clone(),
-        build_id: record.build.as_ref().map(|(id, _)| id.clone()),
-        domain: Some(record.domain.clone()),
-        bytes_per_permit: record.bytes_per_permit,
+        ticket,
+        weight,
+        cpu: None,
+        memory_bytes: None,
+        cpu_cap: None,
+        mem_cap: None,
+        domain_memory_cap: None,
+        domain_cpu_cap: None,
+        priority: "normal".into(),
+        domain: domain.0.into(),
+        domain_capacity: domain.1,
+        global_capacity: None,
+        bytes_per_permit: 0,
+        build: build.map(|(id, capacity)| (id.into(), capacity)),
+        shape: None,
+        handoff: None,
     }
 }
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum SimPolicy {
-    Today,
-    TodayOrPass,
-    StrictFifo,
-}
-
-#[derive(Clone)]
-struct AdmissionSimulation<'a> {
-    capacity: u64,
-    legacy_readers: bool,
-    now: u64,
-    live: Vec<Lease>,
-    finishes: Vec<u64>,
-    queue: Vec<usize>,
-    requests: &'a [SimRequest],
-    started: Vec<Option<u64>>,
-}
-
-impl<'a> AdmissionSimulation<'a> {
-    fn new(capacity: u64, initial: &[(u64, Waiting)], requests: &'a [SimRequest]) -> Self {
-        Self {
-            capacity,
-            legacy_readers: false,
-            now: 0,
-            live: initial
-                .iter()
-                .map(|(_, record)| sim_lease(record))
-                .collect(),
-            finishes: initial.iter().map(|(finish, _)| *finish).collect(),
-            queue: Vec::new(),
-            requests,
-            started: vec![None; requests.len()],
-        }
-    }
-
-    fn expire(&mut self) {
-        for index in (0..self.live.len()).rev() {
-            if self.finishes[index] <= self.now {
-                self.live.swap_remove(index);
-                self.finishes.swap_remove(index);
-            }
-        }
-    }
-
-    fn decision(&self, position: usize) -> AdmissionDecision {
-        let request = &self.requests[self.queue[position]].record;
-        self.reader_decision(
-            request.global_capacity.unwrap_or(self.capacity),
-            &self.live,
-            self.queue.iter().map(|id| &self.requests[*id].record),
-            request,
-        )
-    }
-
-    fn reader_decision<'b>(
-        &self,
-        capacity: u64,
-        live: &[Lease],
-        waiting: impl Iterator<Item = &'b Waiting>,
-        request: &Waiting,
-    ) -> AdmissionDecision {
-        if !self.legacy_readers || request.cpu.is_some() || request.memory_bytes.is_some() {
-            let waiting: Vec<_> = waiting.collect();
-            let without_logging =
-                admission_decision(capacity, live, waiting.iter().copied(), request);
-            let trace = std::cell::RefCell::new(decisions::Trace::default());
-            let with_logging = admission_decision_traced(
-                capacity,
-                live,
-                waiting.iter().copied(),
-                request,
-                Some(&trace),
-            );
-            assert_eq!(
-                without_logging, with_logging,
-                "logging must not change admission"
-            );
-            return without_logging;
-        }
-        // Use the independent fe73826 reader for the legacy process itself,
-        // including in both counterfactual forks and strict FIFO admission.
-        let live: Vec<legacy::Lease> = live
-            .iter()
-            .map(|record| serde_json::from_value(serde_json::to_value(record).unwrap()).unwrap())
-            .collect();
-        let waiting: Vec<legacy::Waiting> = waiting
-            .map(|record| serde_json::from_value(serde_json::to_value(record).unwrap()).unwrap())
-            .collect();
-        let request = serde_json::from_value(serde_json::to_value(request).unwrap()).unwrap();
-        match legacy::admission_decision(capacity, &live, waiting.iter(), &request) {
-            legacy::AdmissionDecision::Ordered => AdmissionDecision::Ordered,
-            legacy::AdmissionDecision::Passing => AdmissionDecision::Passing,
-            legacy::AdmissionDecision::Waiting => AdmissionDecision::Waiting,
-        }
-    }
-
-    fn grant(&mut self, position: usize) {
-        let id = self.queue.remove(position);
-        let request = &self.requests[id];
-        self.live.push(sim_lease(&request.record));
-        self.finishes.push(self.now + request.duration);
-        self.started[id] = Some(self.now);
-    }
-
-    fn check_fork(&self, position: usize, strict_fifo: bool) {
-        let mut a = self.clone();
-        let mut b = self.clone();
-        let passer = self.queue[position];
-        a.grant(position);
-        let policy = if strict_fifo {
-            SimPolicy::StrictFifo
-        } else {
-            SimPolicy::Today
-        };
-        a.drain(policy);
-        b.drain(policy);
-        let protected = if strict_fifo {
-            &self.queue[..position]
-        } else {
-            &self.queue[..]
-        };
-        for id in protected {
-            if *id != passer {
-                assert!(
-                    a.started[*id].unwrap() <= b.started[*id].unwrap(),
-                    "passer ticket {} at {} delayed ticket {}: A={:?}, B={:?}",
-                    self.requests[passer].record.ticket,
-                    self.now,
-                    self.requests[*id].record.ticket,
-                    a.started[*id],
-                    b.started[*id],
-                );
-            }
-        }
-    }
-
-    fn step(&mut self, policy: SimPolicy, check_forks: Option<bool>) -> usize {
-        let mut position = 0;
-        let mut passes = 0;
-        while position < self.queue.len() {
-            let decision = if policy == SimPolicy::StrictFifo {
-                if position != 0 {
-                    break;
-                }
-                // The real decision with an empty older queue still enforces
-                // every physical ceiling, without any overtaking exceptions.
-                let request = &self.requests[self.queue[position]].record;
-                self.reader_decision(
-                    request.global_capacity.unwrap_or(self.capacity),
-                    &self.live,
-                    std::iter::empty(),
-                    request,
-                )
-            } else {
-                self.decision(position)
-            };
-            if decision == AdmissionDecision::Waiting
-                || (policy == SimPolicy::Today && decision == AdmissionDecision::Passing)
-            {
-                position += 1;
-                continue;
-            }
-            if decision == AdmissionDecision::Passing {
-                passes += 1;
-                if let Some(strict_fifo) = check_forks {
-                    self.check_fork(position, strict_fifo);
-                }
-            }
-            self.grant(position);
-        }
-        passes
-    }
-
-    fn drain(&mut self, policy: SimPolicy) {
-        while !self.queue.is_empty() {
-            self.expire();
-            self.step(policy, None);
-            if !self.queue.is_empty() {
-                self.now = *self
-                    .finishes
-                    .iter()
-                    .min()
-                    .expect("a live lease can unblock the queue");
-            }
-        }
-    }
-}
-
-fn simulate_admission(
-    capacity: u64,
-    initial: &[(u64, Waiting)],
-    requests: &[SimRequest],
-    policy: SimPolicy,
-    check_forks: Option<bool>,
-) -> (Vec<u64>, usize) {
-    let mut simulation = AdmissionSimulation::new(capacity, initial, requests);
-    let mut next = 0;
-    let mut passes = 0;
-    loop {
-        simulation.expire();
-        while next < requests.len() && requests[next].arrival <= simulation.now {
-            simulation.queue.push(next);
-            next += 1;
-        }
-        passes += simulation.step(policy, check_forks);
-        let event = simulation
-            .finishes
-            .iter()
-            .copied()
-            .chain(requests.get(next).map(|request| request.arrival))
-            .min();
-        let Some(event) = event else { break };
-        simulation.now = event;
-    }
-    assert!(simulation.queue.is_empty());
-    (
-        simulation.started.into_iter().map(Option::unwrap).collect(),
-        passes,
-    )
-}
-
-#[test]
-fn ordered_admission_prefix_regressions_keep_original_admission_times() {
-    for (initial, requests) in [
-        (vec![(2, 8), (1, 2)], vec![(0, 6, 5), (0, 4, 5), (1, 2, 10)]),
-        (
-            vec![(2, 6), (10, 2)],
-            vec![(0, 8, 5), (0, 1, 5), (1, 1, 10)],
-        ),
-    ] {
-        let initial: Vec<_> = initial
-            .into_iter()
-            .map(|(end, weight)| (end, sim_request(0, 0, weight, 1, ("host", 10), None).record))
-            .collect();
-        let requests: Vec<_> = requests
-            .into_iter()
-            .enumerate()
-            .map(|(id, (arrival, weight, duration))| {
-                sim_request(id as u64 + 1, arrival, weight, duration, ("host", 10), None)
-            })
-            .collect();
-        let (old, _) = simulate_admission(10, &initial, &requests, SimPolicy::Today, None);
-        let (new, _) =
-            simulate_admission(10, &initial, &requests, SimPolicy::TodayOrPass, Some(false));
-        assert_eq!(new, old);
-    }
-}
-
-#[test]
-fn a_passer_must_protect_the_global_pool_even_when_the_head_is_domain_blocked() {
-    let directory = tempfile::tempdir().unwrap();
-    let mut a = pool_at(directory.path(), 4, 0);
-    a.pressure_domain = "A";
-    let mut b = pool_at(directory.path(), 4, 0);
-    b.pressure_domain = "B";
-    let first = a.try_admit(2, None).unwrap().unwrap();
-    let second = b.try_admit(1, None).unwrap().unwrap();
-    let mut head = None;
-    assert!(a.try_admit_queued(3, None, &mut head).unwrap().is_none());
-    assert!(a.try_admit_queued(1, None, &mut None).unwrap().is_none());
-    drop(first);
-    assert!(a.try_admit_queued(3, None, &mut head).unwrap().is_some());
-    drop(second);
-}
-
-#[test]
-fn today_or_pass_keeps_the_unrelated_domain_admission_at_time_one() {
-    let initial = vec![(3, sim_request(0, 0, 2, 1, ("A", 2), Some(("a", 4))).record)];
-    let requests = vec![
-        sim_request(1, 0, 1, 1, ("A", 2), Some(("a", 4))),
-        sim_request(2, 1, 2, 4, ("B", 2), Some(("b", 4))),
-        sim_request(3, 5, 1, 1, ("B", 2), Some(("b", 4))),
-        sim_request(4, 6, 1, 1, ("A", 2), Some(("a", 4))),
-    ];
-    let (old, _) = simulate_admission(4, &initial, &requests, SimPolicy::Today, None);
-    let (new, _) = simulate_admission(4, &initial, &requests, SimPolicy::TodayOrPass, None);
-    assert_eq!(new, vec![3, 1, 5, 6]);
-    assert_eq!(new, old);
-}
-
-#[test]
-fn todays_build_exception_can_refill_capacity_after_a_passer_leaves_the_queue() {
-    let initial = vec![(2, sim_request(0, 0, 2, 1, ("D", 4), Some(("h", 4))).record)];
-    let requests = vec![
-        sim_request(1, 0, 3, 1, ("D", 4), Some(("h", 4))),
-        sim_request(2, 0, 1, 1, ("D", 4), Some(("h", 4))),
-        sim_request(3, 0, 2, 2, ("D", 4), Some(("r", 4))),
-    ];
-    let mut before = AdmissionSimulation::new(4, &initial, &requests);
-    before.queue = vec![0, 1, 2];
-    assert_eq!(before.decision(1), AdmissionDecision::Passing);
-    let mut a = before.clone();
-    a.grant(1);
-    a.drain(SimPolicy::Today);
-    let mut b = before.clone();
-    b.drain(SimPolicy::Today);
-    assert_eq!(a.started, vec![Some(3), Some(0), Some(1)]);
-    assert_eq!(b.started, vec![Some(2), Some(2), Some(3)]);
-    // Today's build exception allows R from another build to refill the
-    // capacity after C finishes. It delays H one tick; the pass check itself
-    // would refuse that refill. Preserve this known scope-exception behavior.
-    assert_eq!(a.started[0].unwrap() - b.started[0].unwrap(), 1);
-    before.check_fork(1, true);
-}
-
-fn sim_random(state: &mut u64, low: u64, high: u64) -> u64 {
-    *state = state
-        .wrapping_mul(6364136223846793005)
-        .wrapping_add(1442695040888963407);
-    low + (*state >> 16) % (high - low + 1)
-}
-
-fn check_random_admission_forks(multi_scope: bool, two_dimensions: bool) {
-    let mut total_passes = 0;
-    let mut mixed_budget_workloads = 0;
-    for seed in 0..512_u64 {
-        let mut state = seed + 1;
-        let capacity = sim_random(&mut state, 4, 128);
-        let domain_count = if multi_scope {
-            sim_random(&mut state, 2, 4)
-        } else {
-            1
-        } as usize;
-        let domain_capacities: Vec<_> = (0..domain_count)
-            .map(|_| {
-                if multi_scope {
-                    sim_random(&mut state, 1, capacity)
-                } else {
-                    capacity
-                }
-            })
-            .collect();
-        let mut build_domains = Vec::new();
-        for domain in 0..domain_count {
-            let count = if multi_scope {
-                sim_random(&mut state, 1, 3)
-            } else {
-                1
-            };
-            build_domains.extend(std::iter::repeat_n(domain, count as usize));
-        }
-        let build_capacities: Vec<_> = build_domains
-            .iter()
-            .map(|_| {
-                if multi_scope {
-                    sim_random(&mut state, 1, capacity)
-                } else {
-                    capacity
-                }
-            })
-            .collect();
-        let make_request = |id, arrival, weight, duration, build: usize| {
-            let domain = build_domains[build];
-            sim_request(
-                id,
-                arrival,
-                weight,
-                duration,
-                (&format!("domain-{domain}"), domain_capacities[domain]),
-                Some((&format!("build-{build}"), build_capacities[build])),
-            )
-        };
-        let mut initial = Vec::new();
-        let mut used = 0;
-        let mut domain_used = vec![0; domain_count];
-        let mut build_used = vec![0; build_domains.len()];
-        for _ in 0..capacity {
-            if sim_random(&mut state, 0, 99) < 15 {
-                break;
-            }
-            let build = sim_random(&mut state, 0, build_domains.len() as u64 - 1) as usize;
-            let domain = build_domains[build];
-            let free = (capacity - used)
-                .min(domain_capacities[domain] - domain_used[domain])
-                .min(build_capacities[build] - build_used[build]);
-            if free != 0 {
-                let weight = sim_random(&mut state, 1, free);
-                let end = sim_random(&mut state, 1, 50);
-                initial.push((end, make_request(0, 0, weight, 1, build).record));
-                used += weight;
-                domain_used[domain] += weight;
-                build_used[build] += weight;
-            }
-        }
-        let mut requests = Vec::new();
-        for arrival in std::iter::repeat_n(0, sim_random(&mut state, 1, 8) as usize).chain(1..=100)
-        {
-            if arrival != 0 && sim_random(&mut state, 0, 99) >= 65 {
-                continue;
-            }
-            let build = sim_random(&mut state, 0, build_domains.len() as u64 - 1) as usize;
-            let limit = domain_capacities[build_domains[build]]
-                .min(build_capacities[build])
-                .min(if arrival == 0 { capacity } else { 3 });
-            let weight = sim_random(&mut state, 1, limit);
-            let duration = sim_random(&mut state, 1, 50);
-            let mut request =
-                make_request(requests.len() as u64 + 1, arrival, weight, duration, build);
-            request.record.global_capacity = Some(if multi_scope {
-                sim_random(&mut state, weight, capacity)
-            } else {
-                capacity
-            });
-            requests.push(request);
-        }
-        if two_dimensions {
-            let global_memory = capacity * 8 * MEMORY_QUANTUM + 123;
-            let mut domain_memory_used = vec![0; domain_count];
-            let mut used_memory = 0;
-            for (_, record) in &mut initial {
-                let domain = record
-                    .domain
-                    .strip_prefix("domain-")
-                    .unwrap()
-                    .parse::<usize>()
-                    .unwrap();
-                let local_memory = domain_capacities[domain] * 8 * MEMORY_QUANTUM + 123;
-                let free =
-                    (global_memory - used_memory).min(local_memory - domain_memory_used[domain]);
-                let memory = sim_random(&mut state, 1, free.max(1)).min(free);
-                record.cpu = Some(record.weight);
-                record.memory_bytes = Some(memory);
-                record.mem_cap = Some(global_memory);
-                record.domain_memory_cap = Some(local_memory);
-                used_memory += memory;
-                domain_memory_used[domain] += memory;
-            }
-            for request in &mut requests {
-                let record = &mut request.record;
-                let domain = record
-                    .domain
-                    .strip_prefix("domain-")
-                    .unwrap()
-                    .parse::<usize>()
-                    .unwrap();
-                let local_memory = domain_capacities[domain] * 8 * MEMORY_QUANTUM + 123;
-                record.cpu = Some(record.weight);
-                record.memory_bytes =
-                    Some(sim_random(&mut state, 1, local_memory.min(global_memory)));
-                record.mem_cap = Some(if multi_scope {
-                    sim_random(&mut state, 1, global_memory)
-                } else {
-                    global_memory
-                });
-                record.domain_memory_cap = Some(local_memory);
-            }
-        }
-        let budgets: std::collections::BTreeSet<_> = requests
-            .iter()
-            .map(|request| request.record.global_capacity)
-            .collect();
-        mixed_budget_workloads += usize::from(budgets.len() > 1);
-        let (_, passes) = simulate_admission(
-            capacity,
-            &initial,
-            &requests,
-            SimPolicy::TodayOrPass,
-            Some(multi_scope),
-        );
-        total_passes += passes;
-    }
-    assert!(total_passes > 0, "random workloads must exercise passing");
-    if multi_scope {
-        assert!(
-            mixed_budget_workloads > 0,
-            "random workloads must mix global budgets"
-        );
-    }
-}
-
-#[test]
-fn single_scope_passes_preserve_all_waiters_in_counterfactuals() {
-    check_random_admission_forks(false, false);
-}
-
-#[test]
-fn shared_scope_passes_preserve_older_waiters_with_fifo_continuations() {
-    check_random_admission_forks(true, false);
-}
-
-#[test]
-fn real_queue_protects_both_prefix_counterexamples() {
-    for (weights, heads, drop_before_pass, passer) in
-        [([8, 2], [6, 4], true, 2), ([6, 2], [8, 1], false, 1)]
-    {
-        let directory = tempfile::tempdir().unwrap();
-        let mut pool = pool_at(directory.path(), 10, 0);
-        pool.domain_capacity = 20;
-        let first = pool.try_admit(weights[0], None).unwrap().unwrap();
-        let mut second = pool.try_admit(weights[1], None).unwrap();
-        let mut head = None;
-        let mut next = None;
-        assert!(
-            pool.try_admit_queued(heads[0], None, &mut head)
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            pool.try_admit_queued(heads[1], None, &mut next)
-                .unwrap()
-                .is_none()
-        );
-        if drop_before_pass {
-            drop(second.take());
-        }
-        assert!(
-            pool.try_admit_queued(passer, None, &mut None)
-                .unwrap()
-                .is_none()
-        );
-        drop(first);
-        let admitted = pool
-            .try_admit_queued(heads[0], None, &mut head)
-            .unwrap()
-            .unwrap();
-        if drop_before_pass {
-            assert!(
-                pool.try_admit_queued(heads[1], None, &mut next)
-                    .unwrap()
-                    .is_some()
-            );
-        }
-        drop((admitted, second));
-    }
-}
-
-#[test]
-fn passing_protects_the_waiting_processes_smaller_global_budget() {
-    let directory = tempfile::tempdir().unwrap();
-    let mut older = pool_at(directory.path(), 10, 0);
-    let newer = pool_at(directory.path(), 12, 0);
-    // Keep the domain ceiling above both global budgets to isolate the
-    // process's global limit, independent of its container ceiling.
-    older.domain_capacity = 12;
-    let first = newer.try_admit(4, None).unwrap().unwrap();
-    let second = newer.try_admit(4, None).unwrap().unwrap();
-    let mut head = None;
-    assert!(
-        older
-            .try_admit_queued(6, None, &mut head)
-            .unwrap()
-            .is_none()
-    );
-    let waiting = scan_waiters(&directory.path().join(WAITERS_DIR)).unwrap();
-    assert_eq!(waiting.len(), 1);
-    assert_eq!(waiting[0].global_capacity, Some(10));
-    let mut small = None;
-    assert!(
-        newer
-            .try_admit_queued(2, None, &mut small)
-            .unwrap()
-            .is_none()
-    );
-    // Against capacity 12 the passer would have two permits of slack, but
-    // the head's capacity 10 has zero. It starts on this first completion.
-    drop(first);
-    let admitted = older.try_admit_queued(6, None, &mut head).unwrap().unwrap();
-    assert!(head.is_none());
-    drop((admitted, second));
-}
-
-#[test]
-fn old_waiter_records_fall_back_to_the_request_global_capacity() {
-    let legacy: Waiting = serde_json::from_str(
-        r#"{"ticket":1,"weight":6,"priority":"normal","domain":"host","domain_capacity":12,"bytes_per_permit":0,"build":null}"#,
-    ).unwrap();
-    assert_eq!(legacy.global_capacity, None);
-    let live = vec![sim_lease(&sim_request(0, 0, 4, 1, ("host", 12), None).record); 2];
-    let request = sim_request(2, 0, 2, 1, ("host", 12), None).record;
-    assert_eq!(
-        admission_decision(12, &live, [&legacy].into_iter(), &request),
-        AdmissionDecision::Passing
-    );
-    let protected = Waiting {
-        global_capacity: Some(10),
-        ..legacy
-    };
-    assert_eq!(
-        admission_decision(12, &live, [&protected].into_iter(), &request),
-        AdmissionDecision::Waiting
-    );
-}
-
-#[test]
-fn two_budget_single_scope_passes_preserve_all_waiters() {
-    check_random_admission_forks(false, true);
-}
-
-#[test]
-fn two_budget_shared_scope_passes_preserve_older_waiters() {
-    check_random_admission_forks(true, true);
-}
-
 fn vector_attempt(pool: &Pool, cpu: u64, memory_bytes: u64) -> Option<Permit> {
     let weight = if pool.bytes_per_permit == 0 {
         cpu
@@ -3834,27 +3106,6 @@ fn legacy_records_charge_full_weight_on_both_axes() {
     };
     assert_eq!(lease.resources(), expected);
     assert_eq!(waiter.resources(), expected);
-    let mut request = sim_request(2, 0, 1, 1, ("host", 8), None).record;
-    request.cpu = Some(1);
-    request.memory_bytes = Some(1);
-    request.cpu_cap = Some(8);
-    request.mem_cap = Some(4 * GIB);
-    request.domain_memory_cap = Some(8 * GIB);
-    assert_eq!(
-        admission_decision(
-            8,
-            std::slice::from_ref(&lease),
-            std::iter::empty(),
-            &request
-        ),
-        AdmissionDecision::Waiting
-    );
-    request.mem_cap = Some(8 * GIB);
-    request.cpu_cap = Some(4);
-    assert_eq!(
-        admission_decision(4, &[lease], std::iter::empty(), &request),
-        AdmissionDecision::Waiting
-    );
 }
 
 #[test]
@@ -3923,82 +3174,6 @@ fn demand_vectors_keep_legacy_weights_and_unmeasured_memory_guesses() {
             memory_bytes: 0
         }
     );
-}
-
-#[test]
-fn low_priority_preserves_headroom_on_both_axes() {
-    let dir = tempfile::tempdir().unwrap();
-    let pool = pool_at(dir.path(), 8, GIB);
-    assert_eq!(
-        yielded(pool.budget(), true),
-        Resources {
-            cpu: 6,
-            memory_bytes: 6 * GIB
-        }
-    );
-    let single = Resources {
-        cpu: 1,
-        ..pool.budget()
-    };
-    assert_eq!(
-        yielded(single, true),
-        Resources {
-            cpu: 1,
-            memory_bytes: 6 * GIB
-        }
-    );
-    assert_eq!(yielded(single, false), single);
-}
-
-#[test]
-fn quantized_memory_slack_never_exceeds_exact_byte_slack() {
-    let u = MEMORY_QUANTUM;
-    assert!(can_pass_quantized(
-        120 * u,
-        &[54 * u, 54 * u],
-        &[54 * u],
-        10 * u,
-        u
-    ));
-    assert!(!can_pass_quantized(u64::MAX, &[65535 * u], &[u], 1, u));
-    let mut state = 73;
-    let mut accepted = 0;
-    for _ in 0..2000 {
-        let cap = sim_random(&mut state, 2, 120) * u + sim_random(&mut state, 1, u - 1);
-        let live = [
-            sim_random(&mut state, 1, cap / 2),
-            sim_random(&mut state, 1, cap / 2),
-        ];
-        let older = [
-            sim_random(&mut state, 1, cap),
-            sim_random(&mut state, 1, cap),
-        ];
-        let charge = sim_random(&mut state, 1, cap / 8);
-        if can_pass_quantized(cap, &live, &older, charge, u) {
-            accepted += 1;
-            let mut prefix = 0;
-            let mut items = live.to_vec();
-            for head in older {
-                prefix += head;
-                let free = cap - live.iter().sum::<u64>();
-                let slack = (0..(1 << items.len()))
-                    .filter_map(|mask| {
-                        let removed: u64 = items
-                            .iter()
-                            .enumerate()
-                            .filter(|(i, _)| mask & (1 << i) != 0)
-                            .map(|(_, w)| *w)
-                            .sum();
-                        (free + removed).checked_sub(prefix)
-                    })
-                    .min()
-                    .unwrap();
-                assert!(charge <= slack);
-                items.push(head);
-            }
-        }
-    }
-    assert!(accepted > 0);
 }
 
 #[test]
@@ -4130,32 +3305,6 @@ fn old_and_new_readers_share_records_without_losing_legacy_charges() {
 }
 
 #[test]
-fn passing_protects_the_waiting_processes_smaller_memory_budget() {
-    let u = MEMORY_QUANTUM;
-    let mut older = sim_request(1, 0, 1, 1, ("host", 100), None).record;
-    older.cpu = Some(1);
-    older.memory_bytes = Some(6 * u);
-    older.cpu_cap = Some(100);
-    older.mem_cap = Some(10 * u);
-    older.domain_memory_cap = Some(100 * u);
-    let mut request = older.clone();
-    request.ticket = 2;
-    request.memory_bytes = Some(2 * u);
-    request.mem_cap = Some(12 * u);
-    let mut active = older.clone();
-    active.memory_bytes = Some(4 * u);
-    let live = vec![sim_lease(&active); 2];
-    assert_eq!(
-        admission_decision(100, &live, [&older].into_iter(), &request),
-        AdmissionDecision::Waiting
-    );
-    assert_eq!(
-        admission_decision(100, &live[1..], std::iter::empty(), &older),
-        AdmissionDecision::Ordered
-    );
-}
-
-#[test]
 fn resource_admission_refuses_arithmetic_overflow() {
     assert!(!fits(u64::MAX, 1, u64::MAX));
     assert!(!fits(u64::MAX - 1, 2, u64::MAX));
@@ -4258,7 +3407,7 @@ fn old_reader_refuses_passing_a_new_memory_limited_domain_waiter() {
 
 #[test]
 fn missing_exact_domain_caps_fall_back_to_the_legacy_scalar_on_both_axes() {
-    let mut record = sim_request(1, 0, 3, 1, ("host", 4), None).record;
+    let mut record = waiter(1, 3, ("host", 4), None);
     record.bytes_per_permit = GIB;
     let mut value = serde_json::to_value(record).unwrap();
     value.as_object_mut().unwrap().remove("domain_cpu_cap");
@@ -4290,7 +3439,6 @@ fn assert_legacy_record_fields(
     weight: u64,
     resources: Resources,
 ) {
-    std::fs::write(pool.dir.join(PRIORITY_WAIT_STAMP), b"").unwrap();
     let held = vector_attempt(pool, pool.capacity, 0).unwrap();
     let mut queued = None;
     assert!(
@@ -4309,18 +3457,12 @@ fn assert_legacy_record_fields(
             .clone()
             .unwrap_or_else(|| ledger_key(&d.name, d.links))
     });
-    let global = pool.capacity
-        - if pool.priority == SchedulerPriority::Low {
-            (pool.capacity / 4).max(1).min(pool.capacity - 1)
-        } else {
-            0
-        };
     assert_eq!(
         serde_json::to_value(legacy_waiting).unwrap(),
         serde_json::json!({
             "name": name, "mode_key": mode, "ticket": 1, "weight": weight,
             "priority": pool.priority.as_str(), "domain": pool.pressure_domain,
-            "domain_capacity": pool.legacy_domain_capacity, "global_capacity": global,
+            "domain_capacity": pool.legacy_domain_capacity, "global_capacity": pool.capacity,
             "bytes_per_permit": pool.bytes_per_permit, "build": pool.build,
         })
     );
@@ -4369,7 +3511,6 @@ fn legacy_lease_and_waiter_schema_is_preserved_across_estimator_demands_and_limi
             );
             pool.available_memory = || None;
             pool.pressure = false;
-            std::fs::write(dir.path().join(PRIORITY_WAIT_STAMP), b"").unwrap();
             pool.pressure_domain = "host";
             pool.build = Some(("build".into(), 12));
             pool.domain_capacity = 16.min(local_cpus);
@@ -4441,230 +3582,6 @@ fn legacy_lease_and_waiter_schema_is_preserved_across_estimator_demands_and_limi
                 },
             );
         }
-    }
-}
-
-fn mixed_legacy_pass_fixture() -> (Vec<Lease>, Waiting, Waiting) {
-    let mut head = sim_request(1, 0, 4, 1, ("host", 12), None).record;
-    head.bytes_per_permit = GIB;
-    head.global_capacity = Some(12);
-    let mut request = head.clone();
-    request.ticket = 2;
-    request.weight = 1;
-    request.cpu = Some(1);
-    request.memory_bytes = Some(GIB);
-    let live = [(4, 1), (1, 4), (2, 2)]
-        .map(|(cpu, mem)| {
-            let mut record = request.clone();
-            record.weight = cpu.max(mem);
-            record.cpu = Some(cpu);
-            record.memory_bytes = Some(mem * GIB);
-            sim_lease(&record)
-        })
-        .to_vec();
-    (live, head, request)
-}
-
-#[test]
-fn mixed_legacy_waiter_requires_scalar_and_vector_slack() {
-    let (live, head, request) = mixed_legacy_pass_fixture();
-    // Marking the head as a new writer leaves the vector-only policy in place.
-    let mut vector_head = head.clone();
-    vector_head.cpu = Some(4);
-    vector_head.memory_bytes = Some(4 * GIB);
-    assert_eq!(
-        admission_decision(12, &live, [&vector_head].into_iter(), &request),
-        AdmissionDecision::Passing
-    );
-    assert_eq!(
-        admission_decision(12, &live, [&head].into_iter(), &request),
-        AdmissionDecision::Waiting
-    );
-    // The weight-2 completion frees exactly enough scalar room without a passer.
-    let old_head: legacy::Waiting =
-        serde_json::from_value(serde_json::to_value(&head).unwrap()).unwrap();
-    let mut remaining: Vec<legacy::Lease> = live[..2]
-        .iter()
-        .map(|lease| serde_json::from_value(serde_json::to_value(lease).unwrap()).unwrap())
-        .collect();
-    assert_eq!(
-        legacy::admission_decision(12, &remaining, std::iter::empty(), &old_head),
-        legacy::AdmissionDecision::Ordered
-    );
-    remaining
-        .push(serde_json::from_value(serde_json::to_value(sim_lease(&request)).unwrap()).unwrap());
-    assert_eq!(
-        legacy::admission_decision(12, &remaining, std::iter::empty(), &old_head),
-        legacy::AdmissionDecision::Waiting
-    );
-    // Scalar slack alone is insufficient when the exact CPU ceiling is tighter.
-    let mut tight = request.clone();
-    tight.cpu_cap = Some(11);
-    tight.domain_capacity = 20;
-    assert!(can_pass_waiters(20, &[4, 4, 2], &[4], 1));
-    let mut roomy_head = head.clone();
-    roomy_head.global_capacity = Some(20);
-    roomy_head.domain_capacity = 20;
-    assert_eq!(
-        admission_decision(20, &live, [&roomy_head].into_iter(), &tight),
-        AdmissionDecision::Waiting
-    );
-    let mut roomy = request.clone();
-    roomy.global_capacity = Some(20);
-    roomy.domain_capacity = 20;
-    roomy_head.domain_capacity = 20;
-    assert_eq!(
-        admission_decision(20, &live, [&roomy_head].into_iter(), &roomy),
-        AdmissionDecision::Passing
-    );
-}
-
-#[test]
-fn mixed_legacy_waiter_blocks_passer_in_real_pool() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut pool = pool_at(dir.path(), 12, GIB);
-    pool.pressure_domain = "host";
-    let held: Vec<_> = [(4, 1), (1, 4), (2, 2)]
-        .into_iter()
-        .map(|(cpu, mem)| pool.reserve(Some(cpu), Some(mem * GIB)).unwrap())
-        .collect();
-    let (live, head, request) = mixed_legacy_pass_fixture();
-    let waiters = dir.path().join(WAITERS_DIR);
-    std::fs::create_dir_all(&waiters).unwrap();
-    let _head_guard = pool
-        .lock_record(&waiters, &serde_json::to_vec(&head).unwrap())
-        .unwrap();
-    let mut vector_head = head.clone();
-    vector_head.cpu = Some(4);
-    vector_head.memory_bytes = Some(4 * GIB);
-    assert_eq!(
-        admission_decision(12, &live, [&vector_head].into_iter(), &request),
-        AdmissionDecision::Passing
-    );
-    assert!(pool.try_admit_queued(1, None, &mut None).unwrap().is_none());
-    drop(_head_guard);
-    let _vector_head_guard = pool
-        .lock_record(&waiters, &serde_json::to_vec(&vector_head).unwrap())
-        .unwrap();
-    assert!(pool.try_admit_queued(1, None, &mut None).unwrap().is_some());
-    drop(held);
-}
-
-#[test]
-fn mixed_version_passes_preserve_legacy_waiters_in_counterfactuals() {
-    let mut total_passes = 0;
-    for seed in 0..512_u64 {
-        let mut state = seed + 1;
-        let capacity = sim_random(&mut state, 8, 24);
-        let mut make_record = |ticket| {
-            let unit = GIB * sim_random(&mut state, 1, 2);
-            let weight = sim_random(&mut state, 1, 4);
-            let mut record = sim_request(
-                ticket,
-                0,
-                weight,
-                1,
-                ("host", capacity),
-                Some(("build", capacity)),
-            )
-            .record;
-            record.global_capacity = Some(sim_random(&mut state, 8, capacity));
-            record.bytes_per_permit = unit;
-            // Every third waiter is genuinely legacy-only. New records keep
-            // a conservative scalar weight but vary their dominant resource.
-            if ticket % 3 != 1 {
-                record.cpu = Some(sim_random(&mut state, 1, weight));
-                record.memory_bytes = Some(sim_random(&mut state, 1, weight) * unit);
-            }
-            record
-        };
-        let initial: Vec<_> = (0..3).map(|_| (1, make_record(0))).collect();
-        let mut requests: Vec<_> = (1..=12)
-            .map(|ticket| SimRequest {
-                arrival: 0,
-                duration: 1,
-                record: make_record(ticket),
-            })
-            .collect();
-        // Different completion times exercise every admitted passer's fork.
-        let initial: Vec<_> = initial
-            .into_iter()
-            .map(|(_, record)| (sim_random(&mut state, 1, 20), record))
-            .collect();
-        for request in &mut requests {
-            request.duration = sim_random(&mut state, 1, 20);
-        }
-        let mut simulation = AdmissionSimulation::new(capacity, &initial, &requests);
-        simulation.legacy_readers = true;
-        simulation.queue = (0..requests.len()).collect();
-        while !simulation.queue.is_empty() {
-            simulation.expire();
-            total_passes += simulation.step(SimPolicy::TodayOrPass, Some(true));
-            if !simulation.queue.is_empty() {
-                simulation.now = *simulation
-                    .finishes
-                    .iter()
-                    .min()
-                    .expect("live work unblocks queue");
-            }
-        }
-    }
-    eprintln!("mixed-version seeds 0..512: {total_passes} passes checked");
-    assert!(
-        total_passes > 0,
-        "mixed-version workloads must exercise passing"
-    );
-}
-
-#[test]
-fn legacy_waiter_scalar_slack_uses_its_units_and_each_shared_ceiling() {
-    for scope in [
-        "global",
-        "missing-global",
-        "domain",
-        "build",
-        "changed-unit",
-    ] {
-        let (mut live, mut head, mut request) = mixed_legacy_pass_fixture();
-        head.global_capacity = Some(20);
-        head.domain_capacity = 20;
-        request.global_capacity = Some(20);
-        request.domain_capacity = 20;
-        match scope {
-            "global" => head.global_capacity = Some(12),
-            "missing-global" => head.global_capacity = None,
-            "domain" => head.domain_capacity = 12,
-            "build" => {
-                head.build = Some(("build".into(), 12));
-                request.build = Some(("build".into(), 20));
-                for lease in &mut live {
-                    lease.build_id = Some("build".into());
-                }
-            }
-            "changed-unit" => {
-                // The head's half-sized units double every lease and the
-                // passer, while retaining the CPU floor of its own weight.
-                head.bytes_per_permit = GIB / 2;
-                head.weight = 8;
-                head.global_capacity = Some(24);
-                head.domain_capacity = 40;
-            }
-            _ => unreachable!(),
-        }
-        let fallback = if scope == "missing-global" { 12 } else { 20 };
-        let mut vector_head = head.clone();
-        vector_head.cpu = Some(head.weight);
-        vector_head.memory_bytes = Some(head.weight * head.bytes_per_permit);
-        assert_eq!(
-            admission_decision(fallback, &live, [&vector_head].into_iter(), &request),
-            AdmissionDecision::Passing,
-            "vector policy: {scope}"
-        );
-        assert_eq!(
-            admission_decision(fallback, &live, [&head].into_iter(), &request),
-            AdmissionDecision::Waiting,
-            "scalar policy: {scope}"
-        );
     }
 }
 
@@ -5282,7 +4199,7 @@ fn a_waiting_admission_plan_refreshes_when_history_changes() {
     let mut cache = None;
     let first = pool.admission_plan(&demand, &mut cache);
     let held = pool.try_admit(9, None).unwrap().unwrap();
-    let mut state = AdmissionState::new(100, false);
+    let mut state = AdmissionState::new(100, Shape::Rigid);
     assert!(
         pool.try_admit_state(
             first.resources,
@@ -5338,7 +4255,7 @@ fn a_waiting_compile_refreshes_its_plan_before_admission() {
         .unwrap();
     });
     wait_until("the compile to queue", || {
-        directory.path().join(PRIORITY_WAIT_STAMP).exists()
+        scan_waiters(&directory.path().join(WAITERS_DIR)).is_ok_and(|waiters| !waiters.is_empty())
     });
     ledger.memory_windows.insert(key, vec![10; 4]);
     // Windows refuses to replace a file the waiting compile has open while it
@@ -5424,7 +4341,7 @@ fn repredicted_waiter_gate_logs_current_charge_and_dequeues_old_record() {
     ledger.memory_windows.insert(key.clone(), vec![500; 4]);
     let plan = pool.demand_vector_with_ledger(&demand, &ledger);
     let held = pool.try_admit(9, None).unwrap().unwrap();
-    let mut state = AdmissionState::new(100, true);
+    let mut state = AdmissionState::new(100, Shape::Rigid);
     assert!(
         pool.try_admit_state(
             plan.resources,
@@ -5741,15 +4658,12 @@ const PASS_BUDGET: Resources = Resources {
 /// A one-build, one-domain, low-priority request as an admission pass sees
 /// it; without `handoff` it comes from a version that admits only itself.
 fn pass_record(ticket: u64, cpu: u64, memory_bytes: u64, handoff: bool) -> Waiting {
-    let mut record = sim_request(
+    let mut record = waiter(
         ticket,
-        0,
         cpu,
-        0,
         ("host", PASS_BUDGET.cpu),
         Some(("run", PASS_BUDGET.cpu)),
-    )
-    .record;
+    );
     record.cpu = Some(cpu);
     record.memory_bytes = Some(memory_bytes);
     record.priority = "low".into();
@@ -5762,6 +4676,7 @@ fn pass_record(ticket: u64, cpu: u64, memory_bytes: u64, handoff: bool) -> Waiti
         budget: PASS_BUDGET,
         gate: None,
     });
+    record.shape = handoff.then_some(Shape::Rigid);
     record
 }
 
@@ -5775,11 +4690,12 @@ struct PassCase {
     queue: Vec<Waiting>,
     request: Waiting,
     context: PassContext,
-    /// Granted tickets in grant order, `true` marking the caller's request.
-    granted: Vec<(u64, bool)>,
+    /// Granted tickets in grant order, `true` marking the caller's request,
+    /// with the cores each grant holds.
+    granted: Vec<(u64, bool, u64)>,
 }
 
-fn pass_grants(case: &PassCase) -> Vec<(u64, bool)> {
+fn pass_grants(case: &PassCase) -> Vec<(u64, bool, u64)> {
     let live = case
         .live
         .iter()
@@ -5799,41 +4715,71 @@ fn pass_grants(case: &PassCase) -> Vec<(u64, bool)> {
     );
     pass.grants
         .iter()
-        .map(|grant| match grant.grantee {
-            Grantee::Queued(index) => (pass.queue[index].ticket, false),
-            Grantee::Request => (pass.request.ticket, true),
+        .map(|grant| {
+            let cores = pass.live[grant.live_before].resources().cpu;
+            match grant.grantee {
+                Grantee::Queued(index) => (pass.queue[index].ticket, false, cores),
+                Grantee::Request => (pass.request.ticket, true, cores),
+            }
         })
         .collect()
 }
 
 #[test]
-fn an_admission_pass_grants_every_request_the_ordering_rule_admits() {
+fn an_admission_pass_grants_what_the_pool_rule_admits() {
     let idle = PassContext {
         now_ms: 0,
-        normal_waiting: false,
         available_memory: None,
         single: false,
     };
-    let small = |ticket| pass_record(ticket, 1, 0, true);
-    let gated = {
-        let mut record = pass_record(1, 1, 2 * GIB, true);
-        record.handoff = Some(Handoff {
-            budget: PASS_BUDGET,
-            gate: Some(Gate {
-                bytes: 2 * GIB,
-                until_ms: 10_000,
-            }),
-        });
-        record
+    let aging = PassContext {
+        now_ms: AGING_MS,
+        ..idle
     };
     let short = PassContext {
         available_memory: Some(GIB),
         ..idle
     };
-    let mut normal = small(NEW);
-    normal.priority = "normal".into();
-    let mut elsewhere = small(1);
-    elsewhere.domain = "other".into();
+    let small = |ticket| pass_record(ticket, 1, 0, true);
+    let rigid = |ticket, cpu| pass_record(ticket, cpu, 0, true);
+    let moldable = |ticket, cpu| Waiting {
+        shape: Some(Shape::Moldable),
+        ..pass_record(ticket, cpu, 0, true)
+    };
+    let aged = |record: Waiting| Waiting {
+        first_arrival_ms: Some(0),
+        ..record
+    };
+    let elsewhere = |record: Waiting| Waiting {
+        domain: "other".into(),
+        ..record
+    };
+    let gated = Waiting {
+        handoff: Some(Handoff {
+            budget: PASS_BUDGET,
+            gate: Some(Gate {
+                bytes: 2 * GIB,
+                until_ms: 10_000,
+            }),
+        }),
+        ..pass_record(1, 1, 2 * GIB, true)
+    };
+    let normal = Waiting {
+        priority: "normal".into(),
+        ..small(NEW)
+    };
+    let at_its_build_ceiling = aged(Waiting {
+        build: Some(("run".into(), 2)),
+        ..rigid(1, 2)
+    });
+    let at_its_domain_ceiling = aged(Waiting {
+        domain_cpu_cap: Some(2),
+        ..rigid(1, 2)
+    });
+    let in_another_build = Waiting {
+        build: Some(("other".into(), PASS_BUDGET.cpu)),
+        ..small(NEW)
+    };
     let cases = [
         PassCase {
             name: "the recorded wedge: a head that fits but has not polled",
@@ -5846,40 +4792,129 @@ fn an_admission_pass_grants_every_request_the_ordering_rule_admits() {
             granted: [4946]
                 .into_iter()
                 .chain(4948..=4958)
-                .map(|ticket| (ticket, false))
+                .map(|ticket| (ticket, false, 1))
                 .collect(),
         },
         PassCase {
-            name: "an older request that does not fit still holds a younger one back",
+            name: "a younger request passes an older rigid one that does not fit",
             live: vec![(1, 0); 17],
-            queue: vec![pass_record(1, 4, 0, true)],
+            queue: vec![rigid(1, 4)],
+            request: small(NEW),
+            context: idle,
+            granted: vec![(NEW, true, 1)],
+        },
+        PassCase {
+            name: "an older moldable one starts on the one core that is free",
+            live: vec![(1, 0); 17],
+            queue: vec![moldable(1, 4)],
+            request: small(NEW),
+            context: idle,
+            granted: vec![(1, false, 1)],
+        },
+        PassCase {
+            name: "and on all it asked for once they are free",
+            live: vec![(1, 0); 14],
+            queue: vec![moldable(1, 4)],
+            request: small(NEW),
+            context: idle,
+            granted: vec![(1, false, 4)],
+        },
+        PassCase {
+            name: "an aged request short of the pool holds back every request behind it",
+            live: vec![(1, 0); 17],
+            queue: vec![aged(rigid(1, 4))],
+            request: small(NEW),
+            context: aging,
+            granted: vec![],
+        },
+        PassCase {
+            name: "but not normal work, which goes before it",
+            live: vec![(1, 0); 17],
+            queue: vec![aged(rigid(1, 4))],
+            request: normal.clone(),
+            context: aging,
+            granted: vec![(NEW, true, 1)],
+        },
+        PassCase {
+            name: "normal work goes before an older low request",
+            live: vec![(1, 0); 17],
+            queue: vec![small(1)],
+            request: normal,
+            context: idle,
+            granted: vec![(NEW, true, 1)],
+        },
+        PassCase {
+            name: "an aged request short only of its build's ceiling holds back only that build",
+            live: vec![(2, 0)],
+            queue: vec![at_its_build_ceiling, small(2)],
+            request: in_another_build,
+            context: aging,
+            granted: vec![(NEW, true, 1)],
+        },
+        PassCase {
+            name: "one short only of its domain's ceiling holds back that domain",
+            live: vec![(2, 0)],
+            queue: vec![at_its_domain_ceiling.clone(), small(2)],
+            request: small(NEW),
+            context: aging,
+            granted: vec![],
+        },
+        PassCase {
+            name: "and leaves other domains their room",
+            live: vec![(2, 0)],
+            queue: vec![at_its_domain_ceiling],
+            request: elsewhere(small(NEW)),
+            context: aging,
+            granted: vec![(NEW, true, 1)],
+        },
+        PassCase {
+            name: "another memory domain's request is left to that domain",
+            live: vec![],
+            queue: vec![elsewhere(small(1))],
+            request: small(NEW),
+            context: idle,
+            granted: vec![(NEW, true, 1)],
+        },
+        PassCase {
+            name: "which keeps the room it could start on",
+            live: vec![(1, 0); 17],
+            queue: vec![elsewhere(small(1))],
             request: small(NEW),
             context: idle,
             granted: vec![],
         },
         PassCase {
-            name: "a younger request passes in capacity the older one cannot use",
-            live: vec![(16, 0)],
-            queue: vec![pass_record(1, 4, 0, true)],
-            request: small(NEW),
-            context: idle,
-            granted: vec![(NEW, true)],
-        },
-        PassCase {
-            name: "a version that admits only itself keeps its place but its own admission",
+            name: "a version that admits only itself is left to its own rule",
             live: vec![(1, 0); 14],
             queue: vec![pass_record(1, 2, 0, false), pass_record(2, 2, 0, true)],
             request: small(NEW),
             context: idle,
-            granted: vec![(2, false)],
+            granted: vec![(2, false, 2), (NEW, true, 1)],
         },
         PassCase {
-            name: "another memory domain's request is left to that domain",
+            name: "a moldable request on an idle pool starts on all of it, not more",
             live: vec![],
-            queue: vec![elsewhere],
-            request: small(NEW),
+            queue: vec![],
+            request: moldable(NEW, 20),
             context: idle,
-            granted: vec![(NEW, true)],
+            granted: vec![(NEW, true, 18)],
+        },
+        PassCase {
+            name: "aged requests go oldest first, whatever their tickets",
+            live: vec![(1, 0); 17],
+            queue: vec![
+                Waiting {
+                    first_arrival_ms: Some(10),
+                    ..small(1)
+                },
+                aged(small(2)),
+            ],
+            request: small(NEW),
+            context: PassContext {
+                now_ms: AGING_MS + 10,
+                ..idle
+            },
+            granted: vec![(2, false, 1)],
         },
         PassCase {
             name: "pressure recovery grants one request per pass",
@@ -5890,7 +4925,7 @@ fn an_admission_pass_grants_every_request_the_ordering_rule_admits() {
                 single: true,
                 ..idle
             },
-            granted: vec![(1, false)],
+            granted: vec![(1, false, 1)],
         },
         PassCase {
             name: "a queued request's memory gate holds it while memory is short",
@@ -5898,7 +4933,7 @@ fn an_admission_pass_grants_every_request_the_ordering_rule_admits() {
             queue: vec![gated.clone()],
             request: small(NEW),
             context: short,
-            granted: vec![(NEW, true)],
+            granted: vec![(NEW, true, 1)],
         },
         PassCase {
             name: "and lets it go at its deadline",
@@ -5909,26 +4944,7 @@ fn an_admission_pass_grants_every_request_the_ordering_rule_admits() {
                 now_ms: 10_000,
                 ..short
             },
-            granted: vec![(1, false), (NEW, true)],
-        },
-        PassCase {
-            name: "a low-priority request yields to waiting normal work as its holder would",
-            live: vec![(14, 0)],
-            queue: vec![pass_record(1, 4, 0, true)],
-            request: normal,
-            context: PassContext {
-                normal_waiting: true,
-                ..idle
-            },
-            granted: vec![(NEW, true)],
-        },
-        PassCase {
-            name: "and takes its whole budget when none waits",
-            live: vec![(14, 0)],
-            queue: vec![pass_record(1, 4, 0, true)],
-            request: small(NEW),
-            context: idle,
-            granted: vec![(1, false)],
+            granted: vec![(1, false, 1), (NEW, true, 1)],
         },
         PassCase {
             name: "the caller's published record is superseded by its request",
@@ -5936,7 +4952,7 @@ fn an_admission_pass_grants_every_request_the_ordering_rule_admits() {
             queue: vec![small(3), small(5)],
             request: pass_record(5, 2, 0, true),
             context: idle,
-            granted: vec![(3, false), (5, true)],
+            granted: vec![(3, false, 1), (5, true, 2)],
         },
     ];
     for case in &cases {
@@ -6048,7 +5064,7 @@ fn a_handed_off_lease_lives_exactly_as_long_as_its_holder() {
     assert!(!live_path.exists());
     let mut state = AdmissionState {
         queued: live.take(),
-        ..AdmissionState::new(0, false)
+        ..AdmissionState::new(0, Shape::Rigid)
     };
     let permit = claim(&mut state, &leases).expect("the holder finds its grant");
     assert_eq!(
@@ -6081,6 +5097,9 @@ struct RecordedRequest {
     /// When the recorded scheduler admitted it, or its holder was killed.
     left: i64,
     admitted: bool,
+    /// How it may start: a reservation on fewer cores than it asked for, a
+    /// process mbx runs on all of them.
+    shape: Shape,
 }
 
 struct RecordedWindow {
@@ -6091,6 +5110,10 @@ struct RecordedWindow {
 }
 
 fn recorded_window() -> RecordedWindow {
+    recorded_window_from(RECORDED_WINDOW)
+}
+
+fn recorded_window_from(text: &str) -> RecordedWindow {
     let mut window = RecordedWindow {
         capacity: Resources::default(),
         leases: Vec::new(),
@@ -6101,10 +5124,7 @@ fn recorded_window() -> RecordedWindow {
         cpu: cpu.unwrap().parse().unwrap(),
         memory_bytes: memory.unwrap().parse().unwrap(),
     };
-    for line in RECORDED_WINDOW
-        .lines()
-        .filter(|line| !line.starts_with('#'))
-    {
+    for line in text.lines().filter(|line| !line.starts_with('#')) {
         let mut fields = line.split_whitespace();
         match fields.next() {
             Some("capacity") => window.capacity = resources(fields.next(), fields.next()),
@@ -6121,6 +5141,12 @@ fn recorded_window() -> RecordedWindow {
                 run_ms: number(fields.next()),
                 admitted: fields.next() == Some("admitted"),
                 left: number(fields.next()),
+                // A request that names no kind is a process mbx runs.
+                shape: match fields.next() {
+                    Some("reservation") => Shape::Moldable,
+                    Some("compile" | "link" | "test-binary") | None => Shape::Rigid,
+                    Some(kind) => panic!("unexpected request kind {kind}"),
+                },
             }),
             other => panic!("unexpected record {other:?}"),
         }
@@ -6134,19 +5160,18 @@ fn window_record(
     ticket: u64,
     resources: Resources,
     build: &str,
+    shape: Shape,
 ) -> Waiting {
-    let mut record = sim_request(
+    let mut record = waiter(
         ticket,
-        0,
         resources.cpu,
-        0,
         ("host", window.capacity.cpu),
         Some((build, window.capacity.cpu)),
-    )
-    .record;
+    );
     record.cpu = Some(resources.cpu);
     record.memory_bytes = Some(resources.memory_bytes);
     record.priority = "low".into();
+    record.shape = Some(shape);
     record.domain_cpu_cap = Some(window.capacity.cpu);
     record.domain_memory_cap = Some(window.capacity.memory_bytes);
     record.handoff = Some(Handoff {
@@ -6163,18 +5188,21 @@ struct IdleBehindQueue {
     /// Waits behind no older request short of room: head-of-line waits.
     unprotected_ms: i64,
     longest_unprotected_ms: i64,
-    /// Waits behind an older request short of room, the one case the
-    /// ordering rule holds a younger request back for.
+    /// Waits behind a request the rule replayed holds them back for: an
+    /// older one short of room, or under the pool rule an aged one.
     protected_ms: i64,
     longest_protected_ms: i64,
 }
 
-/// `waits` holds each request's ticket, charge, and when it waited.
+/// `waits` holds each request's ticket, charge, and when it waited. A wait is
+/// protected while an older request is short of room or, with `aging`, while
+/// another that has waited that long is.
 fn idle_behind_queue(
     capacity: Resources,
     leases: &[(Resources, i64, i64)],
     waits: &[(u64, Resources, i64, i64)],
     end: i64,
+    aging: Option<i64>,
 ) -> IdleBehindQueue {
     let mut times: Vec<i64> = leases
         .iter()
@@ -6207,7 +5235,17 @@ fn idle_behind_queue(
         for (index, wait) in waits.iter().enumerate() {
             let &(ticket, charge, _, _) = wait;
             if waiting(&wait) && capacity.fits(used, charge) {
-                if oldest_short.is_some_and(|older| older < ticket) {
+                let held = match aging {
+                    None => oldest_short.is_some_and(|older| older < ticket),
+                    Some(aging) => waits.iter().enumerate().any(|(other, held)| {
+                        let &(_, short, from, _) = held;
+                        other != index
+                            && waiting(&held)
+                            && now - from >= aging
+                            && !capacity.fits(used, short)
+                    }),
+                };
+                if held {
                     protected[index] += next - now;
                 } else {
                     unprotected[index] += next - now;
@@ -6224,20 +5262,29 @@ fn idle_behind_queue(
     }
 }
 
-/// The recorded window's arrivals, run through admission passes: at every
-/// arrival and every lease end some process runs one pass, as a queued
-/// request's next poll does within its poll interval.
-fn replay_window(window: &RecordedWindow) -> Vec<i64> {
-    let idle = PassContext {
-        now_ms: 0,
-        normal_waiting: false,
-        available_memory: None,
-        single: false,
-    };
+/// The recorded window's arrivals, run through admission passes on the pool
+/// clock, which starts at the earliest arrival: at every arrival, every lease
+/// end and every instant a waiter reaches the aging bound some process runs
+/// one pass, as a queued request's next poll does within its poll interval.
+fn replay_window(window: &RecordedWindow) -> Vec<(i64, Resources, i64)> {
+    let origin = window
+        .requests
+        .iter()
+        .map(|request| request.queued)
+        .min()
+        .unwrap_or(0)
+        .min(0);
+    let clock = |at: i64| u64::try_from(at - origin).unwrap();
+    let aging = i64::try_from(AGING_MS).unwrap();
     let mut live: Vec<(Lease, i64)> = window
         .leases
         .iter()
-        .map(|(charge, build, end)| (Lease::from(&window_record(window, 0, *charge, build)), *end))
+        .map(|(charge, build, end)| {
+            (
+                Lease::from(&window_record(window, 0, *charge, build, Shape::Rigid)),
+                *end,
+            )
+        })
         .collect();
     let mut started = vec![None; window.requests.len()];
     let mut queue: Vec<usize> = Vec::new();
@@ -6254,7 +5301,16 @@ fn replay_window(window: &RecordedWindow) -> Vec<i64> {
                 .iter()
                 .map(|&index| {
                     let request = &window.requests[index];
-                    window_record(window, request.ticket, request.resources, &request.build)
+                    Waiting {
+                        first_arrival_ms: Some(clock(request.queued)),
+                        ..window_record(
+                            window,
+                            request.ticket,
+                            request.resources,
+                            &request.build,
+                            request.shape,
+                        )
+                    }
                 })
                 .collect();
             let request = records[0].clone();
@@ -6263,30 +5319,46 @@ fn replay_window(window: &RecordedWindow) -> Vec<i64> {
                 &records,
                 request,
                 records[0].handoff.unwrap(),
-                idle,
+                PassContext {
+                    now_ms: clock(now),
+                    available_memory: None,
+                    single: false,
+                },
                 false,
             );
-            let granted: Vec<usize> = pass
+            let granted: Vec<(usize, Lease)> = pass
                 .grants
                 .iter()
-                .map(|grant| match grant.grantee {
-                    Grantee::Queued(position) => queue[position],
-                    Grantee::Request => head,
+                .map(|grant| {
+                    let index = match grant.grantee {
+                        Grantee::Queued(position) => queue[position],
+                        Grantee::Request => head,
+                    };
+                    (index, pass.live[grant.live_before].clone())
                 })
                 .collect();
-            for index in &granted {
+            for (index, lease) in &granted {
                 let request = &window.requests[*index];
-                started[*index] = Some(now);
-                let record =
-                    window_record(window, request.ticket, request.resources, &request.build);
-                live.push((Lease::from(&record), now + request.run_ms));
+                // A grant narrower than its request runs the same work on
+                // fewer cpus, for proportionally longer.
+                let asked = i64::try_from(request.resources.cpu.max(1)).unwrap();
+                let held = i64::try_from(lease.resources().cpu.max(1)).unwrap();
+                let end = now + request.run_ms * asked / held;
+                started[*index] = Some((now, lease.resources(), end));
+                live.push((lease.clone(), end));
             }
-            queue.retain(|index| !granted.contains(index));
+            queue.retain(|index| !granted.iter().any(|(granted, _)| granted == index));
         }
         let next = live
             .iter()
             .map(|&(_, end)| end)
             .chain(window.requests.get(arrivals).map(|request| request.queued))
+            .chain(
+                queue
+                    .iter()
+                    .map(|&index| window.requests[index].queued + aging)
+                    .filter(|&at| at > now),
+            )
             .min();
         match next {
             Some(next) => now = next,
@@ -6342,18 +5414,23 @@ fn the_recorded_wedge_replays_without_idle_capacity_behind_queued_work() {
             })
             .collect()
     };
-    let replayed: Vec<_> = replay_window(&window).into_iter().map(Some).collect();
+    let replayed: Vec<_> = replay_window(&window)
+        .into_iter()
+        .map(|(start, _, _)| Some(start))
+        .collect();
     let before = idle_behind_queue(
         window.capacity,
         &schedule(&recorded_starts),
         &waits(&recorded_starts),
         end,
+        None,
     );
     let after = idle_behind_queue(
         window.capacity,
         &schedule(&replayed),
         &waits(&replayed),
         end,
+        None,
     );
     let longest_wait = |starts: &[Option<i64>]| {
         waits(starts)
@@ -6385,55 +5462,365 @@ fn the_recorded_wedge_replays_without_idle_capacity_behind_queued_work() {
     );
 }
 
-/// A lease outside the request's build, so only the shared scopes see it.
-fn shared_lease(cpu: u64, memory_bytes: u64) -> Lease {
-    let mut record = pass_record(0, cpu, memory_bytes, true);
-    record.build = None;
-    Lease::from(&record)
+/// 2026-10-31 00:21-00:42 +04:00 on one 18-core host, from its observation
+/// log: `mbx reserve`s for 17 and 18 cpus at the head of the queue held the
+/// one-cpu reserves behind them for up to 176 s while cores sat idle.
+const CONVOY_WINDOW: &str = include_str!("scheduler_replay_window_20261031.txt");
+
+/// No core idles while a request could start on it, but behind a request that
+/// has waited the aging bound: a reservation starts on whatever is free up to
+/// its request, so a wide one at the head is no reason to hold narrow ones, and
+/// a process's request that does not fit is passed by those that do until it
+/// has aged (POOL_RULE, SmoothBricks' admission simulator).
+#[test]
+fn the_reserve_convoy_replays_with_cores_idle_only_behind_an_aged_request() {
+    let window = recorded_window_from(CONVOY_WINDOW);
+    let end = window
+        .requests
+        .iter()
+        .map(|request| request.left + request.run_ms)
+        .max()
+        .unwrap();
+    let replayed = replay_window(&window);
+    let aging = i64::try_from(AGING_MS).unwrap();
+    let initial = window
+        .leases
+        .iter()
+        .map(|&(charge, _, finish)| (charge, i64::MIN, finish));
+    // What each request needs to start: a reservation one core, a process
+    // all of its cores, either with all of its memory.
+    let need = |request: &RecordedRequest| Resources {
+        cpu: match request.shape {
+            Shape::Rigid => request.resources.cpu,
+            Shape::Moldable => request.resources.cpu.min(1),
+        },
+        ..request.resources
+    };
+    let leases: Vec<_> = initial
+        .chain(
+            window
+                .requests
+                .iter()
+                .zip(&replayed)
+                .map(|(_, &(start, granted, end))| (granted, start, end)),
+        )
+        .collect();
+    let waits: Vec<_> = window
+        .requests
+        .iter()
+        .zip(&replayed)
+        .map(|(request, &(start, _, _))| {
+            (request.ticket, need(request), request.queued.max(0), start)
+        })
+        .collect();
+    let idle = idle_behind_queue(window.capacity, &leases, &waits, end, Some(aging));
+    let head_wait = window
+        .requests
+        .iter()
+        .zip(&replayed)
+        .filter(|(request, _)| request.resources.cpu >= 17)
+        .map(|(request, &(start, _, _))| start - request.queued)
+        .max()
+        .unwrap();
+    assert!(
+        idle.unprotected_ms == 0 && head_wait < aging,
+        "a replayed request waited while a cpu it could start on was free, or \
+         the widest reservation waited {head_wait} ms: {idle:?}"
+    );
 }
 
-#[test]
-fn an_older_request_short_of_memory_leaves_the_cores_its_start_will_free() {
-    let mib = 1 << 20;
-    let cases = [
+/// splitmix64 (Steele, Lea and Flood): the random pool traces' deterministic
+/// stream, so a failing seed replays.
+struct SplitMix(u64);
+
+impl SplitMix {
+    fn next(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    /// Uniform enough in `0..bound` for a trace.
+    fn below(&mut self, bound: u64) -> u64 {
+        self.next() % bound
+    }
+}
+
+/// One request of a random pool trace.
+#[derive(Clone, Copy, Debug)]
+struct Arrival {
+    at: u64,
+    hold_ms: u64,
+    want: Resources,
+    shape: Shape,
+    normal: bool,
+}
+
+/// A random pool trace on `PASS_BUDGET`, after SmoothBricks' admission
+/// simulator: mostly one-core requests, some mid-sized, a tenth for the whole
+/// pool or more; holds over four orders of magnitude; half charging memory, up to a
+/// share per core; half moldable; a fifth `normal`.
+fn random_trace(seed: u64) -> Vec<Arrival> {
+    let mut random = SplitMix(seed);
+    let share = PASS_BUDGET.memory_bytes / PASS_BUDGET.cpu;
+    let size = 20 + random.below(140);
+    let mut at = 0;
+    (0..size)
+        .map(|_| {
+            at += 10 + random.below(5_000);
+            let roll = random.below(100);
+            let cpu = if roll < 75 {
+                1
+            } else if roll < 90 {
+                2 + random.below(8)
+            } else {
+                17 + random.below(3)
+            };
+            Arrival {
+                at,
+                hold_ms: 10_u64.pow(u32::try_from(random.below(4)).unwrap())
+                    * (50 + random.below(150)),
+                want: Resources {
+                    cpu,
+                    memory_bytes: if random.below(2) == 0 {
+                        0
+                    } else {
+                        share * (1 + random.below(cpu))
+                    },
+                },
+                shape: if random.below(2) == 0 {
+                    Shape::Rigid
+                } else {
+                    Shape::Moldable
+                },
+                normal: random.below(5) == 0,
+            }
+        })
+        .collect()
+}
+
+/// `arrival` as its holder publishes it, queued since it arrived.
+fn trace_record(ticket: u64, arrival: &Arrival) -> Waiting {
+    Waiting {
+        first_arrival_ms: Some(arrival.at),
+        priority: if arrival.normal { "normal" } else { "low" }.into(),
+        shape: Some(arrival.shape),
+        build: None,
+        ..pass_record(ticket, arrival.want.cpu, arrival.want.memory_bytes, true)
+    }
+}
+
+/// Whether `arrival` could start beside leases that use `used` of
+/// `PASS_BUDGET`, worked out apart from the scheduler: a moldable request on
+/// one of its cores, a rigid one on all of them, either with all its memory;
+/// an axis nobody holds takes any request.
+fn could_start(arrival: &Arrival, used: Resources) -> bool {
+    let cores = match arrival.shape {
+        Shape::Rigid => arrival.want.cpu,
+        Shape::Moldable => arrival.want.cpu.min(1),
+    };
+    (used.cpu == 0 || used.cpu + cores <= PASS_BUDGET.cpu)
+        && (used.memory_bytes == 0
+            || used.memory_bytes + arrival.want.memory_bytes <= PASS_BUDGET.memory_bytes)
+}
+
+/// The pool rule's properties over one pass at `now` from `queue`, each
+/// request an index into `trace`. `granted` names each grant's request and its
+/// lease's index in `live`, the leases after the pass.
+fn check_pass(
+    seed: u64,
+    now: u64,
+    trace: &[Arrival],
+    queue: &[usize],
+    live: &[Lease],
+    granted: &[(usize, usize)],
+) {
+    let aged = |index: usize| now - trace[index].at >= AGING_MS;
+    // The pool's order, worked out apart from the scheduler.
+    let order = |index: usize| {
         (
-            "a one-core test passes an older test waiting for memory: what frees that memory frees cores",
-            vec![shared_lease(1, 6 * GIB); 17],
-            pass_record(1, 1, 13 * GIB, true),
-            pass_record(2, 1, 64 * mib, true),
-            AdmissionDecision::Passing,
-        ),
-        (
-            "a memory-only lease can free that memory alone, freeing no core",
-            [
-                vec![shared_lease(1, 5 * GIB); 17],
-                vec![shared_lease(0, 13 * GIB)],
-            ]
-            .concat(),
-            pass_record(1, 1, 13 * GIB, true),
-            pass_record(2, 1, 64 * mib, true),
-            AdmissionDecision::Waiting,
-        ),
-        (
-            "an older request short of cores, not memory, keeps the free core",
-            vec![shared_lease(1, GIB); 17],
-            pass_record(1, 2, GIB, true),
-            pass_record(2, 1, 64 * mib, true),
-            AdmissionDecision::Waiting,
-        ),
-        (
-            "memory-only work passes an older request waiting for a core: that core frees memory",
-            vec![shared_lease(1, 6 * GIB); 17],
-            pass_record(1, 2, 6 * GIB, true),
-            pass_record(2, 0, GIB, true),
-            AdmissionDecision::Passing,
-        ),
-    ];
-    for (name, live, older, newer, expected) in cases {
-        assert_eq!(
-            admission_decision(PASS_BUDGET.cpu, &live, [&older].into_iter(), &newer),
-            expected,
-            "{name}"
+            !trace[index].normal,
+            !aged(index),
+            if aged(index) { trace[index].at } else { 0 },
+            index,
+        )
+    };
+    let after = scope_used(live.iter());
+    // An axis nobody holds takes any request, so an oversize one runs: only a
+    // lone holder of an axis may hold more of it than the pool.
+    let holders = |axis: fn(Resources) -> u64| {
+        live.iter()
+            .filter(|lease| axis(lease.resources()) > 0)
+            .count()
+    };
+    assert!(
+        (after.cpu <= PASS_BUDGET.cpu || holders(|charge| charge.cpu) == 1)
+            && (after.memory_bytes <= PASS_BUDGET.memory_bytes
+                || holders(|charge| charge.memory_bytes) == 1),
+        "seed {seed} at {now} ms: the grants hold {after:?} of {PASS_BUDGET:?}"
+    );
+    for &(index, lease) in granted {
+        let held = live[lease].resources();
+        let arrival = &trace[index];
+        // A rigid request holds all of its cores; a moldable one as many of
+        // them as were free, all the pool's on an empty pool.
+        let cores = match arrival.shape {
+            Shape::Rigid => arrival.want.cpu,
+            Shape::Moldable => arrival.want.cpu.min(
+                PASS_BUDGET
+                    .cpu
+                    .saturating_sub(scope_used(live[..lease].iter()).cpu),
+            ),
+        };
+        assert!(
+            held.cpu == cores && held.memory_bytes == arrival.want.memory_bytes,
+            "seed {seed} at {now} ms: request {index} asked for {arrival:?} and holds {held:?}"
         );
     }
+    let waiting: Vec<usize> = queue
+        .iter()
+        .copied()
+        .filter(|index| !granted.iter().any(|&(granted, _)| granted == *index))
+        .collect();
+    for &index in &waiting {
+        // Work-conserving: a request that could start waits only behind an
+        // aged one that cannot.
+        if could_start(&trace[index], after) {
+            assert!(
+                waiting.iter().any(|&ahead| order(ahead) < order(index)
+                    && aged(ahead)
+                    && !could_start(&trace[ahead], after)),
+                "seed {seed} at {now} ms: request {index} waits while it could start"
+            );
+        }
+        // Priority: no low request starts while a normal one that could
+        // start on what was free waits.
+        if trace[index].normal {
+            for &(low, lease) in granted
+                .iter()
+                .filter(|&&(granted, _)| !trace[granted].normal)
+            {
+                assert!(
+                    !could_start(&trace[index], scope_used(live[..lease].iter())),
+                    "seed {seed} at {now} ms: low request {low} started while normal request {index} could"
+                );
+            }
+        }
+        // Aging: nothing ordered after a request that has waited the aging
+        // bound starts before it.
+        if aged(index) {
+            for &(started, _) in granted {
+                assert!(
+                    order(started) < order(index),
+                    "seed {seed} at {now} ms: request {started} started ahead of aged request {index}"
+                );
+            }
+        }
+    }
+}
+
+/// Replays `trace` through admission passes on a virtual clock: one pass at
+/// every arrival, every lease end and every instant a waiter reaches the
+/// aging bound, as a waiter's next poll runs one, checking the pool rule's
+/// properties at each. A narrower grant runs the same work on fewer cores,
+/// for proportionally longer. Returns when each request started and on how
+/// many cores; a request that never starts fails the replay.
+fn replay_trace(seed: u64, trace: &[Arrival]) -> Vec<(u64, u64)> {
+    let records: Vec<Waiting> = (1..)
+        .zip(trace)
+        .map(|(ticket, arrival)| trace_record(ticket, arrival))
+        .collect();
+    let handoff = Handoff {
+        budget: PASS_BUDGET,
+        gate: None,
+    };
+    let mut started = vec![None; trace.len()];
+    let mut live: Vec<(Lease, u64)> = Vec::new();
+    let mut queue: Vec<usize> = Vec::new();
+    let mut arrivals = 0;
+    let mut now = 0;
+    loop {
+        live.retain(|&(_, end)| end > now);
+        while arrivals < trace.len() && trace[arrivals].at <= now {
+            queue.push(arrivals);
+            arrivals += 1;
+        }
+        if let Some(&head) = queue.first() {
+            let waiting: Vec<Waiting> = queue.iter().map(|&index| records[index].clone()).collect();
+            let pass = admission_pass(
+                live.iter().map(|(lease, _)| lease.clone()).collect(),
+                &waiting,
+                records[head].clone(),
+                handoff,
+                PassContext {
+                    now_ms: now,
+                    available_memory: None,
+                    single: false,
+                },
+                false,
+            );
+            let granted: Vec<(usize, usize)> = pass
+                .grants
+                .iter()
+                .map(|grant| match grant.grantee {
+                    Grantee::Queued(position) => (queue[position], grant.live_before),
+                    Grantee::Request => (head, grant.live_before),
+                })
+                .collect();
+            check_pass(seed, now, trace, &queue, &pass.live, &granted);
+            for &(index, lease) in &granted {
+                let lease = pass.live[lease].clone();
+                let cores = lease.resources().cpu;
+                let end = now + trace[index].hold_ms * trace[index].want.cpu.max(1) / cores.max(1);
+                started[index] = Some((now, cores));
+                live.push((lease, end));
+            }
+            queue.retain(|index| !granted.iter().any(|&(granted, _)| granted == *index));
+        }
+        let next = live
+            .iter()
+            .map(|&(_, end)| end)
+            .chain(trace.get(arrivals).map(|arrival| arrival.at))
+            .chain(
+                queue
+                    .iter()
+                    .map(|&index| trace[index].at + AGING_MS)
+                    .filter(|&at| at > now),
+            )
+            .min();
+        match next {
+            Some(next) => now = next,
+            None => break,
+        }
+    }
+    started
+        .into_iter()
+        .enumerate()
+        .map(|(index, start)| {
+            start.unwrap_or_else(|| panic!("seed {seed}: request {index} never started"))
+        })
+        .collect()
+}
+
+/// POOL_RULE's properties over 96 random traces, each checked at every pass
+/// by `check_pass`: the grants never hold more than the pool; a request that
+/// could start waits only behind an aged one that cannot; no low request
+/// starts while a normal one that could start waits; nothing ordered after a
+/// request that has waited the aging bound starts before it; and every
+/// request starts, so every request finishes.
+#[test]
+fn the_pool_rule_keeps_its_properties_on_random_traces() {
+    let (mut aged, mut narrowed) = (0, 0);
+    for seed in 0..96 {
+        let trace = random_trace(seed);
+        for (arrival, (start, cores)) in trace.iter().zip(replay_trace(seed, &trace)) {
+            aged += usize::from(start - arrival.at >= AGING_MS);
+            narrowed += usize::from(cores < arrival.want.cpu);
+        }
+    }
+    // Neither property holds vacuously: requests did reach the aging bound,
+    // and moldable ones did start on fewer cores than they asked for.
+    assert!(aged > 0 && narrowed > 0, "{aged} aged, {narrowed} narrowed");
 }

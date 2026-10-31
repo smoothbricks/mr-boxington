@@ -539,7 +539,7 @@ Works on Linux and macOS. Has no effect when `scheduler.memory` is `"none"`. Thi
 
 Priority of this build's compilations in the machine-wide permit pool.
 
-While a normal-priority build is waiting, a `low` build leaves about a quarter of the pool free for it. This may also be set in workspace `.mbx.toml`; the environment variable wins.
+A waiting normal-priority request goes before every `low` one, which starts only on room no waiting normal-priority request can use. This may also be set in workspace `.mbx.toml`; the environment variable wins.
 
 **Choices:**
 - `normal`

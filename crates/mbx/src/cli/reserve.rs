@@ -14,13 +14,16 @@ const WORKER_ENV: &str = "MBX_RESERVE_WORKER";
 
 #[derive(usage_rs::Args)]
 pub(super) struct ReserveArgs {
-    /// CPU cores to hold while the command runs.
+    /// Most CPU cores to hold while the command runs. The pool may grant
+    /// fewer, at least one, as soon as one is free; the command reads the
+    /// count it was granted from `MBX_RESERVE_CPUS`.
     #[usage(long, value_name = "N")]
     cpus: Option<u64>,
     /// Memory to hold from the configured scheduler budget.
     #[usage(long, value_name = "SIZE")]
     memory: Option<ByteSize>,
-    /// Whether this reservation yields capacity to normal-priority builds.
+    /// Priority in the machine-wide pool: `low` goes after waiting
+    /// normal-priority work.
     #[usage(long, default = "normal")]
     priority: SchedulerPriority,
     /// Descriptor to announce the reservation on: one byte, `g`, once
@@ -116,9 +119,13 @@ fn run_direct(config: &Config, args: &ReserveArgs, grant: Option<Descriptor>) ->
         .map(Descriptor::granted)
         .transpose()
         .and_then(|_hold| {
-            external_command(program, arguments)
-                // Nested mbx work is covered by this reservation. Letting its compiler
-                // shims take new permits would deadlock when this lease fills the pool.
+            let mut command = external_command(program, arguments);
+            // `--cpus` is a maximum: the pool grants as many as are free,
+            // down to one, rather than hold the command until all are.
+            if args.cpus.is_some() {
+                command.env(GRANTED_CPUS_ENV, admission.cpus().to_string());
+            }
+            command
                 .status()
                 .wrap_err_with(|| format!("failed to run {program}"))
         });
@@ -141,7 +148,20 @@ fn run_enclosed(
     // That grant covers the command already, so --grant-fd hears of it now,
     // and of its release once the command has run.
     let _hold = grant.map(Descriptor::granted).transpose()?;
-    let status = external_command(program, arguments)
+    let mut command = external_command(program, arguments);
+    // Its share of the enclosing grant is at most what it asked for.
+    if let Some(cpus) = args.cpus {
+        let enclosing = std::env::var(GRANTED_CPUS_ENV)
+            .ok()
+            .and_then(|count| count.parse::<u64>().ok());
+        command.env(
+            GRANTED_CPUS_ENV,
+            enclosing
+                .map_or(cpus, |enclosing| enclosing.min(cpus))
+                .to_string(),
+        );
+    }
+    let status = command
         .status()
         .wrap_err_with(|| format!("failed to run {program}"))?;
     Ok(exit_code(status))
@@ -160,6 +180,10 @@ fn reservation<'a>(
     };
     Ok((program, arguments, pool))
 }
+
+/// The cores a reservation's command was granted, at most its `--cpus`: the
+/// command sizes its own parallelism from it.
+const GRANTED_CPUS_ENV: &str = "MBX_RESERVE_CPUS";
 
 pub(super) fn external_command(program: &str, arguments: &[String]) -> Command {
     let mut command = Command::new(program);
