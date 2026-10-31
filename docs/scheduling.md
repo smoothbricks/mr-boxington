@@ -214,10 +214,10 @@ Enqueue, dequeue (including gate or error reason), admission, and reclamation of
 dead waiters record identity, resources, and wait age. A request gated before it
 joins the queue records a `gated` event when its gate reason changes, rather than
 on every retry. A dequeue records that reason too, so continued gating does not
-repeat it. Request arrival time survives requeues. Admissions include the
-ordered/passing rule, free resources in each scope, and the oldest overtaken
-waiters with exception reasons or the actual CPU/memory slack bounds (legacy
-scalar checks include their permit size). Events are collected while admission
+repeat it. Request arrival time survives requeues. Admissions include whether
+an older request was still waiting (`rule`: `ordered` or `passing`), free
+resources in each scope, and the oldest overtaken waiters with the reason each
+was passed. Events are collected while admission
 is locked, then encoded and appended after the registrar is released. Concurrent
 writers can therefore append events in a different order from their decisions;
 use their timestamps and tickets to follow a request. An admission granted to a
@@ -260,45 +260,39 @@ unused-byte averages use only successful unwrapped measurements. Missing peaks
 count as observations but do not contribute to measured statistics. Without
 observations, this section shows a short empty-state line.
 
-When a compilation cannot fit, it queues before newer requests, so a large
-compilation still runs while other builds keep submitting small ones. Newer
-requests may use capacity a waiting request cannot use when it next becomes
-able to start, only when both CPU and memory fit the safe slack in every
-shared scope. The memory calculation rounds completion subsets up in 16 MiB
-units and subtracts their maximum rounding error; a calculation that exceeds
-the bounded subset bitset refuses the pass.
+The pool admits requests in one order: `normal` priority before `low`, and
+within a priority by arrival, except that a request which has waited 30 seconds
+goes ahead of every younger request of its priority.
 
-Each axis's slack also counts what the other axis makes complete first. An
-older request short of memory starts only once completions free that
-shortfall. No set of completions frees it with fewer leases than the shortfall
-divided by the largest memory any of them holds, rounded up, and each of those
-leases frees at least the fewest cores any lease holding memory holds. Every
-set of completions that lets the older request start therefore frees at least
-that many cores, so a newer request may use that many of the cores free now
-without delaying it. Memory freed by the completions an older request short of
-cores waits for counts the same way. Both bounds are lower bounds on the room
-every such completion set leaves, so taking the larger of either and the
-single-axis slack keeps the guarantee. A build's ceiling counts cores only and
-gains nothing from memory, and a lease that holds memory but no cores, such as
-a memory-only reservation, makes the bound zero.
+A compiler or test process runs as many threads as it was charged for, so its
+request starts only when all of its cores fit. An
+[`mbx reserve`](#reserve-capacity-for-external-work) may start on fewer: as soon
+as one core is free, it gets as many of the cores it asked for as are free.
+Memory is charged whole either way, since a process's predicted peak does not
+shrink with its cores. A request that cannot start is passed by the requests
+behind it that can, so a large compilation never leaves cores idle that smaller
+work could use.
 
-Within one scope this never delays an older request. When a request
-waits on its own build or container limit, the existing rule already lets
-other builds or containers start, which can rarely delay the waiting request
-after a pass. Cancelling a waiter or killing its process releases its queue
+Passing is bounded by age. Once a request has waited 30 seconds and still
+cannot start, the requests behind it in each scope it is short of wait
+until it has started: every request when it is short of the shared pool, and
+only the requests of its build or container when it is short of only that
+build's `-j` or that container's ceiling. A large compilation therefore starts
+once the pool has drained enough for it, however many small requests keep
+arriving. Cancelling a waiter or killing its process releases its queue
 position.
 
 Each admission attempt serves the whole queue. Whichever process takes the
-pool's lock admits, in queue order, every waiting request these rules admit,
+pool's lock admits, in that order, every waiting request these rules admit,
 not only its own. On macOS and Linux, waiters block on lease-directory changes:
 a release wakes admission scans, and a grant's rename wakes its holder. The
 watch is registered before rechecking admission, so a release cannot be lost
 between the check and the wait. Notifications never decide admission; the
-existing registrar and queue order do. A request therefore waits only for
-capacity, or behind an older request that does not fit yet. Requests
-from another container are left to that container's processes, since each
-container measures its own memory pressure, and a waiter from an older mbx
-keeps admitting only itself.
+registrar and these rules do. A request from another container is left to that
+container's processes, since each container measures its own memory pressure,
+but still takes its turn: the cores it could start on are left for its own
+process to claim. A waiter from an older mbx keeps admitting only itself, by
+its own rule.
 
 A jittered one-to-one-and-a-half-second recheck notices memory-pressure changes
 and refreshes normal-priority demand. Periodic waiters share admission passes
@@ -360,7 +354,7 @@ New wrappers still write the original weight and memory share for older readers;
 new records carry exact CPU and memory charges as well. Older mbx versions
 read the same single-number charge as today, including its cap at the writing
 process's own capacity; new versions read the exact cores and bytes. Upgrade
-all wrappers sharing the pool to get ordered admission.
+all wrappers sharing the pool to admit everything by one rule.
 
 Set `scheduler.pressure = false` (`MBX_SCHEDULER_PRESSURE=0`) to admit
 compilations on permits and memory estimates alone. Disabling the scheduler or
@@ -369,9 +363,10 @@ pressure probes fail, scheduling falls back to the same permit and estimate
 checks.
 
 Use `scheduler.priority = "low"` (`MBX_SCHEDULER_PRIORITY=low`) for an editor's
-background check or CI on a shared machine. While normal-priority work is
-waiting, low-priority builds leave a quarter of each budget available for it,
-without withholding the whole CPU or memory budget.
+background check or CI on a shared machine. A waiting normal-priority request
+goes before every low-priority one, so low-priority work starts only on room no
+waiting normal-priority request can use; with none waiting, it may use the
+whole budget.
 
 ## Reserve capacity for external work
 
@@ -382,21 +377,26 @@ memory but does not run through mbx, such as a build in a VM or container:
 mbx reserve --memory 6GiB --cpus 4 -- ./run-windows-build-in-vm.sh
 ```
 
-CPU and memory requests reserve exactly their separate amounts; an omitted
-resource reserves zero of that resource. The command waits until both amounts
-fit, then a dedicated worker
-holds it until the external command exits. Killing the invoking `mbx reserve`
+`--cpus` is a maximum. The command starts as soon as one core is free, on as
+many of the cores it asked for as are free then, and the reservation holds
+those. The command reads that count from `MBX_RESERVE_CPUS` and should size its
+own parallelism from it. Memory is reserved exactly, and the command waits
+until all of it fits; an omitted resource reserves zero of that resource, and
+without `--cpus` the command gets no `MBX_RESERVE_CPUS`. Once the reservation is granted, a dedicated
+worker holds it until the external command exits. Killing the invoking `mbx reserve`
 process alone does not release capacity while that worker still waits for the
 command; a crashed worker does release its lease through the operating system.
 The command must wait for work it launches: detached background processes can
 outlive the reservation and are not covered after the command exits. That
 includes a nested `mbx reserve`: run by a command a reservation already covers,
 it runs its own command under the enclosing grant at once, without a lease of
-its own, instead of queueing behind capacity its enclosing reservation holds.
+its own, instead of queueing behind capacity its enclosing reservation holds;
+its command's `MBX_RESERVE_CPUS` is the smaller of its `--cpus` and the
+enclosing grant's, or its `--cpus` when no enclosing grant names one.
 `--memory` is measured against `scheduler.memory`; omit it when memory
 scheduling is disabled. Use `--priority low` for background work that
-should yield at admission time to waiting normal-priority builds; an admitted
-reservation, like an admitted compiler, is never preempted. `--grant-fd` tells a
+should go after waiting normal-priority work; an admitted
+reservation, like an admitted compiler, is never preempted or narrowed. `--grant-fd` tells a
 supervisor when the reservation gets its capacity; see
 [Tell a supervisor when work holds capacity](#tell-a-supervisor-when-work-holds-capacity).
 
@@ -535,13 +535,13 @@ descriptor. Grant descriptors are a Unix interface.
 
 ## Choose the scope of a limit
 
-| Limit | Affects |
-| --- | --- |
-| `scheduler.cpus`, `scheduler.memory` | The shared compiler pool |
-| `scheduler.reserve_cpus` | CPU cores left outside that pool |
-| Cargo `-j` or `CARGO_BUILD_JOBS` | CPU cores one build may hold |
-| `scheduler.priority = "low"` | Whether a build yields to waiting normal-priority work |
-| `scheduler.tests = true` | Whether Cargo test binaries and nextest tests take permits |
+| Limit                                | Affects                                                    |
+| ------------------------------------ | ---------------------------------------------------------- |
+| `scheduler.cpus`, `scheduler.memory` | The shared compiler pool                                   |
+| `scheduler.reserve_cpus`             | CPU cores left outside that pool                           |
+| Cargo `-j` or `CARGO_BUILD_JOBS`     | CPU cores one build may hold                               |
+| `scheduler.priority = "low"`         | Whether a build goes after waiting normal-priority work    |
+| `scheduler.tests = true`             | Whether Cargo test binaries and nextest tests take permits |
 
 A memory budget schedules work using measurements; it is not an operating-system
 memory limit. A compiler process can still exceed its estimate. For laptop
