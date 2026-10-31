@@ -417,6 +417,18 @@ fn a_build_std_unit_of_a_nix_join_found_through_a_profile_stores_and_restores() 
     );
 }
 
+/// The same host when Cargo runs the profile's own link by its path, as
+/// `RUSTC=$(command -v rustc)` makes it: rustc still finds its sysroot in the
+/// join, and Cargo names the sources by it, so the unit is keyed beneath the
+/// join, not the profile.
+#[test]
+fn a_build_std_unit_of_a_nix_join_run_by_a_profile_link_stores_and_restores() {
+    build_std_unit_of_a_joined_toolchain_stores_and_restores(
+        Leaves::Files,
+        Reached::ThroughProfileLink,
+    );
+}
+
 /// The store names of that host's toolchain join and the `rust-src` it joins,
 /// and of the join the AxE shell's profile linked next.
 const RUST_NIGHTLY: &str = "dh0b8lj8avd02zizqd7xb452z5fp13i0-rust-nightly-1.101.0-nightly-2026-10-04-1.101.0-nightly-2026-10-04";
@@ -440,11 +452,14 @@ enum Reached {
     Directly,
     /// As a bare `rustc` that `PATH` finds in a profile linking into the join.
     ThroughProfile,
+    /// By the path of a profile's `bin/rustc`, a link into the join.
+    ThroughProfileLink,
 }
 
 /// The toolchain join `name` in `root`'s `nix/store`: `core`'s sources link
 /// into `source` as `leaves` lays them out, and its `bin/rustc` compiles a
-/// build-std unit by copying the source into `libcore.rmeta`.
+/// build-std unit by copying the source into `libcore.rmeta` and, as rustc
+/// does, reports the join its own file sits in as its sysroot.
 fn joined_toolchain(root: &Path, name: &str, source: &Path, leaves: Leaves) -> PathBuf {
     let join = root.join(format!("nix/store/{name}"));
     let core = join.join("lib/rustlib/src/rust/library/core");
@@ -464,7 +479,15 @@ fn joined_toolchain(root: &Path, name: &str, source: &Path, leaves: Leaves) -> P
         &compiler,
         r#"#!/bin/sh
 set -eu
-default=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)
+executable=$0
+while [ -L "$executable" ]; do
+    link=$(readlink "$executable")
+    case $link in
+        /*) executable=$link ;;
+        *) executable=$(dirname -- "$executable")/$link ;;
+    esac
+done
+default=$(CDPATH= cd -- "$(dirname -- "$executable")/.." && pwd -P)
 case "$1" in
     -vV)
         printf 'rustc 1.101.0-nightly (abc 2026-10-12)\ncommit-hash: abc\nhost: x86_64-unknown-linux-gnu\nrelease: 1.101.0-nightly\nLLVM version: 22.0.0\n'
@@ -526,20 +549,26 @@ fn build_std_unit_of_a_joined_toolchain_stores_and_restores(leaves: Leaves, reac
     std::fs::write(source.join("lib.rs"), "#![no_std]\n").unwrap();
     let join = joined_toolchain(&root, RUST_NIGHTLY, &source, leaves);
     let profile = root.join("nix/store/devenv-profile");
+    if !matches!(reached, Reached::Directly) {
+        std::fs::create_dir_all(profile.join("bin")).unwrap();
+        std::fs::create_dir_all(profile.join("lib/rustlib")).unwrap();
+        link_profile(&profile, &join);
+    }
     let (spelled, path) = match reached {
         Reached::Directly => (
             join.join("bin/rustc").into_os_string(),
             std::env::var_os("PATH").unwrap(),
         ),
         Reached::ThroughProfile => {
-            std::fs::create_dir_all(profile.join("bin")).unwrap();
-            std::fs::create_dir_all(profile.join("lib/rustlib")).unwrap();
-            link_profile(&profile, &join);
             let mut path = profile.join("bin").into_os_string();
             path.push(":");
             path.push(std::env::var_os("PATH").unwrap());
             ("rustc".into(), path)
         }
+        Reached::ThroughProfileLink => (
+            profile.join("bin/rustc").into_os_string(),
+            std::env::var_os("PATH").unwrap(),
+        ),
     };
     let compiles = root.join("compiles");
     let compiled = || std::fs::read_to_string(&compiles).unwrap().lines().count();
@@ -592,7 +621,7 @@ fn build_std_unit_of_a_joined_toolchain_stores_and_restores(leaves: Leaves, reac
         1,
         "the build-std unit should be stored once and restored, not compiled again:\n{stored}\n{restored}"
     );
-    if !matches!(reached, Reached::ThroughProfile) {
+    if matches!(reached, Reached::Directly) {
         return;
     }
 
