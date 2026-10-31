@@ -990,6 +990,15 @@ pub struct CompilerIdentity {
     pub host: String,
     /// Identity of a compiler driver layered over rustc, when one is in use.
     pub driver: Option<String>,
+    /// Content identity of the toolchain parts the compilation uses, for a
+    /// compiler whose default sysroot no other mapping covers: the compiler,
+    /// its `rustc_driver` and what the sysroot holds for its target, its
+    /// standard library first. Two installations whose parts match key alike
+    /// wherever they sit, and parts that differ key apart even where no path
+    /// beneath the sysroot is named. `None` for a sysroot an existing
+    /// mapping covers (rustup's), whose keys stay as they were, and for a
+    /// compiler that reports no default sysroot.
+    pub toolchain_parts: Option<CacheDigest>,
 }
 
 /// One file input paired with the digest used in the action key.
@@ -1236,6 +1245,9 @@ struct CompilerDescriptor {
     host: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     driver: Option<String>,
+    /// Omitted when absent, so a key under a covered sysroot keeps its bytes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    toolchain_parts: Option<CacheDigest>,
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -2554,6 +2566,7 @@ impl<'a> ActionBuilder<'a> {
                 rustc_version: self.context.compiler.rustc_version.clone(),
                 host: self.context.compiler.host.clone(),
                 driver: self.context.compiler.driver.clone(),
+                toolchain_parts: self.context.compiler.toolchain_parts.clone(),
             },
             arguments,
             required_inputs,

@@ -3238,10 +3238,14 @@ fn base_action_context(
 ) -> Result<ActionContext> {
     let _phase = crate::phase_timing::phase("key");
     let compiler = compiler_identity(rustc)?;
+    let mut identity = compiler.identity.clone();
+    identity.toolchain_parts = portable
+        .compiler_key(&compiler)?
+        .map(|key| key.parts.clone());
     let mut context = ActionContext {
-        compiler: compiler.identity.clone(),
+        compiler: identity,
         working_dir: working_dir.to_path_buf(),
-        path_mappings: portable.key_mappings(&compiler).to_vec(),
+        path_mappings: portable.mappings().to_vec(),
         environment: compiler_environment(|name| std::env::var(name).ok()),
         portable_environment: BTreeSet::new(),
         inputs: Vec::new(),
@@ -4018,21 +4022,231 @@ fn validated_outputs(
 #[derive(Clone)]
 struct SelectedCompiler {
     identity: CompilerIdentity,
+    /// The compiler that runs, links resolved.
+    executable: PathBuf,
     /// The selected compiler's physical default, never an invocation's override.
     sysroot: Option<PathMapping>,
 }
 
+/// The selected compiler's default sysroot as a path mapping. Its placeholder
+/// names no installation: what the installation holds enters the key as the
+/// [`toolchain_parts`] a compilation uses, so two installations of one
+/// toolchain spell a path beneath either alike, and a path beneath one is
+/// keyed by what the compilation compiles with, not by where that sits.
 fn default_sysroot_mapping(root: PathBuf) -> Option<PathMapping> {
-    let text = root.to_str().filter(|_| root.is_absolute())?;
-    // Equal version text does not prove two installations have equal libraries.
-    // Like external native roots, an uncovered sysroot keeps its location identity.
-    let placeholder = format!("sysroot_{}", CacheDigest::blake3(text.as_bytes()).hash);
+    root.to_str().filter(|_| root.is_absolute())?;
     // Matched as spelled too: a symlink-joined toolchain (Nix builds one) keeps
     // its directories but links its leaves into the store paths it joins, so
     // `rust-src` resolves outside the root. `-Zbuild-std` names a unit's sources,
     // working directory and any sysroot remap by the join's own paths, and the
     // toolchain identity in the key covers what they name.
-    Some(PathMapping::spelled(root, placeholder))
+    Some(PathMapping::spelled(root, "sysroot"))
+}
+
+/// The parts of a toolchain a compilation for `target` uses, by content: the
+/// compiler that runs (`executable`, links resolved), the `rustc_driver`
+/// library its `sysroot` holds, and every file the sysroot holds for `target`
+/// (`lib/rustlib/<target>`: its standard library, and any target
+/// specification or tools installed there), each named by its path beneath
+/// that directory. Where they are installed does not enter, nor does anything
+/// the sysroot holds for another target: a Nix join that adds the rust-std of
+/// another target keys alike, while a different compiler, driver or standard
+/// library for `target` keys apart.
+///
+/// Remembered beside the compiler's own identity, under pins on every file
+/// and directory it read, so a later process, with a session or without one,
+/// rehashes nothing until one of them changes.
+fn toolchain_parts(sysroot: &Path, executable: &Path, target: &str) -> Result<CacheDigest> {
+    let target = target_directory_name(target);
+    let Some(sysroot_text) = sysroot.to_str() else {
+        bail!("sysroot is not UTF-8: {}", sysroot.display());
+    };
+    let environment = BTreeMap::from([
+        (
+            "MBX_TOOLCHAIN_SYSROOT".to_owned(),
+            Some(sysroot_text.to_owned()),
+        ),
+        ("MBX_TOOLCHAIN_TARGET".to_owned(), Some(target.clone())),
+    ]);
+    let responses = session::request_agent(&[AgentRequest::FindExecutableIdentity {
+        executable: executable.to_path_buf(),
+        environment: environment.clone(),
+    }])?;
+    if let Some(AgentResponse::ExecutableIdentity {
+        stdout: Some(stdout),
+    }) = responses.into_iter().next()
+        && let Ok(parts) = serde_json::from_slice::<CacheDigest>(&stdout)
+    {
+        return Ok(parts);
+    }
+    let (parts, pins) =
+        hash_toolchain_parts(sysroot, executable, &target, session::file_digest_cache())?;
+    // Best-effort, like the compiler's own identity: a record that is not
+    // kept costs the next process one more hashing, never a wrong key.
+    let _ = session::request_agent(&[AgentRequest::StoreExecutableIdentity {
+        executable: executable.to_path_buf(),
+        environment,
+        stdout: serde_json::to_vec(&parts)?,
+        pins,
+    }]);
+    Ok(parts)
+}
+
+/// The directory name rustc looks a target's files up by: the target itself,
+/// or for a target specification file the stem of its resolved path.
+fn target_directory_name(target: &str) -> String {
+    if !(target.ends_with(".json") || target.contains(['/', '\\'])) {
+        return target.to_owned();
+    }
+    let path = std::fs::canonicalize(target).unwrap_or_else(|_| PathBuf::from(target));
+    path.file_stem()
+        .and_then(OsStr::to_str)
+        .unwrap_or(target)
+        .to_owned()
+}
+
+/// [`toolchain_parts`] read from disk: the digest, and the pins that tell a
+/// later process whether it still describes what is there. The pins are
+/// taken before anything is read, so a file replaced while it is hashed is
+/// never recorded under the replacement.
+fn hash_toolchain_parts(
+    sysroot: &Path,
+    executable: &Path,
+    target: &str,
+    digests: &dyn mbx_cache_core::FileDigestCache,
+) -> Result<(CacheDigest, Vec<PinnedFile>)> {
+    let directory = sysroot.join("lib/rustlib").join(target);
+    let mut pins = Vec::new();
+    for pinned in [
+        sysroot.join("bin"),
+        sysroot.join("lib"),
+        directory.clone(),
+        executable.to_path_buf(),
+    ] {
+        pins.extend(PinnedFile::describe(pinned));
+    }
+    let mut parts = vec![("compiler".to_owned(), executable.to_path_buf())];
+    if let Some(driver) = sysroot_driver(sysroot)? {
+        pins.extend(PinnedFile::describe(driver.clone()));
+        parts.push(("driver".to_owned(), driver));
+    }
+    let mut files = Vec::new();
+    target_files(&directory, "", 0, &mut files, &mut pins)?;
+    parts.extend(
+        files
+            .into_iter()
+            .map(|(name, path)| (format!("target {name}"), path)),
+    );
+    let contents = content_digests(parts.iter().map(|(_, path)| path.as_path()), digests)?;
+    let named = parts
+        .iter()
+        .zip(&contents)
+        .map(|((name, _), digest)| (name.as_str(), digest.hash.as_str()))
+        .collect::<Vec<_>>();
+    let parts = CacheDigest::blake3(&canonical_json(&("mbx-toolchain-parts-v1", target, named))?);
+    Ok((parts, pins))
+}
+
+/// The `rustc_driver` library in `sysroot`, the first by name: in `lib/` on
+/// Unix, in `bin/` on Windows. rustc finds its sysroot where this library
+/// sits, so it is the driver the sysroot's compilations run, whatever spelling
+/// started them; a link to it counts, as a profile's file does, which
+/// [`compiler_driver_library`] leaves out to tell a dispatcher from a
+/// compiler.
+fn sysroot_driver(sysroot: &Path) -> Result<Option<PathBuf>> {
+    for directory in [sysroot.join("lib"), sysroot.join("bin")] {
+        let entries = resolved_entries(&directory).wrap_err_with(|| {
+            format!("toolchain directory is unreadable: {}", directory.display())
+        })?;
+        for (path, metadata) in entries {
+            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            if metadata.is_file()
+                && (name.starts_with("librustc_driver") || name.starts_with("rustc_driver"))
+            {
+                return Ok(Some(path));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Every file beneath `directory`, links followed, named by its path beneath
+/// it with `prefix` in front, in name order, each directory and file pinned
+/// as it is reached. A target's directory nests a few levels (`lib`,
+/// `lib/self-contained`, `bin/gcc-ld`); a deeper tree is a link cycle, and
+/// has no identity.
+fn target_files(
+    directory: &Path,
+    prefix: &str,
+    depth: usize,
+    files: &mut Vec<(String, PathBuf)>,
+    pins: &mut Vec<PinnedFile>,
+) -> Result<()> {
+    if depth > 6 {
+        bail!(
+            "toolchain directory nests too deep: {}",
+            directory.display()
+        );
+    }
+    let entries = resolved_entries(directory)
+        .wrap_err_with(|| format!("toolchain directory is unreadable: {}", directory.display()))?;
+    for (path, metadata) in entries {
+        let name = path
+            .file_name()
+            .and_then(OsStr::to_str)
+            .ok_or_else(|| eyre::eyre!("toolchain file name is not UTF-8: {}", path.display()))?;
+        let name = if prefix.is_empty() {
+            name.to_owned()
+        } else {
+            format!("{prefix}/{name}")
+        };
+        if metadata.is_dir() {
+            pins.extend(PinnedFile::describe(path.clone()));
+            target_files(&path, &name, depth + 1, files, pins)?;
+        } else if metadata.is_file() {
+            pins.extend(PinnedFile::describe(path.clone()));
+            files.push((name, path));
+        }
+    }
+    Ok(())
+}
+
+/// The contents of `paths`, from the digest ledger where it holds them and
+/// read here otherwise. Each path is resolved first, so every link to one
+/// file shares its ledger entry.
+fn content_digests<'a>(
+    paths: impl Iterator<Item = &'a Path>,
+    digests: &dyn mbx_cache_core::FileDigestCache,
+) -> Result<Vec<CacheDigest>> {
+    let mut files = Vec::new();
+    for path in paths {
+        let unreadable = || format!("toolchain file is unreadable: {}", path.display());
+        let path = std::fs::canonicalize(path).wrap_err_with(unreadable)?;
+        let metadata = std::fs::metadata(&path).wrap_err_with(unreadable)?;
+        let identity =
+            FileIdentity::for_digest_cache(&path, &metadata).wrap_err_with(unreadable)?;
+        files.push((path, identity));
+    }
+    let known = files
+        .iter()
+        .filter_map(|(_, identity)| identity.clone())
+        .collect::<Vec<_>>();
+    let mut resolved = digests
+        .resolve(FileDigestScope::Content, &known)
+        .into_iter();
+    files
+        .into_iter()
+        .map(|(path, identity)| {
+            match identity
+                .and_then(|_| resolved.next())
+                .and_then(FileDigestResolution::into_digest)
+            {
+                Some(digest) => Ok(digest),
+                None => CacheDigest::blake3_file(&path)
+                    .wrap_err_with(|| format!("toolchain file is unreadable: {}", path.display())),
+            }
+        })
+        .collect()
 }
 
 fn compiler_identity(rustc: &OsStr) -> Result<Cow<'static, SelectedCompiler>> {
@@ -4186,6 +4400,9 @@ fn query_compiler_identity(rustc: &OsStr) -> Result<SelectedCompiler> {
         .ok()
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| release.to_string());
+    let sysroot = sysroot
+        .map(|selected| default_sysroot(&executable, selected))
+        .and_then(default_sysroot_mapping);
     Ok(SelectedCompiler {
         identity: CompilerIdentity {
             toolchain,
@@ -4196,10 +4413,10 @@ fn query_compiler_identity(rustc: &OsStr) -> Result<SelectedCompiler> {
                 .find_map(|line| line.strip_prefix("mbx-driver: "))
                 .filter(|value| !value.is_empty())
                 .map(str::to_string),
+            toolchain_parts: None,
         },
-        sysroot: sysroot
-            .map(|selected| default_sysroot(&executable, selected))
-            .and_then(default_sysroot_mapping),
+        executable: std::fs::canonicalize(&executable).unwrap_or(executable),
+        sysroot,
     })
 }
 
@@ -4332,36 +4549,58 @@ const PORTABLE_ENVIRONMENT: &[&str] = &["OUT_DIR"];
 struct Portable {
     /// Path mappings for this compilation, ordered as keys need them.
     mappings: Vec<PathMapping>,
-    /// Published only after a key path successfully resolves the selected compiler.
-    /// None retains the existing semantic mappings without allocating another vector.
-    compiler_mappings: OnceLock<Option<Vec<PathMapping>>>,
+    /// The compilation's `--target`, or `None` for the host.
+    target: Option<String>,
+    /// Published once a key has resolved the selected compiler; `None` when
+    /// an existing mapping covers its default sysroot and the key stays as it
+    /// was.
+    compiler_key: OnceLock<Option<CompilerKey>>,
     /// Flags appended to the real rustc invocation, one per remapped value.
     arguments: Vec<OsString>,
     /// Cargo's invalidation inputs, captured before OUT_DIR is stabilized.
     build_script_inputs: Option<crate::build_script::CompilationInputs>,
 }
 
+/// What a default sysroot no other mapping covers adds to a compilation's key.
+struct CompilerKey {
+    /// The compilation's mappings with the sysroot's among them.
+    mappings: Vec<PathMapping>,
+    /// The [`toolchain_parts`] the compilation uses.
+    parts: CacheDigest,
+}
+
 impl Portable {
     fn mappings(&self) -> &[PathMapping] {
-        self.compiler_mappings
-            .get()
-            .and_then(|mappings| mappings.as_deref())
-            .unwrap_or(&self.mappings)
+        match self.compiler_key.get() {
+            Some(Some(key)) => &key.mappings,
+            _ => &self.mappings,
+        }
     }
 
-    fn key_mappings(&self, compiler: &SelectedCompiler) -> &[PathMapping] {
-        self.compiler_mappings.get_or_init(|| {
-            let sysroot = uncovered_default_sysroot(&self.mappings, compiler.sysroot.as_ref())?;
-            let depth = sysroot.root.components().count();
-            let index = self
-                .mappings
-                .partition_point(|mapping| mapping.root.components().count() >= depth);
-            let mut mappings = self.mappings.clone();
-            // Preserve the existing stable, deepest-first ordering without sorting again.
-            mappings.insert(index, sysroot.clone());
-            Some(mappings)
-        });
-        self.mappings()
+    /// The selected compiler's share of the key, worked out once.
+    fn compiler_key(&self, compiler: &SelectedCompiler) -> Result<Option<&CompilerKey>> {
+        if let Some(key) = self.compiler_key.get() {
+            return Ok(key.as_ref());
+        }
+        let key = match uncovered_default_sysroot(&self.mappings, compiler.sysroot.as_ref()) {
+            None => None,
+            Some(sysroot) => {
+                let depth = sysroot.root.components().count();
+                let index = self
+                    .mappings
+                    .partition_point(|mapping| mapping.root.components().count() >= depth);
+                let mut mappings = self.mappings.clone();
+                // Preserve the existing stable, deepest-first ordering without sorting again.
+                mappings.insert(index, sysroot.clone());
+                let parts = toolchain_parts(
+                    &sysroot.root,
+                    &compiler.executable,
+                    self.target.as_deref().unwrap_or(&compiler.identity.host),
+                )?;
+                Some(CompilerKey { mappings, parts })
+            }
+        };
+        Ok(self.compiler_key.get_or_init(|| key).as_ref())
     }
     fn map_external_native_paths(&mut self, invocation: &RustcInvocation, working_dir: &Path) {
         for path in invocation.native_search_paths() {
@@ -4393,7 +4632,8 @@ impl Portable {
                 target,
                 None,
             )),
-            compiler_mappings: OnceLock::new(),
+            target: target.map(str::to_owned),
+            compiler_key: OnceLock::new(),
             arguments: Vec::new(),
             build_script_inputs: None,
         };
