@@ -50,6 +50,7 @@
 
 #[path = "scheduler_accuracy.rs"]
 mod accuracy;
+pub(crate) use accuracy::Admission;
 #[path = "scheduler_decisions.rs"]
 mod decisions;
 #[path = "scheduler_grant.rs"]
@@ -68,14 +69,15 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 /// Directory under the cache root holding the pool.
 const SCHEDULER_DIR: &str = "scheduler";
 /// Subdirectory holding one locked lease file per admitted compilation.
 const LEASES_DIR: &str = "leases";
-const WAITERS_DIR: &str = "waiters";
+/// Subdirectory holding one locked record per request waiting for capacity.
+pub(crate) const WAITERS_DIR: &str = "waiters";
 /// Subdirectory holding one locked flight file per compiling invocation.
 const INFLIGHT_DIR: &str = "inflight";
 /// Registrar lock serializing admission scans.
@@ -1927,6 +1929,25 @@ impl Pool {
         }
     }
 
+    /// A pool of `capacity` cores under `dir` that reads none of the host's
+    /// cores, memory or pressure, so a test's admissions depend only on the
+    /// leases and requests it makes.
+    #[cfg(test)]
+    pub(crate) fn isolated(
+        dir: &Path,
+        capacity: u64,
+        bytes_per_permit: u64,
+        priority: SchedulerPriority,
+    ) -> Self {
+        let mut pool = Self::new(dir.to_path_buf(), capacity, bytes_per_permit, priority);
+        pool.domain_capacity = capacity;
+        pool.legacy_domain_capacity = capacity;
+        pool.domain_memory_capacity = capacity.saturating_mul(bytes_per_permit);
+        pool.available_memory = || None;
+        pool.pressure = false;
+        pool
+    }
+
     fn from_config(config: &Config) -> Option<Self> {
         let scheduler = &config.scheduler;
         let permits = scheduler.permits();
@@ -2021,11 +2042,6 @@ impl Pool {
         }
     }
 
-    /// Wait for and hold capacity for work mbx does not launch itself.
-    ///
-    /// Unlike compiler admission this propagates scheduler errors: silently
-    /// running an explicitly reserved command without its reservation would
-    /// defeat the command's purpose.
     /// The permits a reservation of `cpus` and `memory_bytes` holds.
     pub(crate) fn reservation_weight(
         &self,
@@ -2047,13 +2063,33 @@ impl Pool {
         Ok(weight)
     }
 
-    pub(crate) fn reserve(&self, cpus: Option<u64>, memory_bytes: Option<u64>) -> Result<Permit> {
+    /// Wait for and hold capacity for work mbx does not launch itself, or
+    /// `None` once `withdrawn` is set while the request still waits.
+    ///
+    /// Unlike compiler admission this propagates scheduler errors: silently
+    /// running an explicitly reserved command without its reservation would
+    /// defeat the command's purpose.
+    ///
+    /// The request leaves the queue at its next admission attempt after the
+    /// withdrawal, at most one recheck interval later. `mbx reserve` waits on
+    /// behalf of its command and never withdraws; a reservation served over a
+    /// connection (`mbx reservations`) is withdrawn by its client's release or
+    /// disconnect.
+    pub(crate) fn reserve(
+        &self,
+        cpus: Option<u64>,
+        memory_bytes: Option<u64>,
+        withdrawn: &AtomicBool,
+    ) -> Result<Option<Permit>> {
         let weight = self.reservation_weight(cpus, memory_bytes)?;
 
         let started = Instant::now();
         let mut state = AdmissionState::new((self.clock)(), Shape::Moldable);
         let mut wake: Option<wait::Wait> = None;
         loop {
+            if withdrawn.load(Ordering::Acquire) {
+                return Ok(None);
+            }
             // Like compiler admission, a persistently low available-memory
             // reading must not turn an advisory gate into permanent starvation.
             let gate = memory_bytes.filter(|_| started.elapsed() < GATE_DEADLINE);
@@ -2067,7 +2103,7 @@ impl Pool {
                 &mut state,
                 None,
             )? {
-                return Ok(permit);
+                return Ok(Some(permit));
             }
             if let Some(wake) = &mut wake {
                 state.periodic = wake.pause();

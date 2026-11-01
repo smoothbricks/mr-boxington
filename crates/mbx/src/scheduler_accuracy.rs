@@ -109,20 +109,25 @@ impl Pool {
         }
     }
 
+    /// `reserve`, with what the grant charged and how long it waited; `None`
+    /// once `withdrawn` is set while it waits.
     pub(crate) fn reserve_observed(
         &self,
         cpus: Option<u64>,
         memory_bytes: Option<u64>,
-    ) -> Result<(super::Permit, Admission)> {
+        withdrawn: &AtomicBool,
+    ) -> Result<Option<(super::Permit, Admission)>> {
         let requested_at = Instant::now();
-        let permit = self.reserve(cpus, memory_bytes)?;
+        let Some(permit) = self.reserve(cpus, memory_bytes, withdrawn)? else {
+            return Ok(None);
+        };
         let (resources, weight) = permit.granted()?;
         let wait_ms = requested_at
             .elapsed()
             .as_millis()
             .try_into()
             .unwrap_or(u64::MAX);
-        Ok((
+        Ok(Some((
             permit,
             Admission {
                 weight,
@@ -132,7 +137,7 @@ impl Pool {
                 wait_ms,
                 started: Instant::now(),
             },
-        ))
+        )))
     }
 
     pub(crate) fn observe_reservation(&self, admission: Admission, status: Option<&ExitStatus>) {
@@ -724,7 +729,10 @@ mod tests {
     fn reservation_observation_records_weight_and_respects_gates() {
         let dir = tempfile::tempdir().unwrap();
         let observed_pool = pool(dir.path(), 100);
-        let (permit, admission) = observed_pool.reserve_observed(Some(3), None).unwrap();
+        let (permit, admission) = observed_pool
+            .reserve_observed(Some(3), None, &AtomicBool::default())
+            .unwrap()
+            .unwrap();
         drop(permit);
         observed_pool.observe_reservation(admission, Some(&status(0)));
         let line = std::fs::read_to_string(dir.path().join(FILE)).unwrap();
@@ -749,7 +757,10 @@ mod tests {
             let gated_dir = tempfile::tempdir().unwrap();
             let mut gated_pool = pool(gated_dir.path(), bytes);
             gated_pool.events = events;
-            let (permit, admission) = gated_pool.reserve_observed(Some(1), None).unwrap();
+            let (permit, admission) = gated_pool
+                .reserve_observed(Some(1), None, &AtomicBool::default())
+                .unwrap()
+                .unwrap();
             drop(permit);
             gated_pool.observe_reservation(admission, Some(&status(0)));
             assert!(!gated_dir.path().join(FILE).exists());
@@ -762,7 +773,10 @@ mod tests {
         let pool = pool(dir.path(), 100);
         // Wider than the pool: a moldable request starts on all of it, where
         // a rigid one would run alone on all it asked for.
-        let (permit, admission) = pool.reserve_observed(Some(20), None).unwrap();
+        let (permit, admission) = pool
+            .reserve_observed(Some(20), None, &AtomicBool::default())
+            .unwrap()
+            .unwrap();
         assert_eq!(admission.cpus(), 16);
         assert_eq!(permit.granted().unwrap().0.cpu, 16);
         drop(permit);
@@ -785,7 +799,8 @@ mod tests {
         assert_eq!(summary.overall.worst_peak_reserved_ratio, Some(1.5));
         assert_eq!(summary.keys[0].average_reserved_unused_bytes, Some(25.0));
         let (permit, admission) = pool(dir.path(), 100)
-            .reserve_observed(Some(2), Some(201))
+            .reserve_observed(Some(2), Some(201), &AtomicBool::default())
+            .unwrap()
             .unwrap();
         drop(permit);
         pool(dir.path(), 100).observe_reservation(admission, None);

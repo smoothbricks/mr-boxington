@@ -30,6 +30,7 @@ mod mascot;
 mod plain_progress;
 mod prefetch;
 mod pretty;
+mod reservations;
 mod reserve;
 mod settings;
 mod setup;
@@ -212,6 +213,26 @@ enum Commands {
     /// setting to be enabled. Specify one or both resource flags, as in
     /// `mbx reserve --memory 6GiB --cpus 4 -- ./run-windows-build-in-vm.sh`.
     Reserve(reserve::ReserveArgs),
+    /// Serve reservations of the scheduler pool on a Unix socket until
+    /// standard input closes.
+    ///
+    /// For a runner that starts many external commands, such as an Nx run's
+    /// tasks: it starts this once instead of one `mbx reserve` per command.
+    /// A client connects and sends newline-delimited JSON:
+    /// `{"type":"reserve","id":1,"cpus":4,"priority":"low"}` (optionally with
+    /// `"memory"` in bytes) is answered `{"type":"granted","id":1,"cpus":K}`
+    /// once the pool admits it, `K` being as many of those cores as were
+    /// free, at least one, or `{"type":"refused","id":1,"error":"..."}`.
+    /// `{"type":"release","id":1}` gives the grant back, or withdraws it while
+    /// it waits. One connection may hold many grants under distinct ids, and
+    /// closing it releases all of them, so a client that dies gives back what
+    /// it held. A line that breaks the protocol is answered
+    /// `{"type":"error","error":"..."}` and closes the connection.
+    ///
+    /// Admission is `mbx reserve`'s: the same pool, priorities and order. mbx
+    /// creates the socket readable only by its user, prints `listening` once
+    /// it accepts connections, and removes the socket when it exits.
+    Reservations(reservations::ReservationsArgs),
     #[usage(external_subcommand)]
     Cargo(Vec<String>),
 }
@@ -256,6 +277,7 @@ fn compiles_nothing(command: &Commands) -> Option<&'static str> {
         // running, so a Rust toolchain has nothing to select here.
         Commands::Exec(_) => Some("exec"),
         Commands::Reserve(_) => Some("reserve"),
+        Commands::Reservations(_) => Some("reservations"),
         Commands::Doctor(_) | Commands::Explain(_) | Commands::Prefetch(_) | Commands::Cargo(_) => {
             None
         }
@@ -357,6 +379,7 @@ pub fn run() -> Result<ExitCode> {
         }
         Commands::Exec(args) => exec::run(&config, &settings, &args),
         Commands::Reserve(args) => reserve::run(&config, args),
+        Commands::Reservations(args) => reservations::run(&config, &args),
         Commands::Cargo(arguments) => {
             shim::prepare_explicit_cargo()?;
             cargo::run(&config, &settings, &with_toolchain(toolchain, arguments))

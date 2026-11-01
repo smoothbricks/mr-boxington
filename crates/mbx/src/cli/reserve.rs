@@ -8,6 +8,7 @@ use bytesize::ByteSize;
 use eyre::{Result, WrapErr};
 use std::ffi::OsStr;
 use std::process::{Command, ExitCode};
+use std::sync::atomic::AtomicBool;
 
 /// Marks the worker process that holds one reservation's lease.
 const WORKER_ENV: &str = "MBX_RESERVE_WORKER";
@@ -108,8 +109,16 @@ fn spawn_worker(args: &ReserveArgs, grant: Option<Descriptor>) -> Result<ExitCod
 
 fn run_direct(config: &Config, args: &ReserveArgs, grant: Option<Descriptor>) -> Result<ExitCode> {
     let (program, arguments, pool) = reservation(config, args)?;
-    let (mut permit, admission) =
-        pool.reserve_observed(args.cpus, args.memory.map(|memory| memory.as_u64()))?;
+    // This process waits for its own command's grant, so nothing withdraws it:
+    // it ends granted, or with the process.
+    let Some((mut permit, admission)) = pool.reserve_observed(
+        args.cpus,
+        args.memory.map(|memory| memory.as_u64()),
+        &AtomicBool::new(false),
+    )?
+    else {
+        unreachable!("nothing withdraws a reservation its own command waits on")
+    };
     if grant.is_none() {
         // Without --grant-fd, an inherited grant descriptor hears of this hold.
         permit.announce();

@@ -938,7 +938,8 @@ impl Default for SchedulerSettings {
 /// `Low` is for builds nobody is sitting at, such as CI on a shared box or an
 /// editor's background check. Normal-priority work waiting for the pool goes
 /// before them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum SchedulerPriority {
     #[default]
     Normal,
