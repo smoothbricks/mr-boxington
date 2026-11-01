@@ -200,6 +200,12 @@ run, or takes an absolute path as given, and puts that linker's path and
 version into the key. [Managed linkers](/linkers) route native links this way,
 so those links stay cacheable.
 
+A library compilation, which includes every crate `cargo check` and Clippy
+compile, runs no linker, so its `-C linker` selection stays out of the key.
+The program it names is a path on one host: cargo-zigbuild names its `zig cc`
+wrapper under `$HOME`, and keying that path would set a cross check in a
+checkout with a `$HOME` of its own apart from the same check run anywhere else.
+
 Most other `-C link-arg` values bypass, because their text cannot say whether
 they name a file the key would need to hash. A few options read no file, so
 they enter the key as text:

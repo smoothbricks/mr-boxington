@@ -3346,6 +3346,63 @@ fn an_explicit_linker_is_inert_for_a_library() {
     }
 }
 
+/// cargo-zigbuild cross-compiles by selecting its `zig cc` wrapper with
+/// `-Clinker`, from a cache under `$HOME`, and a sandboxed checkout's `$HOME`
+/// is its own. Keyed as text, that path gave the same Clippy check a key of
+/// its own in every checkout and on the host, so none of them looked up what
+/// another had stored. A library compilation never runs the linker it names.
+#[test]
+fn a_library_key_leaves_out_the_linker_it_never_runs() {
+    let library = |linker: Option<&str>| {
+        let mut arguments = vec![
+            "--crate-name=widget",
+            "--crate-type=lib",
+            "--emit=dep-info,metadata",
+            "--target=x86_64-unknown-linux-gnu",
+            "--out-dir=target/x86_64-unknown-linux-gnu/debug/deps",
+        ];
+        arguments.extend(linker);
+        arguments.push("src/lib.rs");
+        RustcInvocation::parse(&args(&arguments)).unwrap()
+    };
+    let inputs = [("src/lib.rs", "source")];
+    let wrapper =
+        "Library/Caches/cargo-zigbuild/0.23.4/wrappers/4fc0/zigcc-x86_64-unknown-linux-gnu-8781.sh";
+    let host = library(Some(&format!("-Clinker=/Users/someone/{wrapper}")));
+    let sandboxed = library(Some(&format!(
+        "-Clinker=/work/project/.cowshed/home/{wrapper}"
+    )));
+    for invocation in [&sandboxed, &library(None)] {
+        assert_eq!(
+            invocation.invocation_digest(&context(&inputs)),
+            host.invocation_digest(&context(&inputs))
+        );
+        assert_eq!(
+            invocation.action(context(&inputs)).unwrap().digest,
+            host.action(context(&inputs)).unwrap().digest
+        );
+    }
+
+    // A link runs the linker, so its selection stays in the key.
+    let link = |linker: &str| {
+        RustcInvocation::parse_with(
+            &args(&[
+                "--crate-name=widget",
+                "--test",
+                "--emit=dep-info,link",
+                linker,
+                "src/lib.rs",
+            ]),
+            native_links(),
+        )
+        .unwrap()
+        .action_linked_by(context(&inputs), Some(test_linker()))
+        .unwrap()
+        .digest
+    };
+    assert_ne!(link("-Clinker=clang"), link("-Clinker=clang++"));
+}
+
 /// `-Clinker-flavor` only matters to a real link, so an rlib or a metadata-only
 /// check stays cacheable while every linking output still bypasses.
 #[test]
