@@ -385,6 +385,14 @@ enum Argument {
     FuseLd(String),
 }
 
+impl Argument {
+    /// Whether this is a `-C linker` selection: the program a link would run,
+    /// named by its path on this host.
+    fn selects_linker(&self) -> bool {
+        matches!(self, Self::Plain(value) if value.starts_with("--codegen=linker="))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Emit {
     kind: String,
@@ -2119,15 +2127,15 @@ impl<'a> Parser<'a> {
                 "link-arg=-fuse-ld={selection}"
             )));
         }
-        if self.parsed.iter().any(|argument| {
-            matches!(argument, Argument::Plain(value) if value.starts_with("--codegen=linker="))
-        }) && !matches!(
-            link_output,
-            LinkOutput::Library
-                | LinkOutput::NativeExecutable
-                | LinkOutput::NativeProcMacro
-                | LinkOutput::NativeSharedLibrary
-        ) {
+        if self.parsed.iter().any(Argument::selects_linker)
+            && !matches!(
+                link_output,
+                LinkOutput::Library
+                    | LinkOutput::NativeExecutable
+                    | LinkOutput::NativeProcMacro
+                    | LinkOutput::NativeSharedLibrary
+            )
+        {
             return Err(BypassReason::UnknownCodegenOption("linker".into()));
         }
         // `-Clinker-flavor` tells rustc how to drive the linker, which no
@@ -2543,10 +2551,18 @@ impl<'a> ActionBuilder<'a> {
 
     fn invocation_descriptor(&self) -> Result<InvocationDescriptor, BypassReason> {
         self.validate_mappings()?;
+        // A library compilation runs no linker, so the program a `-C linker`
+        // selection names, a path on this host, says nothing about its output.
+        // cargo-zigbuild names its `zig cc` wrapper under `$HOME`, which a
+        // sandboxed checkout has to itself: keyed, that path set the same cross
+        // check apart in every checkout and on the host, and none looked up
+        // what another had stored.
+        let library = self.invocation.link_output == LinkOutput::Library;
         let arguments = self
             .invocation
             .arguments
             .iter()
+            .filter(|argument| !(library && argument.selects_linker()))
             .map(|argument| self.normalize_argument(argument))
             .collect::<Result<Vec<_>, _>>()?;
         let required_inputs = self
