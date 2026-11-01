@@ -35,21 +35,10 @@ fn wait_until(description: &str, mut ready: impl FnMut() -> bool) {
     }
 }
 
+// Tests must not depend on how much memory the machine running them has free;
+// anything that wants the gate closed injects its own probe.
 fn pool_at(dir: &Path, capacity: u64, bytes_per_permit: u64) -> Pool {
-    let mut pool = Pool::new(
-        dir.to_path_buf(),
-        capacity,
-        bytes_per_permit,
-        SchedulerPriority::Normal,
-    );
-    // Tests must not depend on how much memory the machine running them has
-    // free; anything that wants the gate closed injects its own probe.
-    pool.domain_capacity = capacity;
-    pool.legacy_domain_capacity = capacity;
-    pool.domain_memory_capacity = capacity.saturating_mul(bytes_per_permit);
-    pool.available_memory = || None;
-    pool.pressure = false;
-    pool
+    Pool::isolated(dir, capacity, bytes_per_permit, SchedulerPriority::Normal)
 }
 
 fn calibrate_kind(pool: &Pool, kind: &str) {
@@ -190,7 +179,10 @@ fn a_reservation_charges_cpu_and_memory_separately() {
     let directory = tempfile::tempdir().unwrap();
     let pool = pool_at(directory.path(), 4, 1024);
 
-    let reservation = pool.reserve(Some(1), Some(3 * 1024)).unwrap();
+    let reservation = pool
+        .reserve(Some(1), Some(3 * 1024), &AtomicBool::default())
+        .unwrap()
+        .unwrap();
     let cpu_only =
         vector_attempt(&pool, 2, 0).expect("memory reservations leave CPU capacity free");
     assert!(
@@ -207,7 +199,7 @@ fn a_reservation_requires_a_requested_resource() {
     let directory = tempfile::tempdir().unwrap();
     let pool = pool_at(directory.path(), 4, 1024);
 
-    assert!(pool.reserve(None, None).is_err());
+    assert!(pool.reserve(None, None, &AtomicBool::default()).is_err());
 }
 
 #[test]
@@ -215,7 +207,10 @@ fn a_memory_reservation_needs_a_memory_budget() {
     let directory = tempfile::tempdir().unwrap();
     let pool = pool_at(directory.path(), 4, 0);
 
-    assert!(pool.reserve(None, Some(1024)).is_err());
+    assert!(
+        pool.reserve(None, Some(1024), &AtomicBool::default())
+            .is_err()
+    );
 }
 
 #[test]
@@ -236,7 +231,10 @@ fn blocked_reservations_sleep_and_wake_in_fifo_order() {
                 SCANS.fetch_add(1, Ordering::Relaxed);
                 crate::pressure::now_ms()
             };
-            let permit = pool.reserve(Some(1), None).unwrap();
+            let permit = pool
+                .reserve(Some(1), None, &AtomicBool::default())
+                .unwrap()
+                .unwrap();
             admitted.send((index, permit)).unwrap();
         }));
         wait_until("the next FIFO reservation to enqueue", || {
@@ -294,7 +292,12 @@ fn a_waiting_reservation_recovers_a_silently_unlocked_lease() {
     let (admitted, admission) = std::sync::mpsc::channel();
     let worker = std::thread::spawn(move || {
         admitted
-            .send(pool_at(&dir, 1, 0).reserve(Some(1), None).unwrap())
+            .send(
+                pool_at(&dir, 1, 0)
+                    .reserve(Some(1), None, &AtomicBool::default())
+                    .unwrap()
+                    .unwrap(),
+            )
             .unwrap();
     });
     wait_until("the reservation to enqueue", || {
@@ -3060,7 +3063,10 @@ fn domain_budgets_are_independent_and_build_slots_only_limit_cpu() {
 fn reservation_vector_and_legacy_charge_are_both_preserved() {
     let dir = tempfile::tempdir().unwrap();
     let pool = pool_at(dir.path(), 8, GIB);
-    let lease = pool.reserve(Some(2), Some(5 * GIB + 1)).unwrap();
+    let lease = pool
+        .reserve(Some(2), Some(5 * GIB + 1), &AtomicBool::default())
+        .unwrap()
+        .unwrap();
     let record: Lease = serde_json::from_slice(&std::fs::read(&lease.path).unwrap()).unwrap();
     assert_eq!(
         record.resources(),
@@ -3072,7 +3078,10 @@ fn reservation_vector_and_legacy_charge_are_both_preserved() {
     assert_eq!(record.weight, 6);
     assert_eq!(record.bytes_per_permit, GIB);
     drop(lease);
-    let lease = pool.reserve(Some(2), None).unwrap();
+    let lease = pool
+        .reserve(Some(2), None, &AtomicBool::default())
+        .unwrap()
+        .unwrap();
     let record: Lease = serde_json::from_slice(&std::fs::read(&lease.path).unwrap()).unwrap();
     assert_eq!(
         record.resources(),
@@ -3082,7 +3091,10 @@ fn reservation_vector_and_legacy_charge_are_both_preserved() {
         }
     );
     drop(lease);
-    let lease = pool.reserve(None, Some(GIB)).unwrap();
+    let lease = pool
+        .reserve(None, Some(GIB), &AtomicBool::default())
+        .unwrap()
+        .unwrap();
     let record: Lease = serde_json::from_slice(&std::fs::read(&lease.path).unwrap()).unwrap();
     assert_eq!(
         record.resources(),
