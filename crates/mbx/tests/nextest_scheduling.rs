@@ -361,8 +361,59 @@ mod unix {
         assert_eq!(String::from_utf8_lossy(&output.stdout), "2\n1\n");
     }
 
-    /// The descriptor the grant tests name with `--grant-fd 5`, as Nx's
-    /// bounded-exec executor does.
+    /// `mbx reservations` serves the pool `mbx reserve` reserves from, on a
+    /// socket only its user can open, for as long as its starter keeps its
+    /// standard input open; the starter's end releases every grant.
+    #[test]
+    fn the_reservation_server_grants_on_its_socket_until_its_starter_goes() {
+        use std::io::{BufRead, BufReader, Write};
+
+        let temp = tempfile::tempdir().unwrap();
+        let cache = temp.path().join("cache");
+        let socket = temp.path().join("r.sock");
+        let mut server = mbx(temp.path())
+            .env("MBX_CACHE_DIR", &cache)
+            .env("MBX_SCHEDULER", "1")
+            .env("MBX_SCHEDULER_CPUS", "2")
+            .env("MBX_SCHEDULER_MEMORY", "none")
+            .arg("reservations")
+            .arg(&socket)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap();
+        let mut said = String::new();
+        BufReader::new(server.stdout.take().unwrap())
+            .read_line(&mut said)
+            .unwrap();
+        assert_eq!(said, "listening\n");
+        assert_eq!(
+            fs::metadata(&socket).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        let mut client = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+        client
+            .write_all(b"{\"type\":\"reserve\",\"id\":1,\"cpus\":3,\"priority\":\"low\"}\n")
+            .unwrap();
+        let mut reply = String::new();
+        BufReader::new(&client).read_line(&mut reply).unwrap();
+        // At most the pool's two cores, as `mbx reserve --cpus 3` would hold.
+        assert_eq!(reply, "{\"type\":\"granted\",\"id\":1,\"cpus\":2}\n");
+        assert_eq!(locked_lease_files(&cache).len(), 1);
+
+        // The client still holds its connection; the starter going ends it all.
+        drop(server.stdin.take());
+        let status = wait_child(&mut server, Duration::from_secs(10));
+        assert!(status.success(), "mbx reservations exited with {status}");
+        assert!(!socket.exists(), "the server removes its socket");
+        assert_no_live_leases(&cache, "after the server's starter went");
+        drop(client);
+    }
+
+    /// The descriptor the grant tests name with `--grant-fd 5`, the one Nx's
+    /// bounded-exec executor names in `MBX_GRANT_FD`.
     const GRANT_FD: i32 = 5;
 
     /// Run by a reserved command: reports whether descriptor 5 reached it.
