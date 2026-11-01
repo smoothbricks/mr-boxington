@@ -45,6 +45,7 @@
 - [`mbx prefetch <CARGO_ARGS>…`](/cli/prefetch.md)
 - [`mbx exec [--project-root <DIR>] <COMMAND>…`](/cli/exec.md)
 - [`mbx reserve [FLAGS] <COMMAND>…`](/cli/reserve.md)
+- [`mbx reservations <SOCKET>`](/cli/reservations.md)
 
 ## Configuration
 

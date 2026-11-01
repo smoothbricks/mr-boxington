@@ -400,6 +400,52 @@ reservation, like an admitted compiler, is never preempted or narrowed. `--grant
 supervisor when the reservation gets its capacity; see
 [Tell a supervisor when work holds capacity](#tell-a-supervisor-when-work-holds-capacity).
 
+### Serve reservations to many commands
+
+`mbx reserve` spends a process, and the worker that holds its lease, on every
+reservation. A runner that starts many short external commands, such as an Nx
+run's tasks, starts `mbx reservations` once and asks it instead:
+
+```sh
+mbx reservations "$XDG_RUNTIME_DIR/reservations.sock"
+```
+
+mbx creates the socket readable and writable only by its user, prints
+`listening` on standard output once it accepts connections, and serves until
+its standard input closes, removing the socket as it exits. Start it with a
+pipe on its standard input whose write end only the starter holds, so the
+server, and every grant it serves, ends with the starter.
+
+A client connects and writes one JSON object per line:
+
+```text
+→ {"type":"reserve","id":1,"cpus":4,"priority":"low"}
+← {"type":"granted","id":1,"cpus":2}
+→ {"type":"release","id":1}
+```
+
+`reserve` asks for at most `cpus` cores at a `priority`, with an optional
+`memory` in bytes, and is admitted exactly as `mbx reserve --cpus --priority
+--memory` is: the same pool, the same order, and as many of its cores as are
+free once one is. The answer is `granted` with the cores the request holds, or
+`refused` with the pool's error, after which the connection keeps serving.
+`release` gives a grant back, or withdraws a request that still waits; it has
+no answer. One connection may hold many grants under distinct ids, answered in
+the order the pool grants them, and an id is free again once released. Closing
+the connection releases every grant it holds and withdraws every request it has
+waiting, so a client that dies gives back what it had. A line that is not a
+request, a second live request under one id, or a release of an id the
+connection does not hold is answered `{"type":"error","error":"..."}`, and the
+connection is closed with the same effect.
+
+A served reservation runs no command, so mbx sets no `MBX_RESERVE_CPUS` and
+announces nothing on a grant descriptor: the client hands the granted count to
+the work it starts, as `mbx reserve` hands its command `MBX_RESERVE_CPUS`, and
+runs that work with `MBX_SCHED_DISABLE=1` and an empty `MBX_SCHED_DIR`, so mbx
+builds inside it run under the grant instead of queueing beside it.
+`mbx reservations` refuses to start inside an enclosing reservation, and it
+serves only a Unix socket.
+
 ## Schedule test binaries
 
 By default, permits cover compilers only. When several test commands reach
