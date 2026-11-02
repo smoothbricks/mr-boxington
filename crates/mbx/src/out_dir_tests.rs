@@ -230,12 +230,16 @@ fn a_tree_with_a_symlink_is_left_alone() {
     assert!(!root.exists(), "nothing was copied");
 }
 
+/// Whether the scan finds `OUT_DIR` among the sources below `directory`.
+fn mentions_out_dir(directory: &Path) -> bool {
+    !sources_mentioning(directory, &["OUT_DIR".to_string()]).is_empty()
+}
 #[test]
 fn the_scan_finds_a_mention_and_skips_what_is_not_source() {
     let directory = tempfile::tempdir().unwrap();
     let src = directory.path().join("src");
     write_tree(&src, &[("lib.rs", b"pub fn value() -> u32 { 1 }\n")]);
-    assert!(!sources_mention_out_dir(&src));
+    assert!(!mentions_out_dir(&src));
 
     write_tree(
         &src,
@@ -244,7 +248,7 @@ fn the_scan_finds_a_mention_and_skips_what_is_not_source() {
             b"include!(concat!(env!(\"OUT_DIR\"), \"/x.rs\"));\n",
         )],
     );
-    assert!(sources_mention_out_dir(&src));
+    assert!(mentions_out_dir(&src));
 
     // A mention under a target directory or in a non-Rust file is not the
     // crate reading it.
@@ -258,7 +262,7 @@ fn the_scan_finds_a_mention_and_skips_what_is_not_source() {
             ("lib.rs", b"nothing"),
         ],
     );
-    assert!(!sources_mention_out_dir(&other));
+    assert!(!mentions_out_dir(&other));
 }
 
 #[test]
@@ -428,7 +432,10 @@ fn a_bypassed_compilation_gets_cargos_out_dir_back_and_holds_no_lease() {
     write_tree(&real, &[("generated.rs", b"x")]);
     let stable = stabilize(&real, &root).unwrap().unwrap();
     let digest = stable.file_name().unwrap().to_string_lossy().into_owned();
-    *ORIGINAL.lock().unwrap() = Some(real.clone().into_os_string());
+    ORIGINAL
+        .lock()
+        .unwrap()
+        .push(("OUT_DIR".into(), real.clone().into_os_string()));
     unsafe { std::env::set_var("OUT_DIR", &stable) };
     assert!(
         LEASES
@@ -444,7 +451,7 @@ fn a_bypassed_compilation_gets_cargos_out_dir_back_and_holds_no_lease() {
         std::env::var_os("OUT_DIR").as_deref(),
         Some(real.as_os_str())
     );
-    assert!(ORIGINAL.lock().unwrap().is_none());
+    assert!(ORIGINAL.lock().unwrap().is_empty());
     let _registrar = registrar(&root).unwrap();
     assert!(
         !leased(&root, &digest, true).unwrap(),
@@ -733,6 +740,22 @@ fn displayed_output_names_cargos_out_dir_not_the_stable_copy() {
     assert_eq!(
         String::from_utf8(text).unwrap(),
         "{\"file_name\":\"/work/target/debug/build/x-1/out/gen.rs\"}\n --> /work/target/debug/build/x-1/out/gen.rs:1:29\n"
+    );
+}
+
+#[test]
+fn displayed_output_names_each_shared_variables_own_directory() {
+    let text = swap_all(
+        b" --> /cache/out-dirs/v1/abc/gen.rs:1:29\n --> /cache/out-dirs/v1/def/codegen.rs:2:1\n",
+        [
+            ("/cache/out-dirs/v1/abc", "/work/target/debug/build/x-1/out"),
+            ("/cache/out-dirs/v1/def", "/work/build/codegen"),
+        ],
+        false,
+    );
+    assert_eq!(
+        String::from_utf8(text).unwrap(),
+        " --> /work/target/debug/build/x-1/out/gen.rs:1:29\n --> /work/build/codegen/codegen.rs:2:1\n"
     );
 }
 
@@ -1232,4 +1255,19 @@ fn an_orphan_skipped_while_leased_waits_for_the_next_accounted_sweep() {
     assert_eq!(next.removed_bytes, 6);
     assert_eq!(next.remaining_bytes, 0);
     assert!(!record.exists());
+}
+
+#[test]
+fn share_env_names_follow_out_dir_once_each_and_set_apart_what_names_no_variable() {
+    let environment = |listed: &'static str| {
+        move |name: &str| (name == SHARE_ENV).then(|| std::ffi::OsString::from(listed))
+    };
+    assert_eq!(shared_names_with(|_| None), ["OUT_DIR"]);
+    let (names, invalid) = listed_names(environment(
+        " BUN_CODEGEN_DIR, OUT_DIR,,GEN_2 ,BUN_CODEGEN_DIR,a=b",
+    ));
+    assert_eq!(names, ["OUT_DIR", "BUN_CODEGEN_DIR", "GEN_2"]);
+    assert_eq!(invalid, ["a=b"]);
+    assert_eq!(placeholder("BUN_CODEGEN_DIR"), "bun_codegen_dir");
+    assert_eq!(placeholder("OUT_DIR"), "out_dir");
 }
