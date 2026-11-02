@@ -1169,20 +1169,24 @@ impl CcInvocation {
     /// likely to change without any other key component noticing, because the
     /// compiler identity does not cover the C library or the platform SDK.
     ///
-    /// A compilation that uses a precompiled header also gets
-    /// `-Xclang -module-file-deps`. Clang leaves module files out of the list
+    /// A compilation that uses a precompiled header also gets the driver's
+    /// `-fmodule-file-deps`. Clang leaves module files out of the list
     /// otherwise, and a PCH built while another was loaded makes Clang load
     /// that one too, from the path recorded inside it: with the option the
     /// list names both, so the PCH a chain loads is keyed by its bytes like
     /// any header read. Without it, rebuilding that first PCH under another
-    /// definition would restore an object built against the old one.
+    /// definition would restore an object built against the old one. The
+    /// driver option, not the frontend's `-Xclang -module-file-deps`: Clang 23
+    /// made the frontend option `-module-file-deps=<none|all|direct>` and
+    /// refuses the bare spelling, while the driver option means the same on
+    /// every Clang and passes the frontend whichever spelling it takes.
     pub fn dependency_arguments(&self, depfile: &Path) -> Vec<OsString> {
         let mut arguments = vec!["-MD".into(), "-MF".into(), depfile.into()];
         if self.arguments.iter().any(|argument| {
             matches!(argument, Argument::Path { flag, .. }
                 if flag == "-include-pch" || flag == "-Xclang -include-pch")
         }) {
-            arguments.extend(["-Xclang".into(), "-module-file-deps".into()]);
+            arguments.push("-fmodule-file-deps".into());
         }
         arguments
     }
