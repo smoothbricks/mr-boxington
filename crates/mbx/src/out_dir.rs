@@ -23,6 +23,10 @@
 //! environment value the compilation did not read; a crate that reads it
 //! through a source the scan cannot see keeps today's checkout-specific key,
 //! which is sound.
+//!
+//! `OUT_DIR` is Cargo's. A build that hands rustc generated sources through a
+//! variable of its own (Bun's `BUN_CODEGEN_DIR`) names it in `MBX_SHARE_ENV`,
+//! and each named variable's directory is shared exactly as `OUT_DIR`'s is.
 
 use crate::retired::{self, RetiredTree};
 use eyre::{Context, Result};
@@ -34,14 +38,21 @@ use std::time::{Duration, SystemTime};
 /// Where the session tells the shim to keep stable trees.
 pub(crate) const ROOT_ENV: &str = "MBX_OUT_DIR_ROOT";
 
+/// Further variables naming generated-source directories to share as `OUT_DIR`
+/// is shared, comma-separated (the `share_env` setting).
+pub(crate) const SHARE_ENV: &str = "MBX_SHARE_ENV";
+
 /// The cache-relative home of stable trees.
 pub(crate) const ROOT: &str = "out-dirs/v1";
 
-/// The placeholder a stable tree normalizes to in keys and predictions. Named
-/// for the variable rather than the digest, so a prediction recorded in one
-/// checkout resolves against another checkout's tree, whose digest is what the
-/// key then compares.
-pub(crate) const PLACEHOLDER: &str = "out_dir";
+/// The placeholder a stable tree normalizes to in keys and predictions: its
+/// variable's name in lower case, `out_dir` for `OUT_DIR`. Named for the
+/// variable rather than the digest, so a prediction recorded in one checkout
+/// resolves against another checkout's tree, whose digest is what the key then
+/// compares.
+pub(crate) fn placeholder(name: &str) -> String {
+    name.to_ascii_lowercase()
+}
 
 /// How often a use is stamped. The marker is what collection ages, and a
 /// crate compiled in an edit loop would otherwise rewrite it every build.
@@ -76,81 +87,156 @@ struct Lease {
 static LEASES: Mutex<std::collections::BTreeMap<PathBuf, Lease>> =
     Mutex::new(std::collections::BTreeMap::new());
 
-/// The `OUT_DIR` Cargo gave this process, once it has been replaced, so a
-/// compilation that ends up bypassing the cache can be handed back the tree
-/// the shim is not going to keep a lease on.
-static ORIGINAL: Mutex<Option<std::ffi::OsString>> = Mutex::new(None);
+/// Each variable this process replaced, with the value Cargo or the build gave
+/// it, so a compilation that ends up bypassing the cache can be handed back
+/// the trees the shim is not going to keep a lease on.
+static ORIGINAL: Mutex<Vec<(std::ffi::OsString, std::ffi::OsString)>> = Mutex::new(Vec::new());
 
-/// Give this compilation a stable `OUT_DIR`, when it has one to read.
+/// `OUT_DIR`, then each variable `MBX_SHARE_ENV` names, once each, read
+/// through `environment`; and apart, the listed names that are no environment
+/// variable's (empty, or holding anything but ASCII letters, digits and `_`).
+fn listed_names(
+    environment: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> (Vec<String>, Vec<String>) {
+    let mut names = vec!["OUT_DIR".to_string()];
+    let mut invalid = Vec::new();
+    let Some(listed) = environment(SHARE_ENV) else {
+        return (names, invalid);
+    };
+    for name in listed.to_string_lossy().split(',').map(str::trim) {
+        if name.is_empty() || names.iter().any(|known| known == name) {
+            continue;
+        }
+        if name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        {
+            names.push(name.to_string());
+        } else {
+            invalid.push(name.to_string());
+        }
+    }
+    (names, invalid)
+}
+
+/// The variables whose generated trees are shared: `OUT_DIR`, then each valid
+/// name `MBX_SHARE_ENV` lists, read through `environment`.
+pub(crate) fn shared_names_with(
+    environment: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Vec<String> {
+    listed_names(environment).0
+}
+
+/// [`shared_names_with`] over this process's environment.
+pub(crate) fn shared_names() -> Vec<String> {
+    shared_names_with(|name| std::env::var_os(name))
+}
+
+/// Give this compilation a stable copy of each generated tree it reads:
+/// `OUT_DIR` and every variable [`shared_names`] adds.
 ///
 /// On success the process environment carries the stable path, which is what
 /// every later step reads: the key, the remapping, the compiler itself. A
-/// problem copying the tree is reported and leaves the checkout's own value in
+/// problem copying a tree is reported and leaves that variable's own value in
 /// place, which is the behavior without this at all.
-pub(crate) fn stabilize_for(source: &Path) -> Option<PathBuf> {
+pub(crate) fn stabilize_for(source: &Path) {
     if !crate::session::share_out_dir_requested() {
-        return None;
+        return;
     }
-    let real = PathBuf::from(std::env::var_os("OUT_DIR")?);
-    if !real.is_absolute() || !real.is_dir() {
-        return None;
+    let Some(root) = std::env::var_os(ROOT_ENV).map(PathBuf::from) else {
+        return;
+    };
+    if !root.is_absolute() {
+        return;
     }
-    let root = PathBuf::from(std::env::var_os(ROOT_ENV)?);
-    if !root.is_absolute() || real.starts_with(&root) {
-        return None;
+    let Some(sources) = source.parent() else {
+        return;
+    };
+    let (names, invalid) = listed_names(|name| std::env::var_os(name));
+    for name in invalid {
+        crate::session::report_shim_warning(&format!(
+            "{SHARE_ENV} names {name:?}, which is not an environment variable's name; it is not shared"
+        ));
     }
-    let sources = source.parent()?;
-    if !sources_mention_out_dir(sources) {
-        return None;
-    }
-    match stabilize(&real, &root) {
-        Ok(Some(stable)) => {
-            // Single-threaded here, ahead of any thread the shim starts, and
-            // rustc inherits what is set by the time it is spawned.
-            *ORIGINAL.lock().unwrap() = Some(real.into_os_string());
-            unsafe { std::env::set_var("OUT_DIR", &stable) };
-            Some(stable)
+    for name in sources_mentioning(sources, &names) {
+        let Some(real) = std::env::var_os(name).map(PathBuf::from) else {
+            continue;
+        };
+        if !real.is_absolute() || !real.is_dir() || real.starts_with(&root) {
+            continue;
         }
-        Ok(None) => None,
-        Err(error) => {
-            crate::session::report_shim_warning(&format!(
-                "OUT_DIR was not made stable for this compilation: {error:#}"
-            ));
-            None
+        match stabilize(&real, &root) {
+            Ok(Some(stable)) => {
+                // Single-threaded here, ahead of any thread the shim starts, and
+                // rustc inherits what is set by the time it is spawned.
+                ORIGINAL
+                    .lock()
+                    .unwrap()
+                    .push((name.into(), real.into_os_string()));
+                unsafe { std::env::set_var(name, &stable) };
+            }
+            Ok(None) => {}
+            Err(error) => {
+                crate::session::report_shim_warning(&format!(
+                    "{name} was not made stable for this compilation: {error:#}"
+                ));
+            }
         }
     }
 }
 
-/// Hand a compilation that bypasses the cache the `OUT_DIR` Cargo gave it.
+/// Hand a compilation that bypasses the cache the values its build gave it.
 ///
 /// A bypassed compilation may replace this process with rustc, and a lease
 /// lives only as long as the process holding it, so the compiler must not be
-/// left reading a tree nothing protects. Cargo's own tree is the checkout's
-/// and needs no lease. The leases go with the value: nothing this process
-/// will run reads the stable tree any more.
+/// left reading a tree nothing protects. The build's own trees are the
+/// checkout's and need no lease. The leases go with the values: nothing this
+/// process will run reads the stable trees any more.
 pub(crate) fn restore() {
-    let Some(original) = ORIGINAL.lock().unwrap().take() else {
+    let originals = std::mem::take(&mut *ORIGINAL.lock().unwrap());
+    if originals.is_empty() {
         return;
-    };
-    unsafe { std::env::set_var("OUT_DIR", original) };
+    }
+    for (name, original) in originals {
+        unsafe { std::env::set_var(name, original) };
+    }
     LEASES.lock().unwrap().clear();
 }
 
 /// Compiler output as the person running Cargo should see it.
 ///
-/// rustc reads the stable copy of `OUT_DIR`, so its paths name that copy. The
-/// copy is an implementation detail, and tools such as trybuild match the
-/// `target/.../out` path Cargo gave the build script, so on the way out the
-/// copy's path becomes Cargo's. What the cache stores is untouched.
+/// rustc reads the stable copy of each shared variable's tree, `OUT_DIR` and
+/// every name `MBX_SHARE_ENV` adds, so its paths name those copies. A copy is
+/// an implementation detail, and tools such as trybuild match the
+/// `target/.../out` path Cargo gave the build script, so on the way out each
+/// copy's path becomes the one its build gave. What the cache stores is
+/// untouched.
 pub(crate) fn for_display(bytes: &[u8]) -> Vec<u8> {
-    let original = ORIGINAL.lock().unwrap().clone();
-    let (Some(original), Some(stable)) = (original, std::env::var_os("OUT_DIR")) else {
-        return bytes.to_vec();
-    };
-    match (stable.to_str(), original.to_str()) {
-        (Some(stable), Some(original)) => swap_stable(bytes, stable, original, cfg!(windows)),
-        _ => bytes.to_vec(),
+    let originals = ORIGINAL.lock().unwrap();
+    let stables: Vec<(std::ffi::OsString, &std::ffi::OsString)> = originals
+        .iter()
+        .filter_map(|(name, original)| Some((std::env::var_os(name)?, original)))
+        .collect();
+    swap_all(
+        bytes,
+        stables
+            .iter()
+            .filter_map(|(stable, original)| Some((stable.to_str()?, original.to_str()?))),
+        cfg!(windows),
+    )
+}
+
+/// [`swap_stable`] for each `(stable, original)` pair in turn.
+fn swap_all<'a>(
+    bytes: &[u8],
+    swaps: impl IntoIterator<Item = (&'a str, &'a str)>,
+    windows: bool,
+) -> Vec<u8> {
+    let mut text = bytes.to_vec();
+    for (stable, original) in swaps {
+        text = swap_stable(&text, stable, original, windows);
     }
+    text
 }
 
 /// [`swap_paths`] for the native spelling of `stable`, and on Windows for its
@@ -188,15 +274,18 @@ fn swap_paths(bytes: &[u8], from: &str, to: &str) -> Vec<u8> {
     text
 }
 
-/// Whether any Rust source below `directory` mentions `OUT_DIR`.
+/// Which of `names` any Rust source below `directory` mentions, in their order,
+/// from one walk of the sources.
 ///
 /// Hidden directories, `target`, and `node_modules` are skipped: none of them
 /// hold a crate's own sources, and a workspace root package would otherwise
-/// walk the whole checkout.
-pub(crate) fn sources_mention_out_dir(directory: &Path) -> bool {
+/// walk the whole checkout. Past the scan limit the names not yet found count
+/// as unmentioned, which keeps their compilations keyed to the checkout.
+pub(crate) fn sources_mentioning<'a>(directory: &Path, names: &'a [String]) -> Vec<&'a str> {
+    let mut found = vec![false; names.len()];
     let mut pending = vec![directory.to_path_buf()];
     let mut scanned = 0;
-    while let Some(directory) = pending.pop() {
+    'walk: while let Some(directory) = pending.pop() {
         let Ok(entries) = std::fs::read_dir(&directory) else {
             continue;
         };
@@ -213,17 +302,29 @@ pub(crate) fn sources_mention_out_dir(directory: &Path) -> bool {
             } else if kind.is_file() && name.ends_with(".rs") {
                 scanned += 1;
                 if scanned > SCAN_FILE_LIMIT {
-                    return false;
+                    break 'walk;
                 }
-                if std::fs::read(entry.path())
-                    .is_ok_and(|contents| memchr::memmem::find(&contents, b"OUT_DIR").is_some())
-                {
-                    return true;
+                let Ok(contents) = std::fs::read(entry.path()) else {
+                    continue;
+                };
+                for (index, variable) in names.iter().enumerate() {
+                    if !found[index]
+                        && memchr::memmem::find(&contents, variable.as_bytes()).is_some()
+                    {
+                        found[index] = true;
+                    }
+                }
+                if found.iter().all(|&mentioned| mentioned) {
+                    break 'walk;
                 }
             }
         }
     }
-    false
+    names
+        .iter()
+        .zip(found)
+        .filter_map(|(name, mentioned)| mentioned.then_some(name.as_str()))
+        .collect()
 }
 
 /// Copy `real` under `root` into a directory named for its contents, and

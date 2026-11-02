@@ -4519,14 +4519,6 @@ fn identity_field<'a>(verbose: &'a str, field: &str) -> Result<&'a str> {
         .ok_or_else(|| eyre::eyre!("rustc identity is missing {field}"))
 }
 
-/// Environment inputs eligible for remapping.
-///
-/// Deliberately just the one. `OUT_DIR` lives under the target directory, so
-/// remapping it confines the change to generated sources, and it is the value
-/// the plan identifies as the cross-checkout shortfall. Widening this list
-/// widens which paths disappear from debug info, which is its own decision.
-const PORTABLE_ENVIRONMENT: &[&str] = &["OUT_DIR"];
-
 /// The environment values whose absolute paths this compilation was made
 /// independent of.
 ///
@@ -4644,8 +4636,11 @@ impl Portable {
         if !session::share_out_dir_requested() {
             return portable;
         }
-        for name in PORTABLE_ENVIRONMENT {
-            let Some(value) = std::env::var(name)
+        // `OUT_DIR` and the variables `share_env` names: each one's directory
+        // sits under the cache's shared root by now, and remapping it confines
+        // the change to generated sources.
+        for name in crate::out_dir::shared_names() {
+            let Some(value) = std::env::var(&name)
                 .ok()
                 .filter(|value| Path::new(value).is_absolute())
             else {
@@ -4728,23 +4723,26 @@ fn path_mappings_with_env(
 ) -> Vec<PathMapping> {
     let mut mappings = Vec::new();
     let mut roots = BTreeSet::new();
-    // A stable `OUT_DIR` is its own root, named for the variable rather than
-    // for the tree: a prediction that lists `${out_dir}/generated.rs` resolves
-    // in every checkout against that checkout's own tree, and the key then
-    // compares the trees by the digest in the path rustc was given.
-    if let (Some(root), Some(out_dir)) = (
-        environment(crate::out_dir::ROOT_ENV).map(PathBuf::from),
-        environment("OUT_DIR").map(PathBuf::from),
-    ) && out_dir.is_absolute()
-        && out_dir.starts_with(&root)
-        && out_dir != root
-    {
-        add_mapping(
-            &mut mappings,
-            &mut roots,
-            out_dir,
-            crate::out_dir::PLACEHOLDER,
-        );
+    // Each stable tree -- `OUT_DIR`'s and each one `share_env` names -- is its
+    // own root, named for its variable rather than for the tree: a prediction
+    // that lists `${out_dir}/generated.rs` resolves in every checkout against
+    // that checkout's own tree, and the key then compares the trees by the
+    // digest in the path rustc was given.
+    if let Some(root) = environment(crate::out_dir::ROOT_ENV).map(PathBuf::from) {
+        for name in crate::out_dir::shared_names_with(&environment) {
+            if let Some(stable) = environment(&name).map(PathBuf::from)
+                && stable.is_absolute()
+                && stable.starts_with(&root)
+                && stable != root
+            {
+                add_mapping(
+                    &mut mappings,
+                    &mut roots,
+                    stable,
+                    &crate::out_dir::placeholder(&name),
+                );
+            }
+        }
     }
     let home_roots = ["HOME", "USERPROFILE"]
         .into_iter()

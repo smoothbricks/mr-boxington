@@ -559,6 +559,14 @@ path and can reuse the compilation when its other inputs also match.
 The literal `OUT_DIR` value remains part of the key. Code that stores the path
 or derives a value from it sees the same value in both checkouts.
 
+`share_env` (`MBX_SHARE_ENV`, comma-separated) names further environment
+variables a crate reads to locate generated sources; Bun's `BUN_CODEGEN_DIR` is
+one. Each value that names a directory is shared exactly as `OUT_DIR` is: copied
+to `out-dirs/v1/<digest>`, given to rustc as that path, remapped in debug
+information, and kept in the key as that literal path. The crate's own sources
+must mention the variable, as they must mention `OUT_DIR`, and `share_out_dir`
+must be on.
+
 ### When sharing is unavailable
 
 - **Generated output differs.** A build script that embeds a checkout path in
