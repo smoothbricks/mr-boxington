@@ -119,14 +119,17 @@ Clippy's own spelling reaches a key through Cargo instead. Cargo mixes the
 path of `RUSTC_WORKSPACE_WRAPPER` into the `-C metadata` of every workspace
 member, and `cargo-clippy` names that wrapper `clippy-driver` beside its own
 executable path, which on macOS is the path Cargo ran rather than the file
-behind it. Through a profile's link, every member's arguments carried the
-profile, so a check run through another profile, or after any package in the
-profile changed, found no prediction to look up. For `clippy`, when the
-`cargo-clippy` Cargo would run is a link to a `cargo-clippy` elsewhere, mbx
-puts a `cargo-clippy` first on Cargo's `PATH` that runs that file by its
-resolved path. Clippy then names its toolchain's own `clippy-driver`, the same
-path under every profile that links it. A rustup proxy picks its toolchain
-when it runs and is left alone.
+behind it. Every installation of a toolchain set every member's arguments
+apart: a profile's link, the next build of the profile, and a second Nix
+derivation of the same toolchain that only adds targets, such as the profile a
+land gate runs in. A check run through any other installation found no
+prediction to look up. For `clippy`, mbx puts a `cargo-clippy` first on
+Cargo's `PATH` that runs the one Cargo would have run and catches the driver it
+hands Cargo. When the `clippy-driver` on `PATH` is that same file, Cargo gets
+the bare name `clippy-driver`, which it hashes as written and runs from `PATH`:
+the same name under every installation, each running its own driver. A
+different driver, such as a rustup toolchain's behind a proxy on `PATH`, keeps
+the path `cargo-clippy` chose.
 
 An input file in the Nix store keeps its own path in the key, for Rust as for
 C and C++: its contents are hashed like any input's, and a store path is
