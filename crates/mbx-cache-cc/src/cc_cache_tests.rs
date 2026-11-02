@@ -475,6 +475,39 @@ fn a_precompiled_header_is_a_required_input_keyed_by_content() {
     }
 }
 
+/// mbx asks for the precompiled headers a compilation loads with the driver's
+/// `-fmodule-file-deps`, never the frontend's `-module-file-deps`. Clang 23
+/// made the frontend option `-module-file-deps=<none|all|direct>` and refuses
+/// the bare spelling ("unknown argument: '-module-file-deps'"), which failed
+/// every compilation using a precompiled header (measured on clang 23.1.3,
+/// 2026-11-02). The driver option lists the loaded precompiled headers in the
+/// dependency file on clang 21, clang 23 and Apple clang 21 alike.
+#[test]
+fn a_precompiled_header_compilation_asks_the_driver_for_module_file_deps() {
+    let mut arguments = argv(&[
+        "-Xclang",
+        "-include-pch",
+        "-Xclang",
+        "build/root.h.pch",
+        "-Xclang",
+        "-include",
+        "-Xclang",
+        "build/root.h",
+    ]);
+    arguments.extend(argv(&["-c", "-o", "out.o", "src/a.cpp"]));
+    let invocation = CcInvocation::parse(&arguments).expect("a PCH compilation is admitted");
+    assert_eq!(
+        invocation.dependency_arguments(Path::new("out.d")),
+        argv(&["-MD", "-MF", "out.d", "-fmodule-file-deps"])
+    );
+    let plain = CcInvocation::parse(&argv(&["-c", "-o", "out.o", "src/a.cpp"]))
+        .expect("a plain compilation is admitted");
+    assert_eq!(
+        plain.dependency_arguments(Path::new("out.d")),
+        argv(&["-MD", "-MF", "out.d"])
+    );
+}
+
 /// Only the frontend options that name a precompiled header and its header
 /// are modeled. A pair cut short, any other frontend option, and building a
 /// precompiled header still bypass.

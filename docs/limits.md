@@ -423,7 +423,7 @@ input keyed by its contents, and the headers recorded inside it enter the key
 like any other header the compilation read. A precompiled header built while
 another was loaded is chained: Clang loads that one too, from the path
 recorded inside it. mbx asks Clang to list the precompiled headers it loads
-(`-Xclang -module-file-deps`), so each one in a chain is an input keyed by its
+(the driver's `-fmodule-file-deps`), so each one in a chain is an input keyed by its
 contents as well. A precompiled header records the paths and modification
 times of the headers it was built from, so one rebuilt in another directory
 has other bytes, and the compilations that use it miss there. Clang refuses a
