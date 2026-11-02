@@ -4111,6 +4111,10 @@ enum Generated {
     /// it. The first is keyed to its checkout; the second is what the remapping
     /// is for.
     Dependent,
+    /// Includes generated code through a variable of its build's own rather
+    /// than `OUT_DIR`, as Bun's `BUN_CODEGEN_DIR` is: the build script writes
+    /// the sources and hands rustc their directory as `CODEGEN_DIR`.
+    Named,
 }
 
 /// Write a build-script fixture that leaves an observable execution count and
@@ -5836,6 +5840,21 @@ fn write_generated_project(directory: &Path, generated: Generated) {
              pub fn value() -> u32 { VALUE }\n"
                 .to_string()
         }
+        Generated::Named => {
+            std::fs::write(
+                directory.join("build.rs"),
+                "use std::{env, fs, path::PathBuf};\n\
+                 fn main() {\n\
+                 \u{20}   let codegen = PathBuf::from(env::var(\"OUT_DIR\").unwrap()).join(\"codegen\");\n\
+                 \u{20}   fs::create_dir_all(&codegen).unwrap();\n\
+                 \u{20}   fs::write(codegen.join(\"generated.rs\"), \"pub const VALUE: u32 = 7;\\n\").unwrap();\n\
+                 \u{20}   println!(\"cargo:rustc-env=CODEGEN_DIR={}\", codegen.display());\n\
+                 }\n",
+            )
+            .unwrap();
+            "include!(concat!(env!(\"CODEGEN_DIR\"), \"/generated.rs\"));\npub fn value() -> u32 { VALUE }\n"
+                .to_string()
+        }
         Generated::Divergent => {
             std::fs::write(
                 directory.join("build.rs"),
@@ -5920,6 +5939,24 @@ fn a_compilation_that_reads_out_dir_shares_between_checkouts_with_the_same_gener
             "a compilation reading identical generated sources was not shared"
         );
     }
+}
+
+/// A crate may read generated sources through a variable of its build's own
+/// rather than `OUT_DIR`, as Bun's crates read `BUN_CODEGEN_DIR`. The value is
+/// a path in the checkout and the key keeps it, so by default the compilation
+/// is keyed to its checkout. Naming the variable in `MBX_SHARE_ENV` shares its
+/// directory exactly as `OUT_DIR` is shared: both checkouts hand rustc the same
+/// content-addressed copy, and the key keeps that literal path.
+#[test]
+fn a_compilation_reading_a_named_generated_directory_shares_when_the_name_is_shared() {
+    assert!(
+        !two_checkouts_share(Generated::Named, &[]),
+        "a variable nobody named stays keyed to its checkout"
+    );
+    assert!(
+        two_checkouts_share(Generated::Named, &[("MBX_SHARE_ENV", "CODEGEN_DIR")]),
+        "a compilation reading a shared generated directory was not shared"
+    );
 }
 
 /// A build script may declare a dependence on `OUT_DIR` itself, as the
