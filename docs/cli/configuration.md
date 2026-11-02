@@ -616,6 +616,16 @@ This may also be set in workspace `.mbx.toml`; the environment variable wins.
 
 Has no effect; seeding from other checkouts was removed.
 
+### `share_env`
+
+- **Type:** `option<list<string>>`
+- **Optional:** true
+- **Scope:** only from the environment or the command line
+- **Set with:** `MBX_SHARE_ENV`
+
+Share the generated-source directories these environment variables name, comma-separated, as `OUT_DIR` is shared.
+
+A build that hands rustc generated sources through a variable of its own (Bun's `BUN_CODEGEN_DIR`) keys every compilation that reads it to the checkout's path. Each named variable that names a directory, read by a crate whose sources mention it, is copied into the same content-addressed cache directory as `OUT_DIR` and handed to rustc as that path; the key keeps the literal copy's path. Needs `share_out_dir`.
 ### `share_out_dir`
 
 - **Type:** `bool`
