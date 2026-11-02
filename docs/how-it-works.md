@@ -115,6 +115,19 @@ found through the profile or the profile's own link. mbx maps that toolchain,
 whose paths Cargo names `-Zbuild-std` sources by. A compiler that shows no
 toolchain of its own, such as a rustup proxy, keeps the root it reports.
 
+Clippy's own spelling reaches a key through Cargo instead. Cargo mixes the
+path of `RUSTC_WORKSPACE_WRAPPER` into the `-C metadata` of every workspace
+member, and `cargo-clippy` names that wrapper `clippy-driver` beside its own
+executable path, which on macOS is the path Cargo ran rather than the file
+behind it. Through a profile's link, every member's arguments carried the
+profile, so a check run through another profile, or after any package in the
+profile changed, found no prediction to look up. For `clippy`, when the
+`cargo-clippy` Cargo would run is a link to a `cargo-clippy` elsewhere, mbx
+puts a `cargo-clippy` first on Cargo's `PATH` that runs that file by its
+resolved path. Clippy then names its toolchain's own `clippy-driver`, the same
+path under every profile that links it. A rustup proxy picks its toolchain
+when it runs and is left alone.
+
 An input file in the Nix store keeps its own path in the key, for Rust as for
 C and C++: its contents are hashed like any input's, and a store path is
 spelled the same on every machine that holds it. That covers a Nix toolchain's
