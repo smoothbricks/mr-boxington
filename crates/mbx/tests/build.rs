@@ -1080,31 +1080,44 @@ fn clippy_workspace_compilations_restore_and_track_clippy_toml() {
 
 /// Cargo mixes the path of Clippy's `clippy-driver` into every workspace
 /// member's `-C metadata`, and `cargo-clippy` names that driver beside the path
-/// it was run by. Two profiles that link one toolchain's Clippy, such as a Nix
-/// profile before and after any of its packages changed, must still agree on
-/// the member's key: otherwise the second checks it with nothing to look up.
+/// it was run by. Two installations of one toolchain's Clippy -- a Nix profile's
+/// link, and a second derivation of the same toolchain that only adds targets,
+/// whose files are copies -- must still agree on the member's key: otherwise
+/// the second checks it with nothing to look up.
 #[cfg(unix)]
 #[test]
-fn clippy_through_another_link_to_the_same_toolchain_looks_up_the_member() {
+fn clippy_through_another_installation_of_the_same_toolchain_looks_up_the_member() {
     let Some(installed) = installed_cargo_clippy() else {
         return;
     };
     let store = tempfile::tempdir().unwrap();
     let reports = tempfile::tempdir().unwrap();
-    // Empty, so the profile's link is the only `cargo-clippy` Cargo can find.
+    // Empty, so the installation on PATH is the only `cargo-clippy` Cargo finds.
     let cargo_home = tempfile::tempdir().unwrap();
     let first = tempfile::tempdir().unwrap();
     let second = tempfile::tempdir().unwrap();
-    let run = |checkout: &Path, report: &str| {
+    let run = |checkout: &Path, copied: bool, report: &str| {
         let project = checkout.join("project");
         write_project(&project);
-        let profile = checkout.join("profile/bin");
-        std::fs::create_dir_all(&profile).unwrap();
+        let bin = checkout.join("toolchain/bin");
+        std::fs::create_dir_all(&bin).unwrap();
         for program in ["cargo-clippy", "clippy-driver"] {
-            std::os::unix::fs::symlink(installed.with_file_name(program), profile.join(program))
-                .unwrap();
+            let file = installed.with_file_name(program);
+            if copied {
+                std::fs::copy(&file, bin.join(program)).unwrap();
+            } else {
+                std::os::unix::fs::symlink(&file, bin.join(program)).unwrap();
+            }
         }
-        let path = std::env::join_paths(std::iter::once(profile).chain(std::env::split_paths(
+        if copied {
+            // The drivers load `rustc_driver` from `../lib`, as in the toolchain.
+            std::os::unix::fs::symlink(
+                installed.parent().unwrap().with_file_name("lib"),
+                checkout.join("toolchain/lib"),
+            )
+            .unwrap();
+        }
+        let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
             &std::env::var_os("PATH").unwrap_or_default(),
         )))
         .unwrap();
@@ -1121,16 +1134,16 @@ fn clippy_through_another_link_to_the_same_toolchain_looks_up_the_member() {
         .0
     };
 
-    let cold = run(first.path(), "first.json");
+    let cold = run(first.path(), false, "linked.json");
     assert!(
         count(&cold, "stored_bytes") > 0,
         "the member's check should be stored: {cold}"
     );
-    let warm = run(second.path(), "second.json");
+    let warm = run(second.path(), true, "copied.json");
     assert_eq!(
         count(&warm, "unconsulted"),
         0,
-        "the member was not looked up through the second profile: {warm}"
+        "the member was not looked up through the second installation: {warm}"
     );
     assert!(
         count(&warm, "hits") > 0,
