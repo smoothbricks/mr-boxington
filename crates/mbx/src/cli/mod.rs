@@ -19,6 +19,8 @@ mod cache;
 mod cargo;
 mod cargo_invocation;
 mod clean;
+#[cfg(unix)]
+mod clippy;
 mod doctor;
 mod edit;
 mod exec;

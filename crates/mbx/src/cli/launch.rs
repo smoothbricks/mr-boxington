@@ -15,7 +15,7 @@ const BUILD_PATH: &str = "MBX_SESSION_PATH";
 
 type Environment = BTreeMap<OsString, OsString>;
 
-fn current_environment() -> Environment {
+pub(super) fn current_environment() -> Environment {
     let variables = std::env::vars_os();
     // Windows names are case-insensitive: an inherited `Path` must match the
     // `PATH` override instead of being mistaken for absent.
@@ -284,7 +284,7 @@ fn effective_environment(overlay: &BTreeMap<String, String>) -> Environment {
     environment
 }
 
-fn cargo_home(cwd: &Path, environment: &Environment) -> Option<PathBuf> {
+pub(super) fn cargo_home(cwd: &Path, environment: &Environment) -> Option<PathBuf> {
     if let Some(home) = environment
         .get(OsStr::new("CARGO_HOME"))
         .filter(|home| !home.is_empty())
