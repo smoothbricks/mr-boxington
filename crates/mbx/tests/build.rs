@@ -1078,6 +1078,83 @@ fn clippy_workspace_compilations_restore_and_track_clippy_toml() {
     );
 }
 
+/// Cargo mixes the path of Clippy's `clippy-driver` into every workspace
+/// member's `-C metadata`, and `cargo-clippy` names that driver beside the path
+/// it was run by. Two profiles that link one toolchain's Clippy, such as a Nix
+/// profile before and after any of its packages changed, must still agree on
+/// the member's key: otherwise the second checks it with nothing to look up.
+#[cfg(unix)]
+#[test]
+fn clippy_through_another_link_to_the_same_toolchain_looks_up_the_member() {
+    let Some(installed) = installed_cargo_clippy() else {
+        return;
+    };
+    let store = tempfile::tempdir().unwrap();
+    let reports = tempfile::tempdir().unwrap();
+    // Empty, so the profile's link is the only `cargo-clippy` Cargo can find.
+    let cargo_home = tempfile::tempdir().unwrap();
+    let first = tempfile::tempdir().unwrap();
+    let second = tempfile::tempdir().unwrap();
+    let run = |checkout: &Path, report: &str| {
+        let project = checkout.join("project");
+        write_project(&project);
+        let profile = checkout.join("profile/bin");
+        std::fs::create_dir_all(&profile).unwrap();
+        for program in ["cargo-clippy", "clippy-driver"] {
+            std::os::unix::fs::symlink(installed.with_file_name(program), profile.join(program))
+                .unwrap();
+        }
+        let path = std::env::join_paths(std::iter::once(profile).chain(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        )))
+        .unwrap();
+        cargo_with(
+            &project,
+            store.path(),
+            &reports.path().join(report),
+            &["clippy", "--offline"],
+            &[
+                ("PATH", path.to_str().unwrap()),
+                ("CARGO_HOME", cargo_home.path().to_str().unwrap()),
+            ],
+        )
+        .0
+    };
+
+    let cold = run(first.path(), "first.json");
+    assert!(
+        count(&cold, "stored_bytes") > 0,
+        "the member's check should be stored: {cold}"
+    );
+    let warm = run(second.path(), "second.json");
+    assert_eq!(
+        count(&warm, "unconsulted"),
+        0,
+        "the member was not looked up through the second profile: {warm}"
+    );
+    assert!(
+        count(&warm, "hits") > 0,
+        "the member should restore: {warm}"
+    );
+}
+
+/// The toolchain's own `cargo-clippy`, by its resolved path, when it has a
+/// `clippy-driver` beside it.
+#[cfg(unix)]
+fn installed_cargo_clippy() -> Option<PathBuf> {
+    let output = Command::new("rustc")
+        .args(["--print", "sysroot"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())?;
+    let sysroot = PathBuf::from(String::from_utf8(output.stdout).ok()?.trim());
+    let installed = std::fs::canonicalize(sysroot.join("bin/cargo-clippy")).ok()?;
+    installed
+        .with_file_name("clippy-driver")
+        .is_file()
+        .then_some(installed)
+}
+
 #[test]
 fn rustdoc_pages_restore_and_rebuild_the_shared_index() {
     let store = tempfile::tempdir().unwrap();

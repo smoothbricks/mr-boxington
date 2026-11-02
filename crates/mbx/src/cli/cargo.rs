@@ -471,6 +471,9 @@ fn cargo_with_settings_bypass_log_and_roots(
         &roots.workspace_root,
         session_dir.path(),
     )?;
+    // What Cargo will run: an alias that expands to `clippy` reaches Clippy too.
+    #[cfg(unix)]
+    let clippy = super::clippy::ClippyRoute::prepare(&expanded, session_dir.path())?;
     let cargo_jobs = cargo_job_limit(&expanded);
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -592,6 +595,10 @@ fn cargo_with_settings_bypass_log_and_roots(
         }
         if let Some(test_runner) = &test_runner {
             test_runner.environment(&mut environment)?;
+        }
+        #[cfg(unix)]
+        if let Some(clippy) = &clippy {
+            clippy.environment(&mut environment)?;
         }
         if settings.plain_output {
             environment.insert("CARGO_TERM_PROGRESS_WHEN".into(), "never".into());
