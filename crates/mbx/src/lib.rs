@@ -67,6 +67,7 @@ mod managed_linker;
 mod materialize;
 mod object_cleanup;
 mod out_dir;
+mod pch_identity;
 mod pressure;
 mod retired;
 mod rustc;

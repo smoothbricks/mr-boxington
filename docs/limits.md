@@ -430,7 +430,15 @@ recorded inside it. mbx asks Clang to list the precompiled headers it loads
 (the driver's `-fmodule-file-deps`), so each one in a chain is an input keyed by its
 contents as well. A precompiled header records the paths and modification
 times of the headers it was built from, so one rebuilt in another directory
-has other bytes, and the compilations that use it miss there. Clang refuses a
+has other bytes. A precompiled header built under mbx (`-Xclang -emit-pch`
+with `-x c-header` or `-x c++-header`, through a shim or a launcher) is never
+stored or restored, since one from another checkout would make the headers it
+reaches name that checkout's files. mbx records instead which build produced
+its bytes, keyed like any compilation by its arguments and the headers it read,
+and a compilation that uses it is keyed by that build. Two checkouts that build
+the same precompiled header from the same headers and flags therefore share the
+compilations that use it. One built outside mbx is keyed by its bytes, and the
+compilations that use it miss in every other directory. Clang refuses a
 precompiled header whose header changed since it was built, by content or by
 modification time alone. A changed header changes the key, so that refusal is
 never masked by a hit. A header whose modification time alone changed keeps

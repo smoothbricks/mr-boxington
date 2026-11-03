@@ -508,9 +508,10 @@ fn a_precompiled_header_compilation_asks_the_driver_for_module_file_deps() {
     );
 }
 
-/// Only the frontend options that name a precompiled header and its header
-/// are modeled. A pair cut short, any other frontend option, and building a
-/// precompiled header still bypass.
+/// Only the frontend options that name a precompiled header and its header,
+/// and the two a precompiled header's own build takes, are modeled. A pair cut
+/// short, any other frontend option, `-emit-pch` with no header language, and
+/// the driver's `-emit-pch` still bypass.
 #[test]
 fn other_frontend_options_and_building_a_precompiled_header_bypass() {
     for (spelling, kind) in [
@@ -521,7 +522,7 @@ fn other_frontend_options_and_building_a_precompiled_header_bypass() {
             "tool-passthrough",
         ),
         (&["-Xclang", "-fno-validate-pch"], "tool-passthrough"),
-        (&["-Xclang", "-emit-pch"], "tool-passthrough"),
+        (&["-Xclang", "-emit-pch"], "precompiled-header"),
         (&["-emit-pch"], "precompiled-header"),
     ] {
         // Last, so that a pair cut short is cut short by the end of argv.
@@ -533,6 +534,41 @@ fn other_frontend_options_and_building_a_precompiled_header_bypass() {
             "{spelling:?}"
         );
     }
+}
+
+/// Bun's `pch` rule, through its launcher: a precompiled header's build, with
+/// the frontend's `-emit-pch`, `-fno-pch-timestamp`, a `-x c++-header` stub
+/// and the wrapper header it includes. A header language without `-emit-pch`
+/// bypasses, as `-emit-pch` without one does.
+#[test]
+fn a_precompiled_headers_own_build_parses_as_one() {
+    let arguments = argv(&[
+        "-Winvalid-pch",
+        "-fpch-instantiate-templates",
+        "-Xclang",
+        "-fno-pch-timestamp",
+        "-Xclang",
+        "-emit-pch",
+        "-Xclang",
+        "-include",
+        "-Xclang",
+        "pch/root-pch.h.hxx",
+        "-x",
+        "c++-header",
+        "-c",
+        "pch/root-pch.h.hxx.cxx",
+        "-o",
+        "pch/root-pch.h.hxx.pch",
+    ]);
+    let invocation = CcInvocation::parse(&arguments).expect("the pch rule should parse");
+    assert!(invocation.emits_precompiled_header());
+    let plain = CcInvocation::parse(&argv(&["-c", "-o", "a.o", "a.cpp"])).unwrap();
+    assert!(!plain.emits_precompiled_header());
+    let header_only = argv(&["-x", "c++-header", "-c", "-o", "a.pch", "a.h"]);
+    assert_eq!(
+        CcInvocation::parse(&header_only).unwrap_err().kind(),
+        "precompiled-header"
+    );
 }
 
 #[test]

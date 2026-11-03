@@ -85,6 +85,10 @@ pub fn compile(compiler: &OsStr, arguments: &[OsString], language: CcLanguage) -
         inputs: Vec::new(),
     };
 
+    if invocation.emits_precompiled_header() {
+        drop(setup);
+        return build_precompiled_header(compiler, &invocation, &compiler_arguments, context);
+    }
     drop(setup);
     let invocation_digest = prediction_invocation(&invocation.invocation_digest(&context)?);
     let _verification = session::verification::select(|| Ok(invocation_digest.clone()))?;
@@ -115,6 +119,7 @@ pub fn compile(compiler: &OsStr, arguments: &[OsString], language: CcLanguage) -
     if let Some((prediction, discovered)) = usable {
         let mut candidate = context.clone();
         discovered.clone().apply_to(&mut candidate)?;
+        crate::pch_identity::substitute(&mut candidate);
         let action = crate::phase_timing::measure("key", || {
             invocation.action_with_path_binding(candidate, prediction.path_specific)
         })?;
@@ -383,17 +388,81 @@ pub fn compile(compiler: &OsStr, arguments: &[OsString], language: CcLanguage) -
     // may land in a directory the compilation searched for headers, and a
     // file appearing there between the two manifest snapshots would read as
     // a header that appeared mid-compile.
-    if invocation.caller_depfile().is_some() {
-        match mbx_cache_cc::CcDepfile::read_for(&depfile, context.compiler.family) {
-            Ok(listed) => {
-                write_caller_depfile(&invocation, listed.files.iter().map(PathBuf::as_path))
-            }
-            Err(error) => session::report_shim_warning(&format!(
-                "the caller's dependency list was not written: {error}"
-            )),
+    write_listed_caller_depfile(&invocation, &depfile, context.compiler.family);
+    Ok(exit_code(output.status))
+}
+
+/// Build a precompiled header and record which build produced its bytes
+/// ([`crate::pch_identity`]). The PCH itself is never stored or restored: it
+/// records where its headers were, so one from another checkout would make
+/// the headers it reaches name that checkout's files. Its build is counted as
+/// the bypass it is.
+fn build_precompiled_header(
+    compiler: &OsStr,
+    invocation: &CcInvocation,
+    compiler_arguments: &[OsString],
+    mut context: CcActionContext,
+) -> Result<ExitCode> {
+    let depfile_staging = staging_directory()?;
+    let depfile = depfile_staging.path().join("compile.d");
+    let mut command = Command::new(compiler);
+    command.args(compiler_arguments);
+    command.args(invocation.dependency_arguments_for(&depfile, context.compiler.family));
+    let output = crate::phase_timing::measure("compiler", || {
+        crate::supervision::output(&mut command, true)
+    })
+    .wrap_err_with(|| format!("failed to run {}", Path::new(compiler).display()))?;
+    session::record_cc_bypass(&eyre::Report::new(CcBypassReason::PrecompiledHeader(
+        "built under mbx: its bytes are recorded for the compilations that use it, never served"
+            .into(),
+    )));
+    replay_bytes(&output.stdout, &output.stderr)?;
+    if output.status.success() {
+        let pch = invocation.output_in(&context.working_dir);
+        if let Err(error) = record_precompiled_header(invocation, &mut context, &depfile, &pch) {
+            session::report_shim_warning(&format!(
+                "the precompiled header {} was not recorded: {error:#}",
+                pch.display()
+            ));
         }
+        write_listed_caller_depfile(invocation, &depfile, context.compiler.family);
     }
     Ok(exit_code(output.status))
+}
+
+/// Key the precompiled header's own build from the headers it read and record
+/// that key against the bytes it wrote.
+fn record_precompiled_header(
+    invocation: &CcInvocation,
+    context: &mut CcActionContext,
+    depfile: &Path,
+    pch: &Path,
+) -> Result<()> {
+    let discovered = discover(invocation, context, depfile)?;
+    discovered.apply_to(context)?;
+    // A PCH built while another was loaded keys that one by its build too.
+    crate::pch_identity::substitute(context);
+    let action = invocation.action_with_path_binding(context.clone(), false)?;
+    crate::pch_identity::record(pch, &action.digest)
+}
+
+/// Write the dependency list the caller asked for, from the one the driver
+/// wrote for the shim. Owed whether or not anything was published: the build
+/// that asked for the list reads it next.
+fn write_listed_caller_depfile(
+    invocation: &CcInvocation,
+    depfile: &Path,
+    family: CcCompilerFamily,
+) {
+    if invocation.caller_depfile().is_none() {
+        return;
+    }
+    match mbx_cache_cc::CcDepfile::read_for(depfile, family) {
+        Ok(listed) => write_caller_depfile(invocation, listed.files.iter().map(PathBuf::as_path)),
+        Err(error) => session::report_shim_warning(&format!(
+            "the caller's dependency list was not written: {error}"
+        )),
+    }
 }
 
 /// Digest the inputs the compiler reported, build the key, and store the
@@ -424,6 +493,7 @@ fn publish(
     verify_search_path_unchanged(searchable, before)?;
     discovered.verify()?;
     discovered.clone().apply_to(context)?;
+    crate::pch_identity::substitute(context);
     // Debug remapping does not change runtime strings such as __FILE__. If
     // an object retains a path, bind its action to the literal paths instead
     // of discarding it or restoring another checkout's runtime strings.
@@ -517,6 +587,7 @@ fn restore_flight_prediction(
     )?;
     let mut candidate = context.clone();
     discovered.clone().apply_to(&mut candidate)?;
+    crate::pch_identity::substitute(&mut candidate);
     let action = crate::phase_timing::measure("key", || {
         invocation.action_with_path_binding(candidate, prediction.path_specific)
     })?;

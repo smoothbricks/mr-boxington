@@ -9562,6 +9562,70 @@ fn a_compilation_using_a_precompiled_header_hits_until_its_header_changes() {
     assert_ne!(first, std::fs::read(project.join("tu.o")).unwrap());
 }
 
+/// A precompiled header records its headers' absolute paths, so the same PCH
+/// built in two checkouts has two sets of bytes. Built under `mbx exec`, as
+/// Bun's `pch` rule is through its launcher, the PCH is never served from the
+/// cache, but mbx records which build produced those bytes; a compilation
+/// using it is keyed by that build rather than by the bytes, so a second
+/// checkout that built the same PCH from the same headers and flags hits.
+#[cfg(unix)]
+#[test]
+fn a_precompiled_header_built_under_mbx_keys_its_users_alike_in_every_checkout() {
+    if !has_c_compiler() {
+        return;
+    }
+    let version = Command::new("cc").arg("--version").output().unwrap();
+    if !String::from_utf8_lossy(&version.stdout).contains("clang") {
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let cache = directory.path().join("cache");
+    let build = |checkout: &str| {
+        let project = directory.path().join(checkout).join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("tu.c"), "int value(void) { return VALUE; }\n").unwrap();
+        std::fs::write(project.join("root.h"), "#define VALUE 7\n").unwrap();
+        let report = directory.path().join(format!("{checkout}.json"));
+        let output = mbx_command()
+            .current_dir(&project)
+            .env("MBX_CACHE_DIR", &cache)
+            .env("MBX_STATS_REPORT", &report)
+            .env("MBX_GC_AUTO", "0")
+            .args([
+                "exec",
+                "--project-root",
+                ".",
+                "sh",
+                "-c",
+                "cc -Xclang -fno-pch-timestamp -Xclang -emit-pch -x c-header -c root.h -o root.h.pch \
+                 && cc -Xclang -include-pch -Xclang root.h.pch -Xclang -include -Xclang root.h -c tu.c -o tu.o",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        std::fs::read(&report)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .map_or(0, |stats| count(&stats, "hits"))
+    };
+    build("a");
+    let a = directory.path().join("a/project/root.h.pch");
+    let b = directory.path().join("b/project/root.h.pch");
+    let hits = build("b");
+    assert_ne!(
+        std::fs::read(&a).unwrap(),
+        std::fs::read(&b).unwrap(),
+        "the fixture's two precompiled headers should differ in the paths they record"
+    );
+    assert_eq!(
+        hits, 1,
+        "the user of a precompiled header built from the same headers and flags should hit in another checkout"
+    );
+}
 /// A precompiled header built while another was loaded is chained: a
 /// compilation that uses it makes Clang load the first one from the path
 /// recorded inside it, and Clang's dependency list leaves module files out

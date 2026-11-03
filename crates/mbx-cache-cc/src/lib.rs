@@ -188,6 +188,9 @@ const SUPPORTED_F_FLAGS: &[&str] = &[
     "no-unroll-loops",
     "no-unwind-tables",
     "omit-frame-pointer",
+    // Instantiates the templates a precompiled header declares while it is
+    // built; only `-emit-pch` builds read it.
+    "pch-instantiate-templates",
     "pic",
     "pie",
     // Seeds names GCC makes up, such as those of anonymous namespaces; nixpkgs
@@ -1007,6 +1010,9 @@ pub struct CcInvocation {
     /// Positions in the parsed command line of the dependency-list flags the
     /// caller passed, which the shim leaves out when it runs the driver.
     dependency_argument_indices: Vec<usize>,
+    /// Whether this compilation builds a precompiled header (`-Xclang
+    /// -emit-pch` with a `-x c-header` or `-x c++-header` source).
+    emits_precompiled_header: bool,
 }
 
 /// A dependency list the caller asked the driver to write beside the object.
@@ -1121,6 +1127,14 @@ impl CcInvocation {
     /// Files that must appear among the discovered inputs.
     pub fn required_inputs(&self) -> &[PathBuf] {
         &self.required_inputs
+    }
+
+    /// Whether this compilation builds a precompiled header rather than an
+    /// object. Its output is never served from the cache: a PCH records where
+    /// its headers were, so one from another checkout would make the headers
+    /// it reaches name that checkout's files.
+    pub fn emits_precompiled_header(&self) -> bool {
+        self.emits_precompiled_header
     }
 
     /// Language the driver compiles.
@@ -1882,6 +1896,8 @@ struct Parser<'a> {
     compiling: bool,
     preprocessing: bool,
     dependency: DependencyRequest,
+    header_language: bool,
+    emits_precompiled_header: bool,
 }
 
 /// What the caller's `-M` flags asked for, gathered while parsing.
@@ -1915,6 +1931,8 @@ impl<'a> Parser<'a> {
             compiling: false,
             preprocessing: false,
             dependency: DependencyRequest::default(),
+            header_language: false,
+            emits_precompiled_header: false,
         }
     }
 
@@ -1955,6 +1973,15 @@ impl<'a> Parser<'a> {
         }
         if self.preprocessing && self.dependency.file.as_deref() == Some(Path::new("-")) {
             return Err(CcBypassReason::CallerDependencyFlags("-E -MF -".into()));
+        }
+        // A header language builds a precompiled header only with `-emit-pch`,
+        // and `-emit-pch` builds one only from a header language; any other
+        // pairing is not one this adapter models.
+        if self.header_language != self.emits_precompiled_header {
+            return Err(CcBypassReason::PrecompiledHeader(
+                "-emit-pch without a header language, or a header language without -emit-pch"
+                    .into(),
+            ));
         }
         let language = self.language(&source)?;
         let preprocessed_assembly = self.preprocessed_assembly
@@ -2012,6 +2039,7 @@ impl<'a> Parser<'a> {
             sysroot: self.sysroot,
             caller_depfile,
             dependency_argument_indices: self.dependency.indices,
+            emits_precompiled_header: self.emits_precompiled_header,
         })
     }
 
@@ -2094,9 +2122,11 @@ impl<'a> Parser<'a> {
     }
 
     /// `-Xclang -include-pch -Xclang <pch>` or `-Xclang -include -Xclang
-    /// <header>`, consumed whole after the leading `-Xclang`. Any other
-    /// frontend option, or a pair spelled differently, answers `false` and is
-    /// left to the passthrough bypass.
+    /// <header>`, consumed whole after the leading `-Xclang`, and the two
+    /// frontend options a precompiled header's own build takes, `-Xclang
+    /// -emit-pch` and `-Xclang -fno-pch-timestamp`. Any other frontend option,
+    /// or a pair spelled differently, answers `false` and is left to the
+    /// passthrough bypass.
     fn parse_frontend_precompiled_header(&mut self) -> Result<bool, CcBypassReason> {
         let text = |index: usize| {
             self.arguments.get(index).map(|argument| {
@@ -2107,6 +2137,15 @@ impl<'a> Parser<'a> {
         };
         let option = match text(self.index).transpose()? {
             Some(option @ ("-include-pch" | "-include")) => option,
+            Some(option @ ("-emit-pch" | "-fno-pch-timestamp")) => {
+                if option == "-emit-pch" {
+                    self.emits_precompiled_header = true;
+                }
+                self.index += 1;
+                self.parsed
+                    .push(Argument::Plain(format!("-Xclang {option}")));
+                return Ok(true);
+            }
             _ => return Ok(false),
         };
         let flag = format!("-Xclang {option}");
@@ -2326,6 +2365,14 @@ impl<'a> Parser<'a> {
                     CcLanguage::C
                 }
                 "c++" => CcLanguage::Cxx,
+                "c-header" => {
+                    self.header_language = true;
+                    CcLanguage::C
+                }
+                "c++-header" => {
+                    self.header_language = true;
+                    CcLanguage::Cxx
+                }
                 other => return Err(CcBypassReason::UnsupportedLanguage(other.into())),
             });
             self.parsed.push(Argument::Plain(format!("-x{language}")));
@@ -2482,6 +2529,7 @@ impl<'a> MsvcParser<'a> {
             sysroot: None,
             caller_depfile: None,
             dependency_argument_indices: Vec::new(),
+            emits_precompiled_header: false,
         })
     }
 

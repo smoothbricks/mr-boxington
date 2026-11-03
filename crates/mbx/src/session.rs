@@ -259,6 +259,7 @@ pub struct CacheSession {
     incremental_root: PathBuf,
     /// Where the shim keeps content-addressed copies of build-script output.
     out_dir_root: PathBuf,
+    pch_identity_root: PathBuf,
     /// Active leases keep collection from deleting checkout-private state
     /// while this session's compiler processes may still be using it.
     incremental_leases: Mutex<Vec<crate::incremental::ActiveLease>>,
@@ -416,6 +417,7 @@ impl CacheSession {
             store,
             incremental_root: config.cache_dir.join("incremental"),
             out_dir_root: config.cache_dir.join(crate::out_dir::ROOT),
+            pch_identity_root: config.cache_dir.join(crate::pch_identity::ROOT),
             incremental_leases: Mutex::new(Vec::new()),
             ledger_dir: Mutex::new(None),
             ledger_stamp: Arc::new(Mutex::new(None)),
@@ -500,6 +502,10 @@ impl CacheSession {
         environment.insert(
             crate::out_dir::ROOT_ENV.into(),
             self.out_dir_root.to_string_lossy().into_owned(),
+        );
+        environment.insert(
+            crate::pch_identity::ROOT_ENV.into(),
+            self.pch_identity_root.to_string_lossy().into_owned(),
         );
         // Always replace an inherited value. If recording this checkout fails,
         // the shim must use its target-local fallback rather than another
@@ -784,6 +790,10 @@ impl CacheSession {
         environment.insert(
             crate::out_dir::ROOT_ENV.into(),
             self.out_dir_root.to_string_lossy().into_owned(),
+        );
+        environment.insert(
+            crate::pch_identity::ROOT_ENV.into(),
+            self.pch_identity_root.to_string_lossy().into_owned(),
         );
         environment.insert(
             SHARE_OUT_DIR_ENV.into(),
@@ -2617,7 +2627,7 @@ pub(crate) fn report_rustc_store_failure(crate_name: &str, error: &eyre::Report)
 ///
 /// Kinds are prefixed so that a reason the two adapters share by name, such as
 /// an unmodeled flag, does not merge into one statistic covering both.
-fn record_cc_bypass(error: &eyre::Report) {
+pub(crate) fn record_cc_bypass(error: &eyre::Report) {
     let reason = error.downcast_ref::<mbx_cache_cc::CcBypassReason>();
     let kind = reason.map_or_else(
         || "cc-other".to_string(),
