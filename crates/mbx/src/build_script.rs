@@ -1043,10 +1043,17 @@ impl CompilationInputs {
             } else if let Some(name) = directive.strip_prefix("rerun-if-env-changed=")
                 && !name.is_empty()
             {
+                // A variable the shim shares (OUT_DIR and each name
+                // MBX_SHARE_ENV lists) is read as the build gave it: the shim
+                // swaps in its stable copy after this digest is taken and
+                // before `verify` takes it again.
+                let shared = crate::out_dir::shared_names()
+                    .iter()
+                    .any(|shared| shared == name);
                 let value = if name == "OUT_DIR" {
                     Some(self.out_dir.as_os_str().to_owned())
                 } else {
-                    std::env::var_os(name)
+                    crate::out_dir::given_value(name)
                 }
                 .map(|value| {
                     value
@@ -1054,10 +1061,11 @@ impl CompilationInputs {
                         .map_err(|_| eyre::eyre!("environment input is not UTF-8: {name}"))
                 })
                 .transpose()?
-                // Cargo's `OUT_DIR` names the checkout; the placeholder lets
-                // checkouts with the same declarations share a key.
+                // A shared variable names a tree in the checkout; the
+                // placeholder lets checkouts with the same declarations share
+                // a key.
                 .map(|value| {
-                    if name == "OUT_DIR" {
+                    if shared {
                         normalize_environment_value(&value, &self.mappings)
                     } else {
                         value
@@ -2824,6 +2832,72 @@ mod tests {
                 .unwrap()
                 .input
                 .digest
+        });
+        assert_eq!(digests[0], digests[1]);
+    }
+
+    #[test]
+    fn a_declared_shared_variable_survives_the_shim_replacing_it_and_keys_checkouts_alike() {
+        // A build that hands rustc generated sources through a variable of its
+        // own names it in MBX_SHARE_ENV, and its build script declares the
+        // variable as an input. Replacing it is process-wide, so the fixture
+        // runs in a child process of its own.
+        const CHILD_ENV: &str = "MBX_TEST_DECLARED_SHARED_VARIABLE";
+        const NAME: &str = "build_script::tests::a_declared_shared_variable_survives_the_shim_replacing_it_and_keys_checkouts_alike";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([NAME, "--exact"])
+                .env(CHILD_ENV, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout)
+                        .contains("test result: ok. 1 passed"),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let digests = [(); 2].map(|()| {
+            let package = tempfile::tempdir().unwrap();
+            let generated = package.path().join("gen");
+            std::fs::create_dir_all(&generated).unwrap();
+            std::fs::write(generated.join("options.rs"), "pub const A: u8 = 1;\n").unwrap();
+            let source = package.path().join("src/lib.rs");
+            std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+            std::fs::write(
+                &source,
+                "include!(concat!(env!(\"GEN_DIR\"), \"/options.rs\"));\n",
+            )
+            .unwrap();
+            let out_dir = package.path().join("target/debug/build/fixture/out");
+            std::fs::create_dir_all(&out_dir).unwrap();
+            std::fs::write(
+                out_dir.parent().unwrap().join("output"),
+                "cargo::rerun-if-env-changed=GEN_DIR\n",
+            )
+            .unwrap();
+            unsafe {
+                std::env::set_var(crate::out_dir::SHARE_ENV, "GEN_DIR");
+                std::env::set_var(session::SHARE_OUT_DIR_ENV, "1");
+                std::env::set_var(crate::out_dir::ROOT_ENV, root.path());
+                std::env::set_var(session::WORKSPACE_ROOT_ENV, package.path());
+                std::env::set_var("GEN_DIR", &generated);
+            }
+            let inputs = CompilationInputs::read(&out_dir, package.path()).unwrap();
+            // The shim hands rustc the stable copy after the key is taken.
+            crate::out_dir::stabilize_for(&source);
+            assert_ne!(
+                std::env::var_os("GEN_DIR").unwrap(),
+                generated.as_os_str(),
+                "the fixture's GEN_DIR was not replaced by a stable copy"
+            );
+            inputs.verify().unwrap();
+            crate::out_dir::restore();
+            inputs.input.digest
         });
         assert_eq!(digests[0], digests[1]);
     }
