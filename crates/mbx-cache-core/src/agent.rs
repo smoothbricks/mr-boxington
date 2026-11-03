@@ -26,6 +26,7 @@ mod file_digest;
 mod manifest;
 mod prefetch;
 mod stats;
+mod timestamp_macros;
 mod wire;
 
 #[cfg(test)]
