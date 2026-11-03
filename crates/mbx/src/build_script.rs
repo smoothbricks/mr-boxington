@@ -2492,13 +2492,13 @@ mod tests {
 
         retarget_launcher(&launcher, &receiver, 3).unwrap();
 
-        assert_eq!(
-            std::fs::read_to_string(&launcher).unwrap(),
-            format!(
-                "#!{}/.mbx-build-script-shims/0123/mbx\n",
-                receiver.display()
-            )
-        );
+        // The temporary directory's length is the test machine's: a receiving
+        // pin path the kernel will take from a shebang gets the direct
+        // launcher, a longer one the relative launcher three levels up.
+        let pin = receiver.join(".mbx-build-script-shims/0123/mbx");
+        let expected = absolute_shebang(&pin)
+            .unwrap_or_else(|| shell_launcher(Path::new(".mbx-build-script-shims/0123/mbx"), 3));
+        assert_eq!(std::fs::read_to_string(&launcher).unwrap(), expected);
         assert_eq!(
             std::fs::metadata(&launcher).unwrap().modified().unwrap(),
             modified
