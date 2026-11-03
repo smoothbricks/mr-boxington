@@ -172,6 +172,7 @@ pub(crate) fn identity_for(
     refuse_nix_wrapped_link(
         &driver,
         Path::new(NIX_STORE),
+        fuse_ld,
         std::env::vars_os().map(|(name, _)| name),
     )?;
     let mut environment = IDENTITY_ENVIRONMENT
@@ -1031,11 +1032,36 @@ fn sdk_description(sdk: &Path) -> Result<(String, String)> {
 /// libiconv store paths, would share a link key, and a hit would restore a
 /// binary naming the other shell's store paths. Such a link is left
 /// unidentified, so it bypasses.
+///
+/// A link with no wrapper in it reads none of those variables: a driver that
+/// is no cc-wrapper, running the linker `-fuse-ld` names by absolute path,
+/// which is no bintools-wrapper either. Its variables are not refused. A
+/// linker the driver finds itself (no `-fuse-ld`, or one named by a word) may
+/// be a wrapper on `PATH`, so the variables still refuse it.
 fn refuse_nix_wrapped_link(
     driver: &Path,
     store: &Path,
+    fuse_ld: Option<&str>,
     names: impl IntoIterator<Item = OsString>,
 ) -> Result<()> {
+    let wrapper = crate::cc::nix_store_driver(driver, store)
+        .map_err(|reason| eyre::eyre!("{reason}"))?
+        .filter(|driver| driver.cc_wrapper);
+    if let Some(wrapper) = wrapper {
+        bail!(
+            "the linker driver {} is a Nix cc-wrapper, whose link reads variables and an SDK the linker identity does not cover",
+            wrapper.path.display()
+        );
+    }
+    if let Some(linker) = fuse_ld.map(Path::new).filter(|linker| linker.is_absolute()) {
+        if nix_bintools_wrapper(linker, store)? {
+            bail!(
+                "the linker {} is a Nix bintools-wrapper, whose link reads variables the linker identity does not cover",
+                linker.display()
+            );
+        }
+        return Ok(());
+    }
     let link_variable = names.into_iter().find(|name| {
         name.to_str().is_some_and(|name| {
             NIX_LINK_ENVIRONMENT.iter().any(|family| {
@@ -1050,16 +1076,25 @@ fn refuse_nix_wrapped_link(
             name.to_string_lossy()
         );
     }
-    let wrapper = crate::cc::nix_store_driver(driver, store)
-        .map_err(|reason| eyre::eyre!("{reason}"))?
-        .filter(|driver| driver.cc_wrapper);
-    if let Some(wrapper) = wrapper {
-        bail!(
-            "the linker driver {} is a Nix cc-wrapper, whose link reads variables and an SDK the linker identity does not cover",
-            wrapper.path.display()
-        );
-    }
     Ok(())
+}
+
+/// Whether `linker` resolves into a store entry that is a nixpkgs
+/// bintools-wrapper, which marks itself with `nix-support/orig-bintools`.
+fn nix_bintools_wrapper(linker: &Path, store: &Path) -> Result<bool> {
+    let path = std::fs::canonicalize(linker)
+        .wrap_err_with(|| format!("failed to resolve the linker {}", linker.display()))?;
+    let Some(entry) = path
+        .strip_prefix(store)
+        .ok()
+        .and_then(|rest| rest.components().next())
+    else {
+        return Ok(false);
+    };
+    let marker = store.join(entry).join("nix-support/orig-bintools");
+    marker
+        .try_exists()
+        .wrap_err_with(|| format!("failed to look for {}", marker.display()))
 }
 
 /// The string an XML property list's dictionary holds under `key`.

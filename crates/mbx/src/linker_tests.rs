@@ -605,7 +605,7 @@ fn a_link_a_nix_wrapper_shapes_is_not_identified() {
     let unwrapped = executable(store.join("bbbb-clang/bin/cc"));
     let system = executable(root.join("usr/bin/cc"));
     let refuse = |driver: &Path, names: &[&str]| {
-        refuse_nix_wrapped_link(driver, &store, names.iter().map(OsString::from))
+        refuse_nix_wrapped_link(driver, &store, None, names.iter().map(OsString::from))
     };
 
     assert!(refuse(&system, &[]).is_ok());
@@ -631,6 +631,39 @@ fn a_link_a_nix_wrapper_shapes_is_not_identified() {
         "NIX_CFLAGS_COMPILE",
     ] {
         assert!(refuse(&system, &[name]).is_ok(), "{name}");
+    }
+
+    // A driver that is no cc-wrapper, running the linker `-fuse-ld` names by
+    // absolute path, which is no bintools-wrapper either: no wrapper is in the
+    // link, so the variables only a wrapper reads reach nothing.
+    let lld = executable(store.join("cccc-lld/bin/ld64.lld"));
+    let wrapped_ld = executable(store.join("dddd-bintools-wrapper/bin/ld"));
+    std::fs::create_dir_all(store.join("dddd-bintools-wrapper/nix-support")).unwrap();
+    std::fs::write(
+        store.join("dddd-bintools-wrapper/nix-support/orig-bintools"),
+        "/nix/store/eeee-cctools\n",
+    )
+    .unwrap();
+    let variables = ["NIX_LDFLAGS", "NIX_HARDENING_ENABLE"].map(OsString::from);
+    let lld_path = lld.to_str().unwrap();
+    assert!(
+        refuse_nix_wrapped_link(&unwrapped, &store, Some(lld_path), variables.clone()).is_ok(),
+        "an unwrapped driver and linker were refused for variables they never read"
+    );
+    // Any wrapper in the link still refuses: the driver, a wrapped linker, or a
+    // linker named by a word the driver resolves itself, which may be one.
+    let wrapped_ld_path = wrapped_ld.to_str().unwrap();
+    for (driver, fuse_ld) in [
+        (&wrapped, Some(lld_path)),
+        (&unwrapped, Some(wrapped_ld_path)),
+        (&unwrapped, Some("lld")),
+        (&unwrapped, None),
+    ] {
+        assert!(
+            refuse_nix_wrapped_link(driver, &store, fuse_ld, variables.clone()).is_err(),
+            "{} with -fuse-ld={fuse_ld:?} was not refused",
+            driver.display()
+        );
     }
 }
 

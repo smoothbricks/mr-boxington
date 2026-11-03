@@ -170,7 +170,11 @@ native links are cached:
     link families (`NIX_LDFLAGS`, `NIX_CFLAGS_LINK`, `NIX_CXXSTDLIB_LINK`,
     `NIX_DYNAMIC_LINKER`, `NIX_HARDENING_ENABLE` and the rest, under any role or
     target spelling). The wrapper adds link flags from them, and on macOS picks
-    an SDK of its own, none of which the key covers.
+    an SDK of its own, none of which the key covers. A link with no wrapper in
+    it reads none of those variables, so they do not refuse it: a driver that
+    is no cc-wrapper, such as nixpkgs' `clang-unwrapped`, running the linker
+    `-C link-arg=-fuse-ld=<absolute path>` names, which is no bintools-wrapper
+    either.
 
 The same goes for a driver that names no linker or reports no version. mbx
 refuses these hosts rather than leaving the missing input out of the key: two
