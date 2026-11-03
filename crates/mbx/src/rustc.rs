@@ -3334,7 +3334,7 @@ fn selected_clippy_config(working_dir: &Path) -> Option<PathBuf> {
 /// Read straight off the argument list, because this runs before anything
 /// parses: the parser's own debug-map rule is exactly what the flag
 /// satisfies, so it has to be present going in.
-fn with_oso_prefix(arguments: &[OsString], cache_links: bool) -> Cow<'_, [OsString]> {
+pub(crate) fn with_oso_prefix(arguments: &[OsString], cache_links: bool) -> Cow<'_, [OsString]> {
     if !cfg!(target_os = "macos") || !cache_links {
         return Cow::Borrowed(arguments);
     }
@@ -3369,42 +3369,97 @@ fn with_oso_prefix(arguments: &[OsString], cache_links: bool) -> Cow<'_, [OsStri
         .map(PathBuf::from)
         .filter(|root| root.is_absolute() && out_dir.starts_with(root))
         .unwrap_or_else(|| standalone_target_root(&out_dir, None));
-    // ld64 resolves archive paths through Cargo's target symlink before
-    // recording them, so the prefix must use the same physical spelling.
-    let prefix = std::fs::canonicalize(&prefix).unwrap_or(prefix);
+    // rustc canonicalizes every `--extern` path before it hands the rlib to
+    // the linker, so through Cargo's target symlink those archives reach ld64
+    // under the physical target. An rlib rustc finds through `-L`, and the
+    // objects in `--out-dir`, keep the spelling they were given. So the prefix
+    // is the physical target root, and every target path a native link reads
+    // is given that spelling too: one prefix then strips them all, and the
+    // debug map names neither the checkout nor the managed target's digest.
+    // The files are the same ones, reached without the symlink.
+    let logical = prefix;
+    let prefix = std::fs::canonicalize(&logical).unwrap_or_else(|_| logical.clone());
     let mut extended = arguments.to_vec();
-    // Direct object paths use rustc's output spelling while archive paths are
-    // canonicalized by ld64. Give both the same spelling so one prefix covers
-    // them. This still writes through Cargo's target symlink to the same files.
     let native_output = arguments.iter().enumerate().any(|(index, argument)| {
         argument == "--test"
-            || matches!(
-                argument.to_str(),
-                Some("--crate-type=bin" | "--crate-type=proc-macro")
-            )
+            || argument
+                .to_str()
+                .and_then(|argument| argument.strip_prefix("--crate-type="))
+                .is_some_and(links_natively)
             || (argument == "--crate-type"
                 && arguments
                     .get(index + 1)
-                    .is_some_and(|value| matches!(value.to_str(), Some("bin" | "proc-macro"))))
+                    .and_then(|value| value.to_str())
+                    .is_some_and(links_natively))
     });
-    if native_output && let Ok(output) = std::fs::canonicalize(&out_dir) {
-        for index in 0..extended.len() {
-            if extended[index] == "--out-dir" {
-                if let Some(value) = extended.get_mut(index + 1) {
-                    *value = output.as_os_str().to_owned();
-                }
-            } else if extended[index]
-                .to_str()
-                .is_some_and(|arg| arg.starts_with("--out-dir="))
-            {
-                let mut value = OsString::from("--out-dir=");
-                value.push(&output);
-                extended[index] = value;
+    if native_output && prefix != logical {
+        let mut previous: Option<OsString> = None;
+        for argument in &mut extended {
+            let respelled = argument.to_str().and_then(|text| {
+                let after = previous.as_ref().and_then(|value| value.to_str());
+                physical_spelling(text, after, &logical, &prefix)
+            });
+            previous = Some(argument.clone());
+            if let Some(respelled) = respelled {
+                *argument = respelled.into();
             }
         }
     }
     extended.push(format!("-Clink-arg=-Wl,-oso_prefix,{}/", prefix.display()).into());
     Cow::Owned(extended)
+}
+
+/// Whether a `--crate-type` value is linked by the platform linker.
+fn links_natively(crate_types: &str) -> bool {
+    crate_types
+        .split(',')
+        .any(|kind| matches!(kind, "bin" | "proc-macro" | "cdylib" | "dylib"))
+}
+
+/// `argument` with a path under `logical` spelled under `physical` instead, or
+/// `None` when it names no such path. `previous` is the argument before it,
+/// for the value of a flag given apart from it: `--out-dir`, `-L`, `--extern`.
+fn physical_spelling(
+    argument: &str,
+    previous: Option<&str>,
+    logical: &Path,
+    physical: &Path,
+) -> Option<String> {
+    let respell = |path: &str| -> Option<String> {
+        let rest = Path::new(path).strip_prefix(logical).ok()?;
+        Some(physical.join(rest).to_str()?.to_owned())
+    };
+    // `-L [KIND=]PATH`, attached or apart.
+    let search = |value: &str| -> Option<String> {
+        match value.split_once('=') {
+            Some((kind, path)) => Some(format!("{kind}={}", respell(path)?)),
+            None => respell(value),
+        }
+    };
+    // `--extern NAME=PATH`, with or without the path.
+    let external = |value: &str| -> Option<String> {
+        let (name, path) = value.split_once('=')?;
+        Some(format!("{name}={}", respell(path)?))
+    };
+    match previous {
+        Some("--out-dir") => return respell(argument),
+        Some("-L") => return search(argument),
+        Some("--extern") => return external(argument),
+        _ => {}
+    }
+    if let Some(value) = argument.strip_prefix("--out-dir=") {
+        return respell(value).map(|path| format!("--out-dir={path}"));
+    }
+    if let Some(value) = argument.strip_prefix("--extern=") {
+        return external(value).map(|value| format!("--extern={value}"));
+    }
+    if let Some(value) = argument
+        .strip_prefix("-L")
+        .filter(|value| !value.is_empty())
+    {
+        return search(value).map(|value| format!("-L{value}"));
+    }
+    None
 }
 
 fn linker_for(invocation: &RustcInvocation) -> Result<Option<LinkerIdentity>> {

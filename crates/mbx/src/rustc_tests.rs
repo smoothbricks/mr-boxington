@@ -2037,6 +2037,88 @@ fn the_shim_appends_an_oso_prefix_for_cached_links() {
     );
 }
 
+/// rustc canonicalizes every `--extern` path before it hands the rlib to the
+/// linker, but keeps the spelling of an rlib it finds through `-L` and of the
+/// objects in `--out-dir`. With Cargo's target directory a symlink (a managed
+/// target), the debug map then named some inputs under the physical target
+/// and some under the checkout's link, and no one `-oso_prefix` stripped both:
+/// the checkout's path, or the managed target's digest, stayed in the binary.
+/// Every target path a native link reads is therefore spelled physically, a
+/// `cdylib` and a `dylib` included, and the prefix covers them all.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_native_link_spells_every_target_input_by_its_physical_path() {
+    if std::env::var_os("MBX_TEST_OSO_SPELLING").is_none() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "rustc::tests::a_native_link_spells_every_target_input_by_its_physical_path",
+            ])
+            .env("MBX_TEST_OSO_SPELLING", "1")
+            .env_remove(session::TARGET_DIR_ENV)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let physical = std::fs::canonicalize(directory.path())
+        .unwrap()
+        .join("managed");
+    std::fs::create_dir_all(physical.join("debug/deps")).unwrap();
+    let checkout = std::fs::canonicalize(directory.path())
+        .unwrap()
+        .join("checkout");
+    std::fs::create_dir_all(&checkout).unwrap();
+    std::os::unix::fs::symlink(&physical, checkout.join("target")).unwrap();
+    let logical = |rest: &str| format!("{}/target/{rest}", checkout.display());
+    let real = |rest: &str| format!("{}/{rest}", physical.display());
+
+    for crate_type in ["bin", "cdylib", "dylib", "proc-macro"] {
+        let arguments: Vec<OsString> = vec![
+            format!("--crate-type={crate_type}").into(),
+            "--out-dir".into(),
+            logical("debug/deps").into(),
+            "-L".into(),
+            format!("dependency={}", logical("debug/deps")).into(),
+            format!("-Ldependency={}", logical("debug/build/dep/0123/out")).into(),
+            "-L".into(),
+            "native=/usr/lib".into(),
+            "--extern".into(),
+            format!("dep={}", logical("debug/deps/libdep.rlib")).into(),
+            "src/lib.rs".into(),
+        ];
+        let extended = with_oso_prefix(&arguments, true);
+        let expected: Vec<OsString> = vec![
+            format!("--crate-type={crate_type}").into(),
+            "--out-dir".into(),
+            real("debug/deps").into(),
+            "-L".into(),
+            format!("dependency={}", real("debug/deps")).into(),
+            format!("-Ldependency={}", real("debug/build/dep/0123/out")).into(),
+            "-L".into(),
+            "native=/usr/lib".into(),
+            "--extern".into(),
+            format!("dep={}", real("debug/deps/libdep.rlib")).into(),
+            "src/lib.rs".into(),
+            format!("-Clink-arg=-Wl,-oso_prefix,{}/", physical.display()).into(),
+        ];
+        assert_eq!(extended.as_ref(), expected.as_slice(), "{crate_type}");
+    }
+
+    // A library compilation links nothing: its paths stay as Cargo spelled them.
+    let library: Vec<OsString> = vec![
+        "--crate-type=lib".into(),
+        "--out-dir".into(),
+        logical("debug/deps").into(),
+        "-L".into(),
+        format!("dependency={}", logical("debug/deps")).into(),
+        "src/lib.rs".into(),
+    ];
+    let extended = with_oso_prefix(&library, true);
+    assert_eq!(&extended[..library.len()], library.as_slice());
+}
+
 fn in_place_node(bytes: &[u8], executable: bool) -> CacheFileNode {
     CacheFileNode {
         digest: CacheDigest::blake3(bytes),

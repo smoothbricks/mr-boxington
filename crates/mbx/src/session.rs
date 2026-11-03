@@ -2114,7 +2114,9 @@ fn run_transparent_rustc(
     } else {
         Command::new(&rustc)
     };
-    command.args(&arguments);
+    // A link mbx does not cache still names its inputs in its debug map: the
+    // same prefix and physical spelling keep the checkout out of it.
+    command.args(crate::rustc::with_oso_prefix(&arguments, cache_links_requested()).as_ref());
     if let Some(flag) = incremental_flag {
         command.arg(flag);
     }
