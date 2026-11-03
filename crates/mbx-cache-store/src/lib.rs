@@ -2123,6 +2123,13 @@ fn gc_with_mode(
     outcome.removed_bytes += manifests.removed_bytes;
 
     let mut virtually_removed = already_removed;
+    let cas = LocalCas::new(store);
+    // Every result is dropped with its descriptor blob (the dangling pass below
+    // finds it gone), so evicting that blob frees the result's bytes as well.
+    // Counting them only in that pass kept the store looking over budget after
+    // a result's objects were all gone, and the sweep evicted a newer object
+    // in its place. A result's name is its action digest, so no file is read.
+    let mut freed_results = HashSet::new();
     if live_bytes > max_bytes {
         // Reachability costs a read per action result and per output tree, so
         // it is computed only when something is actually about to be evicted.
@@ -2142,17 +2149,32 @@ fn gc_with_mode(
         // each class goes oldest-first. A store with no records at all roots
         // nothing and this is exactly the LRU it was before.
         objects.sort_by_cached_key(|entry| (rooted.contains(&entry.path), entry.used));
-        let evicted = evict_objects(&objects, &rooted, live_bytes, max_bytes, |path| {
-            if dry_run {
-                virtually_removed.insert(path.to_path_buf());
-                Ok(Removal::Removed)
-            } else {
-                remove(path)
-            }
-        })?;
+        let dependents = results
+            .iter()
+            .filter_map(|entry| {
+                let action = digest_from_path(&entry.path, true)?;
+                Some((cas.path_for(&action).ok()?, entry))
+            })
+            .collect::<HashMap<_, _>>();
+        let evicted = evict_objects(
+            &objects,
+            &rooted,
+            &dependents,
+            live_bytes,
+            max_bytes,
+            |path| {
+                if dry_run {
+                    virtually_removed.insert(path.to_path_buf());
+                    Ok(Removal::Removed)
+                } else {
+                    remove(path)
+                }
+            },
+        )?;
         live_bytes = evicted.remaining_bytes;
         outcome.removed_objects += evicted.removed_objects;
         outcome.removed_bytes += evicted.removed_bytes;
+        freed_results = evicted.freed_results;
     }
 
     // An action result whose objects are gone can only produce a miss, so drop
@@ -2168,7 +2190,6 @@ fn gc_with_mode(
     // pass planned to drop are accounted for by that pass, and a real run has
     // already deleted them, so neither makes this sweep walk trees.
     let walk_trees = outcome.removed_objects > 0;
-    let cas = LocalCas::new(store);
     let mut trees = HashMap::new();
     for entry in &results {
         match action_result_is_dangling(
@@ -2251,14 +2272,28 @@ fn gc_with_mode(
         };
         match removal {
             Removal::Removed => {
-                live_bytes = live_bytes.saturating_sub(entry.size);
+                // Bytes the eviction already counted are not freed twice.
+                if !freed_results.remove(&entry.path) {
+                    live_bytes = live_bytes.saturating_sub(entry.size);
+                }
                 outcome.removed_action_results += 1;
                 outcome.removed_bytes += entry.size;
             }
-            Removal::Missing => live_bytes = live_bytes.saturating_sub(entry.size),
+            Removal::Missing => {
+                if !freed_results.remove(&entry.path) {
+                    live_bytes = live_bytes.saturating_sub(entry.size);
+                }
+            }
             Removal::Blocked => {}
         }
     }
+    // A result counted as freed that this pass kept after all -- repaired since
+    // the eviction, or held by another process -- still occupies the store.
+    live_bytes += results
+        .iter()
+        .filter(|entry| freed_results.contains(&entry.path))
+        .map(|entry| entry.size)
+        .sum::<u64>();
 
     let sessions = prune_sessions(store, dry_run)?;
     outcome.removed_session_streams += sessions.removed_streams;
@@ -3094,13 +3129,17 @@ struct ObjectEvictions {
     removed_objects: u64,
     removed_bytes: u64,
     remaining_bytes: u64,
+    /// Results whose descriptor blob this pass evicted, already counted as freed.
+    freed_results: HashSet<PathBuf>,
 }
 
 /// Evict sorted objects without crossing the checkout-protection boundary
-/// when an unrooted object cannot be removed.
+/// when an unrooted object cannot be removed. `dependents` maps a descriptor
+/// blob to the result named after it, which goes with it.
 fn evict_objects(
     objects: &[Entry],
     rooted: &HashSet<PathBuf>,
+    dependents: &HashMap<PathBuf, &Entry>,
     mut live_bytes: u64,
     max_bytes: u64,
     mut remove_file: impl FnMut(&Path) -> Result<Removal>,
@@ -3118,13 +3157,21 @@ fn evict_objects(
             // invert the protection ordering this collector promises.
             break;
         }
-        match remove_file(&entry.path)? {
+        let removal = remove_file(&entry.path)?;
+        if matches!(removal, Removal::Removed | Removal::Missing) {
+            live_bytes = live_bytes.saturating_sub(entry.size);
+            if let Some(result) = dependents.get(&entry.path)
+                && outcome.freed_results.insert(result.path.clone())
+            {
+                live_bytes = live_bytes.saturating_sub(result.size);
+            }
+        }
+        match removal {
             Removal::Removed => {
-                live_bytes = live_bytes.saturating_sub(entry.size);
                 outcome.removed_objects += 1;
                 outcome.removed_bytes += entry.size;
             }
-            Removal::Missing => live_bytes = live_bytes.saturating_sub(entry.size),
+            Removal::Missing => {}
             Removal::Blocked if !is_rooted => blocked_unrooted = true,
             Removal::Blocked => {}
         }
