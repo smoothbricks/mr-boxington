@@ -449,6 +449,45 @@ async fn a_lookup_of_a_torn_blob_reports_a_miss_not_an_error() {
     }
 }
 
+/// Collection evicts the objects with the oldest access times, and a blob
+/// published by cloning its source carries that source's, so a store's newly
+/// stored objects ranked coldest and were evicted under the builds about to
+/// read them ("cached action is missing blob"). Storing a blob is a use, and
+/// the agent records it itself. Lookups are not: see
+/// `looking_a_result_up_is_not_a_use`.
+#[tokio::test]
+async fn a_stored_blob_records_its_own_use_not_its_sources() {
+    let directory = tempfile::tempdir().unwrap();
+    let agent = CacheAgent::new(directory.path().join("cache"), "test-version");
+    let long_ago = SystemTime::now() - Duration::from_secs(30 * 24 * 60 * 60);
+    let age = |path: &Path| {
+        std::fs::File::open(path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_accessed(long_ago))
+            .unwrap();
+    };
+    let used = |path: &Path| {
+        std::fs::metadata(path).unwrap().accessed().unwrap()
+            > long_ago + Duration::from_secs(24 * 60 * 60)
+    };
+
+    let source = directory.path().join("source");
+    std::fs::write(&source, b"stored object").unwrap();
+    age(&source);
+    let stored = CacheDigest::blake3(b"stored object");
+    let response = agent
+        .store_blob(&stored, &source, &mut ConnectionUploads::default())
+        .await
+        .unwrap();
+    let AgentResponse::Stored { path } = response else {
+        panic!("unexpected response {response:?}");
+    };
+    assert!(
+        used(&path),
+        "a stored blob records its own use, not its source's"
+    );
+}
+
 /// Blobs verified side by side still answer in request order, whether a
 /// digest was already remembered, is repeated, or is not stored at all, and
 /// every one found is remembered for the next lookup.

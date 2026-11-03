@@ -611,9 +611,10 @@ is always bounded. To stop creating managed targets, see
 
 Object eviction prefers abandoned checkout data and then the objects builds
 used longest ago. mbx records a use when a build restores an object, at most
-once a day per object, so the order is to the day and does not depend on the
-filesystem's access-time settings. A poor choice costs a recompile, not
-correctness.
+once a day per object, and when it stores one, so an object published by
+cloning a file with an old access time does not rank by its source's. The
+order is to the day and does not depend on the filesystem's access-time
+settings. A poor choice costs a recompile, not correctness.
 
 The action-store budget covers action objects and results. Prediction data,
 checkout records, and temporary downloads add overhead.

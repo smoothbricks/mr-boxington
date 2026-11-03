@@ -2072,10 +2072,12 @@ fn checkout_record_path(store: &Path, identity: &str, workspace_root: &Path) -> 
 /// least-recently-used by access time, falling back to modification time. A
 /// build that restores a result sets the access time of the result and every
 /// object it names itself, at most once a day, rather than trusting reads to:
-/// APFS, `noatime` and large Windows volumes do not refresh it on a read. So
-/// the order is right to the day, and an object nothing has restored since it
-/// was written ranks by its write. Evicting a live object costs a recompile,
-/// never correctness.
+/// APFS, `noatime` and large Windows volumes do not refresh it on a read. The
+/// cache agent also records the use of every blob it stores, so one published
+/// by cloning a file with an old access time does not rank by its source's.
+/// So the order is right to the day, and an object nothing has restored since
+/// it was written ranks by its write. Evicting a live object costs a
+/// recompile, never correctness.
 pub fn gc(store: &Path, max_bytes: u64) -> Result<GcOutcome> {
     gc_with_mode(
         store,
