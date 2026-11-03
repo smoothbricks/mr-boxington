@@ -203,6 +203,20 @@ pub(crate) fn restore() {
     LEASES.lock().unwrap().clear();
 }
 
+/// The value the build gave `name`, even after [`stabilize_for`] replaced it
+/// with a stable copy: what a build script's declared dependency on the
+/// variable names.
+pub(crate) fn given_value(name: &str) -> Option<std::ffi::OsString> {
+    ORIGINAL
+        .lock()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|(replaced, _)| replaced == name)
+        .map(|(_, given)| given.clone())
+        .or_else(|| std::env::var_os(name))
+}
+
 /// Compiler output as the person running Cargo should see it.
 ///
 /// rustc reads the stable copy of each shared variable's tree, `OUT_DIR` and
