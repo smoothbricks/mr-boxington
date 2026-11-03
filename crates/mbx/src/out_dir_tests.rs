@@ -9,6 +9,52 @@ fn write_tree(root: &Path, files: &[(&str, &[u8])]) {
 }
 
 #[test]
+fn a_listed_variable_is_shared_for_a_crate_that_reads_it_through_another_crates_macro() {
+    // Bun's bun_ast reads BUN_CODEGEN_DIR through bun_core's macro, so its own
+    // sources never spell the name. Replacing the variable is process-wide, so
+    // the fixture runs in a child process of its own.
+    const CHILD_ENV: &str = "MBX_TEST_LISTED_VARIABLE_UNSCANNED";
+    const NAME: &str = "out_dir::tests::a_listed_variable_is_shared_for_a_crate_that_reads_it_through_another_crates_macro";
+    if std::env::var_os(CHILD_ENV).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([NAME, "--exact"])
+            .env(CHILD_ENV, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout).contains("test result: ok. 1 passed"),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let generated = directory.path().join("build/codegen");
+    write_tree(&generated, &[("options.rs", b"pub const A: u8 = 1;\n")]);
+    let source = directory.path().join("src/ast/lib.rs");
+    write_tree(
+        &directory.path().join("src/ast"),
+        &[("lib.rs", b"bun_core::generated!(options);\n")],
+    );
+    unsafe {
+        std::env::set_var(SHARE_ENV, "GEN_DIR");
+        std::env::set_var(crate::session::SHARE_OUT_DIR_ENV, "1");
+        std::env::set_var(ROOT_ENV, directory.path().join("out-dirs"));
+        std::env::set_var("GEN_DIR", &generated);
+    }
+    stabilize_for(&source);
+    let shared = std::env::var_os("GEN_DIR").unwrap();
+    assert_ne!(
+        shared,
+        generated.as_os_str(),
+        "GEN_DIR was left at the build's own directory"
+    );
+    assert!(Path::new(&shared).starts_with(directory.path().join("out-dirs")));
+    restore();
+}
+#[test]
 fn a_lease_from_another_pid_namespace_does_not_block_a_compilation() {
     // Other tests restore OUT_DIR and clear the process-wide lease table.
     const CHILD_ENV: &str = "MBX_TEST_OUT_DIR_LEASE_COLLISION";

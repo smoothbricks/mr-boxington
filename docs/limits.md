@@ -567,9 +567,11 @@ or derives a value from it sees the same value in both checkouts.
 variables a crate reads to locate generated sources; Bun's `BUN_CODEGEN_DIR` is
 one. Each value that names a directory is shared exactly as `OUT_DIR` is: copied
 to `out-dirs/v1/<digest>`, given to rustc as that path, remapped in debug
-information, and kept in the key as that literal path. The crate's own sources
-must mention the variable, as they must mention `OUT_DIR`, and `share_out_dir`
-must be on.
+information, and kept in the key as that literal path. Unlike `OUT_DIR`, which
+Cargo sets for every crate with a build script and which is shared only for a
+crate whose own sources mention it, a listed variable is shared for every
+compilation it is set for: a crate can read it through another crate's macro
+its own sources never spell. `share_out_dir` must be on.
 
 ### When sharing is unavailable
 

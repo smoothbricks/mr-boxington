@@ -158,7 +158,16 @@ pub(crate) fn stabilize_for(source: &Path) {
             "{SHARE_ENV} names {name:?}, which is not an environment variable's name; it is not shared"
         ));
     }
-    for name in sources_mentioning(sources, &names) {
+    // `OUT_DIR` is Cargo's, set for every crate with a build script, so only a
+    // crate whose own sources spell it gets a copy. A variable MBX_SHARE_ENV
+    // lists was named by the build for its generated sources, which a crate can
+    // read through another crate's macro its own sources never spell, so every
+    // compilation it is set for shares it.
+    let (out_dir, listed) = names.split_at(1);
+    for name in sources_mentioning(sources, out_dir)
+        .into_iter()
+        .chain(listed.iter().map(String::as_str))
+    {
         let Some(real) = std::env::var_os(name).map(PathBuf::from) else {
             continue;
         };
