@@ -1,13 +1,13 @@
+use super::timestamp_macros;
 use crate::CacheDigest;
 use serde::{Deserialize, Serialize};
-use std::io::{self, Read as _};
+use std::io::{self, Read as _, Seek as _};
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "linux")]
 use std::sync::{Mutex, OnceLock};
 use std::time::SystemTime;
 
 const DIGEST_BUFFER_BYTES: usize = 64 * 1024;
-const TIMESTAMP_MACROS: &[&[u8]] = &[b"__DATE__", b"__TIME__", b"__TIMESTAMP__"];
 
 #[cfg(target_os = "linux")]
 const STATX_IDENTITY_MASK: u32 = 0x100 | 0x200 | 0x40 | 0x1000;
@@ -690,14 +690,8 @@ fn digest_reader(
     let mut reader = std::io::BufReader::new(file);
     let mut hasher = blake3::Hasher::new();
     let mut size = 0_u64;
-    let longest_macro = TIMESTAMP_MACROS
-        .iter()
-        .map(|macro_name| macro_name.len())
-        .max()
-        .unwrap_or_default();
-    let mut window = Vec::with_capacity(DIGEST_BUFFER_BYTES + longest_macro);
     let mut chunk = vec![0_u8; DIGEST_BUFFER_BYTES];
-    let mut found_timestamp_macro = false;
+    let mut mentions = timestamp_macros::Mentions::default();
     loop {
         let read = reader.read(&mut chunk)?;
         if read == 0 {
@@ -707,27 +701,47 @@ fn digest_reader(
         size = size
             .checked_add(read as u64)
             .ok_or_else(|| io::Error::other("file length overflowed u64"))?;
-        if scope == FileDigestScope::CcInput && !found_timestamp_macro {
-            window.extend_from_slice(&chunk[..read]);
-            found_timestamp_macro = TIMESTAMP_MACROS
-                .iter()
-                .any(|macro_name| memchr::memmem::find(&window, macro_name).is_some());
-            let keep = window.len().saturating_sub(longest_macro.saturating_sub(1));
-            window.drain(..keep);
+        if scope == FileDigestScope::CcInput {
+            mentions.feed(&chunk[..read]);
         }
     }
-    if found_timestamp_macro {
-        Ok((FileDigestResolution::EmbeddedTimestampMacro, size))
-    } else {
-        Ok((
-            FileDigestResolution::Digest(CacheDigest {
-                algorithm: "blake3".into(),
-                hash: hasher.finalize().to_hex().to_string(),
-                size,
-            }),
-            size,
-        ))
+    let digest = CacheDigest {
+        algorithm: "blake3".into(),
+        hash: hasher.finalize().to_hex().to_string(),
+        size,
+    };
+    if mentions.found() && expands_timestamp_macro(file, &digest, &mut chunk)? {
+        return Ok((FileDigestResolution::EmbeddedTimestampMacro, size));
     }
+    Ok((FileDigestResolution::Digest(digest), size))
+}
+
+/// Lex a file that names a time macro, reading it again from the start.
+///
+/// The second read is hashed as well: a file that changed between the reads
+/// has no one answer, and it is an error rather than either.
+fn expands_timestamp_macro(
+    mut file: &std::fs::File,
+    digest: &CacheDigest,
+    chunk: &mut [u8],
+) -> io::Result<bool> {
+    file.seek(io::SeekFrom::Start(0))?;
+    let mut hasher = blake3::Hasher::new();
+    let mut expansion = timestamp_macros::Expansion::default();
+    loop {
+        let read = file.read(chunk)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&chunk[..read]);
+        expansion.feed(&chunk[..read]);
+    }
+    if hasher.finalize().to_hex().as_str() != digest.hash {
+        return Err(io::Error::other(
+            "the file changed between the reads that hashed it and lexed its time macros",
+        ));
+    }
+    Ok(expansion.finish())
 }
 
 fn handle_and_path_are_stable(
@@ -879,10 +893,10 @@ mod tests {
     fn timestamp_macros_are_detected_at_every_chunk_boundary_split() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("input.h");
-        for macro_name in TIMESTAMP_MACROS {
+        for macro_name in timestamp_macros::TIMESTAMP_MACROS {
             // Include a macro starting at the boundary and one ending there.
             for split in 0..=macro_name.len() {
-                let mut bytes = vec![b'x'; DIGEST_BUFFER_BYTES - split];
+                let mut bytes = vec![b' '; DIGEST_BUFFER_BYTES - split];
                 bytes.extend_from_slice(macro_name);
                 std::fs::write(&path, &bytes).unwrap();
                 assert_eq!(
@@ -914,6 +928,69 @@ mod tests {
             assert_eq!(
                 digest_file(FileDigestScope::CcInput, &path).unwrap(),
                 FileDigestResolution::Digest(CacheDigest::blake3(bytes))
+            );
+        }
+    }
+
+    /// Only a preprocessing token of its own expands. tinycc's token table
+    /// (`DEF(TOK___DATE__, "__DATE__")`) names each macro inside a string and
+    /// inside a longer identifier, and every tinycc source includes it.
+    #[test]
+    fn a_time_macro_named_in_a_literal_a_comment_or_a_longer_identifier_does_not_expand() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("input.h");
+        let long_literal = format!("\"{}__DATE__\"\n", " ".repeat(DIGEST_BUFFER_BYTES));
+        for text in [
+            "DEF(TOK___DATE__, \"__DATE__\")\nDEF(TOK___TIME__, \"__TIME__\")\n",
+            "if (v == TOK___DATE__ || v == TOK___TIMESTAMP__) {}\n",
+            "/* built on __DATE__ */\n// at __TIME__\n",
+            "const char *s = \"\\\" __DATE__\";\n",
+            "char q = '\"'; const char *s = \"__TIME__\";\n",
+            "long n = 1'000'000; const char *s = \"__DATE__\";\n",
+            "// it's \\\n__DATE__ still the comment\n",
+            "#if 0\ndon't\n#endif\nconst char *s = \"__TIMESTAMP__\";\n",
+            "int x = 0__DATE__;\n",
+            long_literal.as_str(),
+        ] {
+            std::fs::write(&path, text).unwrap();
+            assert_eq!(
+                digest_file(FileDigestScope::CcInput, &path).unwrap(),
+                FileDigestResolution::Digest(CacheDigest::blake3(text.as_bytes())),
+                "{text:?}"
+            );
+        }
+    }
+
+    /// A literal, a comment or a line splice beside a real expansion never hides
+    /// it. A raw string or a trigraph is not lexed: either can make a quote mean
+    /// something else, so a file holding one bypasses on any mention.
+    #[test]
+    fn a_time_macro_token_expands_beside_literals_comments_and_splices() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("input.h");
+        for text in [
+            "const char *d = __DATE__;\n",
+            "puts(\"built \" __TIME__);\n",
+            "puts(\"built \"__TIME__);\n",
+            "char q = '\"'; const char *d = __DATE__;\n",
+            "long n = 1'000; const char *d = __DATE__;\n",
+            "/* \" */ __TIMESTAMP__\n",
+            "x = don't;\n__DATE__\n",
+            "const char *s = \"a\\\nb\"; const char *d = __DATE__;\n",
+            "const char *s = \"a\\ \nb\"; const char *d = __DATE__;\n",
+            "const char *s = \"a\\\r\nb\"; const char *d = __DATE__;\n",
+            "const char *s = \"open\r__TIME__\n",
+            "/\\\n* it's */ const char *d = __DATE__;\n",
+            "auto s = R\"(\")\"; auto d = __DATE__;\n",
+            "auto s = R\"x(\n)\" )x\"; auto d = __DATE__;\n",
+            "x ??' y; const char *d = __DATE__;\n",
+            "s.__DATE__\n",
+        ] {
+            std::fs::write(&path, text).unwrap();
+            assert_eq!(
+                digest_file(FileDigestScope::CcInput, &path).unwrap(),
+                FileDigestResolution::EmbeddedTimestampMacro,
+                "{text:?}"
             );
         }
     }
