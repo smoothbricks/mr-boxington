@@ -464,7 +464,11 @@ mbx leaves these C and C++ calls uncached:
 - Assembler-time `.include`, `.sinclude`, and `.incbin` inputs
 - MSVC compiler PDBs, modules, and other unsupported extra outputs
 - Sources or headers that expand `__DATE__`, `__TIME__`, or `__TIMESTAMP__`,
-  because the result depends on when compilation runs
+  because the result depends on when compilation runs. Only the macro as a
+  token of its own counts: a name inside a string or character literal, a
+  comment, or a longer identifier such as `TOK___DATE__` does not. A file
+  that holds a raw string literal or a trigraph and names one anywhere is
+  counted, since either can change what a quote means
 - Host CPU tuning such as `-march=native`, because the cache key does not
   identify the host processor
 - Any other flag or input mbx cannot model

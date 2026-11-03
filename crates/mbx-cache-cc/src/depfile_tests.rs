@@ -231,7 +231,7 @@ fn timestamp_macro_tokens_in_any_read_file_bypass() {
     let directory = tempfile::tempdir().expect("tempdir");
     let root = directory.path();
     let source = write(root, "a.c", "int main(void) { return 0; }\n");
-    let header = write(root, "a.h", "/* built on __DATE__ */\n");
+    let header = write(root, "a.h", "const char *built = __DATE__;\n");
 
     let clean = CcDiscoveredInputs::collect(
         root,
@@ -271,7 +271,7 @@ fn file_macro_alone_does_not_bypass() {
 fn a_timestamp_macro_split_across_a_read_boundary_is_still_found() {
     let directory = tempfile::tempdir().expect("tempdir");
     let root = directory.path();
-    let mut contents = "a".repeat(SCAN_CHUNK_BYTES - 4);
+    let mut contents = " ".repeat(SCAN_CHUNK_BYTES - 4);
     contents.push_str("__TIMESTAMP__");
     let source = write(root, "a.c", &contents);
     let reason = CcDiscoveredInputs::collect(
@@ -617,7 +617,7 @@ fn a_vouched_cc_input_skips_the_scan_it_already_passed() {
     // The macro token would bypass on a first encounter; a cc-scope ledger
     // entry says this exact identity already passed the scan, so neither the
     // scan nor the hash reads the file again.
-    let source = write(root, "a.c", "/* __DATE__ */ int main(void) { return 0; }\n");
+    let source = write(root, "a.c", "int main(void) { return __DATE__[0]; }\n");
     let metadata = std::fs::metadata(&source).expect("metadata");
     let digest = CacheDigest {
         algorithm: "blake3".into(),
@@ -641,7 +641,7 @@ fn a_vouched_cc_input_skips_the_scan_it_already_passed() {
 
     // Rewrite the file to a new length: the identity no longer matches, so
     // the scan runs and the macro token bypasses again.
-    std::fs::write(&source, "/* __DATE__ */ int main(void) { return 12345; }\n").expect("rewrite");
+    std::fs::write(&source, "int main(void) { return __DATE__[0] + 12345; }\n").expect("rewrite");
     let reason =
         CcDiscoveredInputs::collect(root, BTreeSet::from([source]), BTreeSet::new(), &ledger)
             .unwrap_err();
