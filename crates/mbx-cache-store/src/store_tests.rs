@@ -1752,6 +1752,59 @@ fn keeps_the_store_under_its_budget_evicting_oldest_first() {
     assert!(cas.find(&recent).unwrap().is_some());
 }
 
+/// An action result dies with its descriptor blob: the sweep's dangling pass
+/// drops it. Counting its bytes only then left the store looking over budget
+/// once every object of the older result was gone, so the sweep evicted an
+/// object of the newer result as well, which then missed on its next lookup.
+#[test]
+fn evicting_a_results_descriptor_frees_the_result_with_it() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = directory.path();
+    let cas = LocalCas::new(store);
+    let results = LocalActionCache::new(store);
+    let size = |path: PathBuf| std::fs::metadata(path).unwrap().len();
+    let old_output = store_object(store, b"old output bytes");
+    let old = store_result(store, "old action", std::slice::from_ref(&old_output));
+    let new_output = store_object(store, b"new output bytes");
+    let new = store_result(store, "new action", std::slice::from_ref(&new_output));
+    let old_root = results.find(&old).unwrap().unwrap().output_root.unwrap();
+    let new_root = results.find(&new).unwrap().unwrap().output_root.unwrap();
+    let old_objects = [&old, &old_root, &old_output];
+    let new_objects = [&new, &new_root, &new_output];
+    for digest in old_objects {
+        age(store, digest, Duration::from_secs(2 * 60 * 60));
+    }
+    for digest in new_objects {
+        age(store, digest, Duration::from_secs(60));
+    }
+    let total = stats(store).unwrap().total_bytes();
+    let old_bytes = old_objects
+        .iter()
+        .map(|digest| size(cas.path_for(digest).unwrap()))
+        .sum::<u64>()
+        + size(results.path_for(&old).unwrap());
+
+    let outcome = gc(store, total - old_bytes).unwrap();
+
+    assert!(
+        results.find(&old).unwrap().is_none(),
+        "the older result is collected"
+    );
+    assert!(
+        results.find(&new).unwrap().is_some(),
+        "the newer result is kept"
+    );
+    for digest in new_objects {
+        assert!(
+            cas.find(digest).unwrap().is_some(),
+            "the newer result's objects are kept"
+        );
+    }
+    assert_eq!(outcome.removed_objects, 3);
+    assert_eq!(outcome.removed_action_results, 1);
+    assert_eq!(outcome.remaining_bytes, total - old_bytes);
+}
+
 #[test]
 fn leaves_a_store_within_budget_alone() {
     let directory = tempfile::tempdir().unwrap();
@@ -1798,7 +1851,7 @@ fn a_blocked_unrooted_object_does_not_cost_a_rooted_one() {
     let rooted = HashSet::from([protected.clone()]);
     let mut attempted = Vec::new();
 
-    let outcome = evict_objects(&objects, &rooted, 30, 5, |path| {
+    let outcome = evict_objects(&objects, &rooted, &HashMap::new(), 30, 5, |path| {
         attempted.push(path.to_path_buf());
         Ok(if path == locked {
             Removal::Blocked
@@ -1815,6 +1868,7 @@ fn a_blocked_unrooted_object_does_not_cost_a_rooted_one() {
             removed_objects: 1,
             removed_bytes: 10,
             remaining_bytes: 20,
+            freed_results: HashSet::new(),
         },
         "a locked unrooted blob should leave the store over budget before protected objects are evicted"
     );
