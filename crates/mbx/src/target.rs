@@ -409,35 +409,44 @@ fn retire_view(directory: &Path) -> std::io::Result<PathBuf> {
     Ok(aside)
 }
 
+/// Whether the checkout's `target` is the link to its own managed view and
+/// collection has removed that view.
+///
+/// Collection removes a view but cannot remove the link inside a live
+/// checkout, so the link is left naming nothing until a build places the view
+/// again. Cargo cannot create a directory through such a link: `mkdir` beneath
+/// it fails with `File exists`, for `target` itself and for anything below it.
+/// A link to anywhere else, or to a view that still exists, is not this.
+pub(crate) fn link_awaits_view(root: &Path, workspace_root: &Path) -> std::io::Result<bool> {
+    let directory = view_dir(root, workspace_root);
+    Ok(!directory.try_exists()?
+        && std::fs::read_link(workspace_root.join("target"))
+            .is_ok_and(|destination| destination == directory))
+}
+
 /// Remove the `target` link in a checkout when it points at that checkout's
 /// own managed view and the view is gone.
 ///
-/// Collection removes a view but cannot remove the link inside a live
-/// checkout, so the link is left dangling until the next build places the view
-/// again. Cargo cannot create a directory through it, which fails a command
-/// like `cargo clean -p` that has nothing to build. A link to anywhere else, or
-/// to a view that still exists, is left alone. Returns whether a link was
-/// removed.
+/// Fails a command like `cargo clean -p` that has nothing to build, because
+/// Cargo cannot create a directory through the link
+/// ([`link_awaits_view`]); with the link gone, Cargo reports the clean it would
+/// have done. A link to anywhere else, or to a view that still exists, is left
+/// alone. Returns whether a link was removed.
 pub fn remove_dangling_link(root: &Path, workspace_root: &Path) -> Result<bool> {
-    let directory = view_dir(root, workspace_root);
-    let link = workspace_root.join("target");
-    if directory.try_exists()?
-        || !std::fs::read_link(&link).is_ok_and(|destination| destination == directory)
-    {
+    if !link_awaits_view(root, workspace_root)? {
         return Ok(false);
     }
     // A running command that holds the view's lease may be placing it again.
+    let directory = view_dir(root, workspace_root);
     let Some(_reservation) = try_reserve_view(&directory) else {
         return Ok(false);
     };
     // Re-read under the reservation: only the link this checkout's own view
     // owns may go, and a placement for another root could have replaced it.
-    if directory.try_exists()?
-        || !std::fs::read_link(&link).is_ok_and(|destination| destination == directory)
-    {
+    if !link_awaits_view(root, workspace_root)? {
         return Ok(false);
     }
-    match remove_link(&link) {
+    match remove_link(&workspace_root.join("target")) {
         Ok(()) => Ok(true),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(error.into()),

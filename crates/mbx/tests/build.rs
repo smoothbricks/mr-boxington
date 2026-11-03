@@ -7293,6 +7293,62 @@ mod target_views {
         );
     }
 
+    /// Collection removes a view and leaves the checkout's `target` link
+    /// naming it. A build that names its own directory at or below `target/`
+    /// is not one mbx places, yet Cargo creates that directory through the
+    /// link, and a link to nothing refuses a directory beneath it. Left alone,
+    /// every such build in the checkout fails until an unnamed build happens to
+    /// place the view again, which a lint gate that always names its own
+    /// directory never does.
+    #[test]
+    fn a_build_naming_a_directory_below_target_replaces_the_view_collection_removed() {
+        for (requested, below) in [("target/lint", "lint"), ("target", "")] {
+            let store = tempfile::tempdir().unwrap();
+            let project = tempfile::tempdir().unwrap();
+            let reports = tempfile::tempdir().unwrap();
+            write_project(project.path());
+            let settings = [("MBX_TARGET_VIEWS", "1")];
+
+            build_with(
+                project.path(),
+                store.path(),
+                &reports.path().join("cold.json"),
+                &settings,
+            );
+            let directory = managed(project.path());
+            age_view_record(&directory);
+            gc_expired_targets(store.path());
+            assert!(
+                !directory.exists()
+                    && std::fs::symlink_metadata(project.path().join("target"))
+                        .is_ok_and(|link| link.file_type().is_symlink()),
+                "collection should leave the link naming a view that is gone"
+            );
+
+            cargo_with(
+                project.path(),
+                store.path(),
+                &reports.path().join("named.json"),
+                &["check", "--offline", "--target-dir", requested],
+                &settings,
+            );
+
+            assert_eq!(
+                managed(project.path()),
+                directory,
+                "`--target-dir {requested}` should keep the checkout's own view"
+            );
+            assert!(
+                directory.join(below).join("debug/.cargo-lock").is_file(),
+                "`--target-dir {requested}` should write through the link into the view"
+            );
+            assert!(
+                directory.with_extension("json").is_file(),
+                "the view placed again should be recorded, or collection could never trace it"
+            );
+        }
+    }
+
     /// What a fixture program prints once it is running, and then waits for
     /// its standard input to close before it exits.
     ///
@@ -7326,6 +7382,17 @@ mod target_views {
             output.status
         );
         (stdout, stderr)
+    }
+
+    /// Backdate a view's record, so that `gc_expired_targets` finds the view
+    /// past its age limit.
+    fn age_view_record(view: &Path) {
+        let record = view.with_extension("json");
+        let mut fields: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&record).expect("the view should have a record"))
+                .unwrap();
+        fields["updated_secs"] = 1.into();
+        std::fs::write(&record, serde_json::to_vec(&fields).unwrap()).unwrap();
     }
 
     /// Start `arguments` under mbx in `project`, whose program prints
@@ -7393,12 +7460,8 @@ mod target_views {
         );
         // Make the view old enough to expire, so the only thing standing
         // between it and collection is the command still using it.
+        age_view_record(&view);
         let record = view.with_extension("json");
-        let mut fields: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&record).expect("the view should have a record"))
-                .unwrap();
-        fields["updated_secs"] = 1.into();
-        std::fs::write(&record, serde_json::to_vec(&fields).unwrap()).unwrap();
 
         let (gc_stdout, gc_stderr) = gc_expired_targets(store);
         assert!(

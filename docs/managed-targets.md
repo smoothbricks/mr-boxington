@@ -387,6 +387,16 @@ first. A live checkout's compilations go only when that is not enough to bring
 the store within its budget or relieve a short cache disk, and losing one
 costs a recompile.
 
+Collecting the target directory of a checkout that still exists leaves its
+`target` link in place, naming a directory that is gone. The next build in the
+checkout places the directory again and restores what it needs from the cache.
+That includes a build that names its own directory with `--target-dir`,
+`CARGO_TARGET_DIR`, or `build.target-dir` at or below `target/`, such as
+`target/lint`: Cargo cannot create a directory through a link to nothing, so mbx
+places the directory first and Cargo still writes where it was told. A real
+`target/` directory, a link that names something else, and a build that names a
+directory outside `target/` are left as they are.
+
 ### Unused build units
 
 Within a retained target directory, Cargo leaves previous build units behind

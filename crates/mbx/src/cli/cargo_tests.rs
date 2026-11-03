@@ -519,6 +519,116 @@ fn rust_analyzer_target_is_a_child_of_the_managed_view() {
     assert_eq!(crate::target::stats(&config.target.root).unwrap().views, 1);
 }
 
+/// A checkout whose managed view collection has since removed, which is all
+/// collection can do to it: the directory and its record go, and the link
+/// inside the checkout keeps naming them. Returns the view.
+#[cfg(unix)]
+fn checkout_with_collected_view(config: &Config, workspace: &Path) -> PathBuf {
+    std::fs::create_dir_all(workspace).unwrap();
+    let unnamed = Roots {
+        workspace_root: workspace.to_path_buf(),
+        target_dir: workspace.join("target"),
+        build_dir: None,
+        target_dir_requested: false,
+    };
+    let lease = crate::target::ViewLease::acquire(&config.target.root, workspace).unwrap();
+    place_target_view(config, &unnamed, Some(&lease))
+        .directory
+        .expect("a build that names no directory places the view");
+    let view = std::fs::read_link(workspace.join("target")).unwrap();
+    std::fs::remove_dir_all(&view).unwrap();
+    std::fs::remove_file(view.with_extension("json")).unwrap();
+    view
+}
+
+#[cfg(unix)]
+#[test]
+fn a_directory_named_at_or_below_a_collected_views_link_places_the_view_again() {
+    for named in ["target/lint", "target"] {
+        let directory = tempfile::tempdir().unwrap();
+        let config = managed_target_config(directory.path());
+        let workspace = directory.path().join("project");
+        let view = checkout_with_collected_view(&config, &workspace);
+        assert!(!view.exists());
+        let roots = Roots {
+            workspace_root: workspace.clone(),
+            target_dir: workspace.join(named),
+            build_dir: None,
+            target_dir_requested: true,
+        };
+
+        let placement = place_target_view(
+            &config,
+            &roots,
+            Some(
+                &crate::target::ViewLease::acquire(&config.target.root, &roots.workspace_root)
+                    .unwrap(),
+            ),
+        );
+
+        // The directory the caller named stays where they put it: only the
+        // link it is created through is made whole.
+        assert_eq!(placement.directory, None, "`{named}`");
+        assert_eq!(placement.touch_path, workspace.join("target"), "`{named}`");
+        assert_eq!(std::fs::read_link(workspace.join("target")).unwrap(), view);
+        assert!(view.is_dir(), "`{named}` should have its view again");
+        assert!(
+            view.with_extension("json").is_file(),
+            "`{named}`'s view should be recorded, or collection could never trace it"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn only_the_link_of_the_checkouts_own_removed_view_is_placed_again() {
+    let directory = tempfile::tempdir().unwrap();
+    let config = managed_target_config(directory.path());
+    let roots = |workspace: &Path, target_dir: PathBuf, requested: bool| Roots {
+        workspace_root: workspace.to_path_buf(),
+        target_dir,
+        build_dir: None,
+        target_dir_requested: requested,
+    };
+    let collected = directory.path().join("collected");
+    checkout_with_collected_view(&config, &collected);
+    assert!(writes_through_collected_view(
+        &config,
+        &roots(&collected, collected.join("target/lint"), true)
+    ));
+
+    // A build that names nothing is placed on its own account; one that points
+    // outside `target/` never goes through the link.
+    assert!(!writes_through_collected_view(
+        &config,
+        &roots(&collected, collected.join("target"), false)
+    ));
+    assert!(!writes_through_collected_view(
+        &config,
+        &roots(&collected, directory.path().join("elsewhere"), true)
+    ));
+
+    // A link that is not this checkout's own view is the caller's.
+    let foreign = directory.path().join("foreign");
+    std::fs::create_dir_all(&foreign).unwrap();
+    std::os::unix::fs::symlink(directory.path().join("missing"), foreign.join("target")).unwrap();
+    // A real directory holds somebody's outputs, and a missing one nobody's.
+    let real = directory.path().join("real");
+    std::fs::create_dir_all(real.join("target")).unwrap();
+    let bare = directory.path().join("bare");
+    std::fs::create_dir_all(&bare).unwrap();
+    for workspace in [&foreign, &real, &bare] {
+        assert!(
+            !writes_through_collected_view(
+                &config,
+                &roots(workspace, workspace.join("target/lint"), true)
+            ),
+            "{}",
+            workspace.display()
+        );
+    }
+}
+
 #[test]
 fn an_existing_target_the_managed_root_can_hold_is_adopted_without_asking() {
     let directory = tempfile::tempdir().unwrap();

@@ -263,7 +263,7 @@ fn cargo_with_settings_bypass_log_and_roots(
     let default_target = roots.workspace_root.join("target");
     let placing_editor = roots.target_dir_requested
         && roots.target_dir == roots.workspace_root.join(super::RUST_ANALYZER_TARGET_DIR);
-    let placement_candidate = if placing_editor {
+    let placement_candidate = if placing_editor || writes_through_collected_view(config, &roots) {
         target::placement_candidate(config, &roots.workspace_root, &default_target, false)
     } else {
         target::placement_candidate(
@@ -849,13 +849,41 @@ pub(super) fn build_dir_named_in(arguments: &[String]) -> bool {
     false
 }
 
-/// Place the editor's explicit target inside the checkout's managed view.
+/// Whether this build writes through a `target` link that collection left
+/// naming a view it removed.
+///
+/// A build that names its own directory at or below `target/` is not one mbx
+/// places, yet Cargo creates that directory through the link, and a link to
+/// nothing refuses it with `File exists`. Every such build in the checkout
+/// would then fail until an unnamed build placed the view again, which a lint
+/// gate that always names its own directory never runs. Only the link of the
+/// checkout's own view counts ([`target::link_awaits_view`]): a real directory,
+/// another link and a missing `target` stay as the caller has them.
+pub(super) fn writes_through_collected_view(config: &Config, roots: &Roots) -> bool {
+    roots.target_dir_requested
+        && roots
+            .target_dir
+            .starts_with(roots.workspace_root.join("target"))
+        && target::link_awaits_view(&config.target.root, &roots.workspace_root).unwrap_or_else(
+            |error| {
+                log::debug!("could not tell whether the managed target link is dangling: {error}");
+                false
+            },
+        )
+}
+
+/// Place the managed view of a build that names its own target directory, in
+/// the two cases where the link it is created through must be whole.
 ///
 /// Cargo's `--target-dir` normally opts out of placement. The exact path that
 /// `mbx setup` writes is different: placing its `target` parent first prevents
 /// an editor-first checkout from creating a real directory that would block
 /// managed targets later. Cargo still writes into the requested child, so its
 /// directory lock remains independent from terminal builds.
+///
+/// The other is a `target` link collection left naming a removed view
+/// ([`writes_through_collected_view`]): the view is placed again for the
+/// directory the caller named, which stays where they put it.
 pub(super) fn place_target_view(
     config: &Config,
     roots: &Roots,
@@ -878,6 +906,13 @@ pub(super) fn place_target_view(
             .map(|_| roots.target_dir.clone());
         return TargetViewPlacement {
             directory,
+            touch_path: default,
+        };
+    }
+    if writes_through_collected_view(config, roots) {
+        target::place(config, &roots.workspace_root, &default, false, lease);
+        return TargetViewPlacement {
+            directory: None,
             touch_path: default,
         };
     }
