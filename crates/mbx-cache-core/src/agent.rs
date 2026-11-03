@@ -2377,6 +2377,11 @@ impl CacheAgent {
                 let path = self.cas.store_file(digest, source)?;
                 drop(timer);
                 self.remember_verified_blob(digest, &path);
+                // A blob published by cloning its source carries that source's
+                // access time, weeks old for an `OUT_DIR` file Cargo copied from
+                // the checkout, and eviction would take it for the store's
+                // coldest before any build restored it. Storing it is a use.
+                self.cas.record_use(digest, SystemTime::now());
                 self.stats.stores.fetch_add(1, Ordering::Relaxed);
                 self.stats
                     .stored_bytes
