@@ -592,8 +592,10 @@ is always bounded. To stop creating managed targets, see
 ### Collection is approximate
 
 Object eviction prefers abandoned checkout data and then older access times.
-Filesystems using `relatime` coarsen that order; `noatime` removes it. A poor
-choice costs a recompile, not correctness.
+mbx writes an object's access time itself whenever a build stores or uses it,
+at most once an hour, so the order holds under `noatime` and for objects
+published by cloning a file with an old access time. A poor choice costs a
+recompile, not correctness.
 
 The action-store budget covers action objects and results. Prediction data,
 checkout records, and temporary downloads add overhead.

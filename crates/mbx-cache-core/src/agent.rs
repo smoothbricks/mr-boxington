@@ -103,6 +103,11 @@ const MAX_CONCURRENT_FILE_DIGESTS: usize = 8;
 /// High enough to overlap the per-file stalls of an on-access scanner, low
 /// enough that the blocking threads stay a small fixed number.
 const MAX_CONCURRENT_BLOB_VERIFICATIONS: usize = 16;
+/// How old a recorded use may be before a later one is written again. An hour
+/// cannot reorder anything that matters to eviction across a store that holds
+/// weeks, and it keeps a build that serves one blob to every crate linking it
+/// to one metadata write, not one per crate.
+const USE_RECORD_RESOLUTION: Duration = Duration::from_secs(60 * 60);
 const MAX_REMOTE_TRANSFERS: usize = 64;
 const MAX_PREFETCH_TRANSFERS: usize = 48;
 /// Most blob packs downloaded at once.
@@ -497,6 +502,31 @@ fn file_object(metadata: &std::fs::Metadata) -> Option<(u64, u64)> {
 #[cfg(not(unix))]
 fn file_object(_metadata: &std::fs::Metadata) -> Option<(u64, u64)> {
     None
+}
+
+/// Record that `path` was used now, in the access time collection ranks by.
+///
+/// Reads cannot be trusted to do it: a `noatime` mount never moves an access
+/// time, and a blob published by cloning its source carries that source's.
+/// Either way collection took the store's hottest long-lived objects for its
+/// coldest and evicted them under the builds reading them, each of which then
+/// found its result naming a blob the store no longer had. The modification
+/// time is left alone: it is part of a remembered blob's identity. A use that
+/// cannot be written costs eviction order, never a result, so it is logged
+/// and the request goes on.
+fn record_use(path: &Path) {
+    let now = SystemTime::now();
+    let recent = fs::metadata(path)
+        .and_then(|metadata| metadata.accessed())
+        .is_ok_and(|accessed| accessed + USE_RECORD_RESOLUTION >= now);
+    if recent {
+        return;
+    }
+    if let Err(error) =
+        fs::File::open(path).and_then(|file| file.set_times(fs::FileTimes::new().set_accessed(now)))
+    {
+        debug!("the use of {} was not recorded: {error}", path.display());
+    }
 }
 
 /// Find a stored blob and hash it in full.
@@ -2341,6 +2371,8 @@ impl CacheAgent {
     }
 
     fn remember_verified_blob(&self, digest: &CacheDigest, path: &Path) {
+        // Every blob a session serves or stores passes here once.
+        record_use(path);
         let Some(verified) = VerifiedBlob::describe(path) else {
             // Without an identity to compare against there is nothing to
             // shortcut safely, so the digest stays unremembered and every
@@ -2355,6 +2387,7 @@ impl CacheAgent {
 
     async fn find_action_result(&self, action: &CacheDigest) -> Result<AgentResponse> {
         if let Some(result) = self.actions.find(action)? {
+            record_use(&self.actions.path_for(action)?);
             return Ok(AgentResponse::ActionResult {
                 result: Some(result),
             });
@@ -2368,6 +2401,7 @@ impl CacheAgent {
         let lock = self.action_lock(action);
         let _guard = lock.lock().await;
         if let Some(result) = self.actions.find(action)? {
+            record_use(&self.actions.path_for(action)?);
             return Ok(AgentResponse::ActionResult {
                 result: Some(result),
             });

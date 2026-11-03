@@ -445,6 +445,75 @@ async fn a_lookup_of_a_torn_blob_reports_a_miss_not_an_error() {
     }
 }
 
+/// Collection evicts the objects and results with the oldest access times. A
+/// `noatime` mount never moves one on read, and a blob published by cloning
+/// its source carries that source's, so a store's hottest long-lived objects
+/// ranked coldest and were evicted under the builds reading them ("cached
+/// action is missing blob"). What a session serves or stores is a use, and the
+/// agent writes it down itself.
+#[tokio::test]
+async fn served_and_stored_entries_record_their_use() {
+    let directory = tempfile::tempdir().unwrap();
+    let agent = CacheAgent::new(directory.path().join("cache"), "test-version");
+    let long_ago = SystemTime::now() - Duration::from_secs(30 * 24 * 60 * 60);
+    let age = |path: &Path| {
+        std::fs::File::open(path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_accessed(long_ago))
+            .unwrap();
+    };
+    let used = |path: &Path| {
+        std::fs::metadata(path).unwrap().accessed().unwrap()
+            > long_ago + Duration::from_secs(24 * 60 * 60)
+    };
+
+    let served = CacheDigest::blake3(b"served object");
+    let served_path = agent.cas.store_bytes(&served, b"served object").unwrap();
+    age(&served_path);
+    match agent.find_blobs(vec![served]).await.unwrap() {
+        AgentResponse::Blobs { paths } => assert_eq!(paths, vec![Some(served_path.clone())]),
+        other => panic!("unexpected response {other:?}"),
+    }
+    assert!(used(&served_path), "a served blob records its use");
+
+    let source = directory.path().join("source");
+    std::fs::write(&source, b"stored object").unwrap();
+    age(&source);
+    let stored = CacheDigest::blake3(b"stored object");
+    let response = agent
+        .store_blob(&stored, &source, &mut ConnectionUploads::default())
+        .await
+        .unwrap();
+    let AgentResponse::Stored { path } = response else {
+        panic!("unexpected response {response:?}");
+    };
+    assert!(
+        used(&path),
+        "a stored blob records its own use, not its source's"
+    );
+
+    let action = CacheDigest::blake3(b"action descriptor");
+    agent
+        .cas
+        .store_bytes(&action, b"action descriptor")
+        .unwrap();
+    let result_path = agent
+        .actions
+        .store(&RemoteActionResult {
+            action: action.clone(),
+            metadata: None,
+            output_root: None,
+            version: 1,
+        })
+        .unwrap();
+    age(&result_path);
+    assert!(matches!(
+        agent.find_action_result(&action).await.unwrap(),
+        AgentResponse::ActionResult { result: Some(_) }
+    ));
+    assert!(used(&result_path), "a found action result records its use");
+}
+
 /// Blobs verified side by side still answer in request order, whether a
 /// digest was already remembered, is repeated, or is not stored at all, and
 /// every one found is remembered for the next lookup.

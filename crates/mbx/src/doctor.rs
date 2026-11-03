@@ -161,10 +161,6 @@ async fn check(config: &Config, toolchain: Option<&str>) -> Vec<Check> {
         command_check("rustc", &rustc, toolchain),
     ];
     checks.push(cache_check(&config.cache_dir));
-    checks.push(atime_check(
-        &config.store_dir(),
-        "cache eviction cannot tell recently read objects from unused ones",
-    ));
     if config.target.views {
         checks.push(atime_check(
             &crate::target::views_root(&config.target.root),
