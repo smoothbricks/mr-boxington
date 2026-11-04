@@ -522,10 +522,10 @@ impl RustcInvocation {
     pub fn portable_install_name(&self, outputs: &RustcOutputs) -> Option<String> {
         if !cfg!(target_os = "macos")
             || self.link_output != LinkOutput::NativeProcMacro
-            || self
-                .arguments
-                .iter()
-                .any(|arg| matches!(arg, Argument::InstallName(_)))
+            || self.arguments.iter().any(|arg| {
+                matches!(arg, Argument::InstallName(_))
+                    || matches!(arg, Argument::Plain(flag) if flag == "-Zosx-rpath-install-name")
+            })
         {
             return None;
         }
@@ -1625,11 +1625,14 @@ impl<'a> Parser<'a> {
                 // Those files are inputs the key already digests; the flag
                 // changes only the dep-info, which is stored and restored like
                 // any other output.
+                // `osx-rpath-install-name` names a macOS dylib `@rpath/<file>`
+                // rather than its absolute output path: a switch, keyed as written.
                 "binary-dep-depinfo"
                 | "embed-metadata=no"
                 | "embed-metadata=yes"
                 | "force-unstable-if-unmarked"
                 | "shell-argfiles"
+                | "osx-rpath-install-name"
                 | "unstable-options" => {
                     self.parsed.push(Argument::Plain(format!("-Z{option}")));
                     return Ok(());

@@ -920,6 +920,30 @@ fn address_significance_location_detail_and_binary_dep_info_are_keyed() {
     );
 }
 
+/// `-Zosx-rpath-install-name` makes a macOS dylib name itself
+/// `@rpath/<file>` instead of its absolute output path, which is what lets a
+/// dylib built in one checkout load in another. Set in `RUSTFLAGS`, it reaches
+/// every compilation of a build, so a bypass on it bypassed all of them. It is
+/// a switch read from its text: it enters the key as written.
+#[test]
+fn the_osx_rpath_install_name_switch_is_keyed() {
+    let source = [("/work/project/src.rs", "source")];
+    let digest_with = |flags: &[&str]| {
+        let mut arguments = args(&["--crate-type=lib", "--emit=metadata"]);
+        arguments.extend(args(flags));
+        arguments.extend(args(&["src.rs"]));
+        RustcInvocation::parse(&arguments)
+            .unwrap_or_else(|error| panic!("{flags:?} should be admitted: {error}"))
+            .action(context(&source))
+            .unwrap()
+            .digest
+    };
+    let plain = digest_with(&[]);
+    let attached = digest_with(&["-Zosx-rpath-install-name"]);
+    assert_ne!(attached, plain, "the switch must enter the key");
+    assert_eq!(attached, digest_with(&["-Z", "osx-rpath-install-name"]));
+}
+
 /// `llvm-args` hands LLVM arbitrary options, some of which read files or
 /// change what the backend writes, so only listed ones are modeled.
 #[test]
