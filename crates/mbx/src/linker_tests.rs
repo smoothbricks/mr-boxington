@@ -60,7 +60,6 @@ fn the_identity_round_trips_through_its_recorded_form() {
         crt_objects: BTreeMap::from([("crt1.o".into(), CacheDigest::blake3(b"crt"))]),
         sdk: None,
         deployment_target: Some("11.0".into()),
-        wrapper: None,
     };
 
     let recorded = canonical_json(&identity).unwrap();
@@ -76,70 +75,6 @@ fn identity_without_agent() -> Result<LinkerIdentity> {
     let driver = which::which("cc")?;
     let search = search_dirs(&driver);
     probe(&driver, None, search.as_ref()).map(|(identity, _)| identity)
-}
-
-/// A program in a scratch directory that forwards every argument to `cc`, as a
-/// project's linker wrapper does, with `extra` in its text.
-fn forwarding_wrapper(directory: &Path, extra: &str) -> PathBuf {
-    let wrapper = directory.join("project-linker");
-    std::fs::write(&wrapper, format!("#!/bin/sh\n# {extra}\nexec cc \"$@\"\n")).unwrap();
-    std::fs::set_permissions(
-        &wrapper,
-        std::os::unix::fs::PermissionsExt::from_mode(0o755),
-    )
-    .unwrap();
-    wrapper
-}
-
-/// A `-C linker` mbx does not know by name is refused unless the project
-/// names it as a wrapper: nothing else says that it forwards to a driver.
-#[cfg(unix)]
-#[test]
-fn an_unrecognized_linker_is_refused_unless_named_as_a_wrapper() {
-    let directory = tempfile::tempdir().unwrap();
-    let wrapper = forwarding_wrapper(directory.path(), "first");
-
-    let error = select_driver(Some(&wrapper), &[]).unwrap_err();
-    assert!(
-        format!("{error:#}").contains("MBX_LINK_WRAPPERS"),
-        "the refusal names the setting that would identify it: {error:#}"
-    );
-    let named = select_driver(Some(&wrapper), &["other-linker".into()]).unwrap_err();
-    assert!(format!("{named:#}").contains("not one mbx can identify"));
-}
-
-/// A named wrapper is the driver every probe asks, so the key holds what the
-/// program it forwards to reports, and its own bytes join the key: a wrapper
-/// that adds a flag is a different link even when the driver behind it is not.
-#[cfg(unix)]
-#[test]
-fn a_named_wrapper_is_identified_by_its_bytes_and_what_it_forwards_to() {
-    let Ok(cc) = which::which("cc") else {
-        return;
-    };
-    let directory = tempfile::tempdir().unwrap();
-    let wrapper = forwarding_wrapper(directory.path(), "first");
-    let wrappers = ["project-linker".to_string()];
-
-    let selected = select_driver(Some(&wrapper), &wrappers).unwrap();
-    assert_eq!(selected.path, std::fs::canonicalize(&wrapper).unwrap());
-    assert_eq!(
-        selected.wrapper,
-        Some(CacheDigest::blake3_file(&wrapper).unwrap())
-    );
-    let search = search_dirs(&selected.path);
-    let (identity, _) = probe(&selected.path, None, search.as_ref()).unwrap();
-    assert_eq!(identity.driver_version, run(&cc, &["--version"]).unwrap());
-
-    let edited = forwarding_wrapper(directory.path(), "second");
-    let reselected = select_driver(Some(&edited), &wrappers).unwrap();
-    assert_ne!(reselected.wrapper, selected.wrapper, "new bytes, new key");
-
-    // A known driver is no wrapper and carries no digest.
-    let plain = select_driver(Some(Path::new("clang")), &wrappers);
-    if let Ok(plain) = plain {
-        assert_eq!(plain.wrapper, None);
-    }
 }
 
 #[test]

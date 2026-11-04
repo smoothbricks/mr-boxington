@@ -22,8 +22,6 @@ use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// The variable naming the linker programs a project wraps its driver in.
-pub(crate) const LINK_WRAPPERS_ENV: &str = "MBX_LINK_WRAPPERS";
 /// Environment that selects what the probes below report.
 ///
 /// The search paths are here because they decide which `ld` a driver names,
@@ -126,95 +124,12 @@ fn file_probes() -> FileProbes {
     }
 }
 
-/// The program a native link starts, and, when it is a wrapper the project
-/// named, the digest of its bytes.
-#[derive(Debug)]
-struct Driver {
-    path: PathBuf,
-    wrapper: Option<CacheDigest>,
-}
-
-/// The file names `MBX_LINK_WRAPPERS` lists, comma-separated.
-fn link_wrappers() -> Vec<String> {
-    std::env::var(LINK_WRAPPERS_ENV)
-        .map(|listed| {
-            listed
-                .split(',')
-                .map(str::trim)
-                .filter(|name| !name.is_empty())
-                .map(str::to_owned)
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-/// Which program runs a native link that names `override_linker`.
-///
-/// A `-C linker` mbx knows by name is that driver. One whose file name is in
-/// `wrappers` is a program the project says forwards its arguments to a Clang
-/// or `cc` driver, adding fixed flags of its own (a macOS wrapper that picks
-/// Xcode's `clang`, its `ld` and the SDK): every probe is asked through it, so
-/// the key holds what the driver behind it reports with the wrapper's flags,
-/// and its canonical path and the digest of its bytes join the key, so an
-/// edited wrapper is a different link. Anything else says nothing about what
-/// it runs and is refused.
-fn select_driver(override_linker: Option<&Path>, wrappers: &[String]) -> Result<Driver> {
-    let Some(linker) = override_linker else {
-        let path = if cfg!(windows) {
-            msvc_tool("link.exe").wrap_err("failed to find the linker `link.exe`")?
-        } else {
-            which::which("cc").wrap_err("failed to find the linker driver `cc`")?
-        };
-        return Ok(Driver {
-            path,
-            wrapper: None,
-        });
-    };
-    let file_name = linker
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or_default();
-    let name = file_name.to_ascii_lowercase();
-    let recognized = if cfg!(windows) {
-        matches!(
-            name.as_str(),
-            "link" | "link.exe" | "lld-link" | "lld-link.exe"
-        )
-    } else {
-        matches!(name.as_str(), "clang" | "clang++")
-    };
-    let find = || {
-        which::which(linker)
-            .wrap_err_with(|| format!("failed to find linker `{}`", linker.display()))
-    };
-    if recognized {
-        return Ok(Driver {
-            path: find()?,
-            wrapper: None,
-        });
-    }
-    if cfg!(windows) || !wrappers.iter().any(|wrapper| wrapper == file_name) {
-        bail!(
-            "the selected linker is not one mbx can identify; name it in {LINK_WRAPPERS_ENV} if \
-             it only forwards its arguments to a Clang or cc driver"
-        );
-    }
-    let path = std::fs::canonicalize(find()?)
-        .wrap_err_with(|| format!("failed to resolve the linker `{}`", linker.display()))?;
-    let digest = CacheDigest::blake3_file(&path)
-        .wrap_err_with(|| format!("failed to read the linker wrapper {}", path.display()))?;
-    Ok(Driver {
-        path,
-        wrapper: Some(digest),
-    })
-}
 /// Describe the linker rustc will use for a native link on this host.
 ///
 /// Memoized through the agent for the life of the build, since the answer is
 /// the same for every link in it and the probes are several processes.
 /// Describe the default linker, a Clang driver selecting a named Unix linker,
-/// a recognized Windows linker override, or a wrapper `MBX_LINK_WRAPPERS`
-/// names ([`select_driver`]).
+/// or a recognized Windows linker override.
 ///
 /// `fuse_ld` is a `-fuse-ld=<name>` selection the adapter modeled for a
 /// native link: the driver stays `cc`, but the linker it invokes becomes
@@ -230,10 +145,30 @@ pub(crate) fn identity_for(
     if fuse_ld.is_some() && cfg!(windows) {
         bail!("a `-fuse-ld` selection with a Windows linker is not one mbx can identify");
     }
-    let Driver {
-        path: driver,
-        wrapper,
-    } = select_driver(override_linker, &link_wrappers())?;
+    let driver = if let Some(linker) = override_linker {
+        let name = linker
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let recognized = if cfg!(windows) {
+            matches!(
+                name.as_str(),
+                "link" | "link.exe" | "lld-link" | "lld-link.exe"
+            )
+        } else {
+            matches!(name.as_str(), "clang" | "clang++")
+        };
+        if !recognized {
+            bail!("the selected linker is not one mbx can identify");
+        }
+        which::which(linker)
+            .wrap_err_with(|| format!("failed to find linker `{}`", linker.display()))?
+    } else if cfg!(windows) {
+        msvc_tool("link.exe").wrap_err("failed to find the linker `link.exe`")?
+    } else {
+        which::which("cc").wrap_err("failed to find the linker driver `cc`")?
+    };
     refuse_nix_wrapped_link(
         &driver,
         Path::new(NIX_STORE),
@@ -280,16 +215,10 @@ pub(crate) fn identity_for(
             Some(located.path.display().to_string()),
         );
     }
-    // A wrapper's bytes are part of what it is: an identity recorded for one
-    // version of it must not answer for another at the same path.
-    if let Some(digest) = &wrapper {
-        environment.insert("MBX_LINK_WRAPPER".into(), Some(digest.key()));
-    }
     if let Some(cached) = find_recorded(&driver, &environment)? {
         return Ok(cached);
     }
-    let (mut identity, pins) = probe(&driver, fuse_ld.as_ref(), search())?;
-    identity.wrapper = wrapper;
+    let (identity, pins) = probe(&driver, fuse_ld.as_ref(), search())?;
     record(&driver, &environment, &identity, pins)?;
     Ok(identity)
 }
@@ -608,7 +537,6 @@ fn probe(
         crt_objects,
         sdk,
         deployment_target: std::env::var("MACOSX_DEPLOYMENT_TARGET").ok(),
-        wrapper: None,
     };
     Ok((identity, pins))
 }
@@ -648,7 +576,6 @@ fn probe_windows(linker: &Path) -> Result<LinkerIdentity> {
         crt_objects,
         sdk: Some(sdk),
         deployment_target: None,
-        wrapper: None,
     })
 }
 

@@ -1067,10 +1067,6 @@ pub struct LinkerIdentity {
     /// Deployment target the link was made against, where one applies.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub deployment_target: Option<String>,
-    /// Digest of the linker wrapper's own bytes, when the driver is a program
-    /// the project named as forwarding to a Clang or `cc` driver.
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub wrapper: Option<CacheDigest>,
 }
 
 /// Canonical action descriptor and its content digest.

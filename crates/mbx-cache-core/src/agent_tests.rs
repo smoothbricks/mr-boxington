@@ -6677,10 +6677,9 @@ async fn memoizes_client_observed_executable_identities() {
 }
 
 /// A linker driver's identity depends on the SDK and toolchain environment it
-/// builds against, on the working directory when its search path reaches
-/// into it, and on the bytes of a linker wrapper the project named, so those
-/// names key an identity too. Everything else stays refused: a name that does
-/// not select what the probe reports would let one key stand for two answers.
+/// builds against, and on the working directory when its search path reaches
+/// into it, so those names key an identity too. Everything else stays
+/// refused: a name that does not select what the probe reports would let one
 /// key stand for two answers.
 #[tokio::test]
 async fn identity_keys_admit_only_names_that_select_the_answer() {
@@ -6693,7 +6692,6 @@ async fn identity_keys_admit_only_names_that_select_the_answer() {
         "GCC_EXEC_PREFIX",
         "LIBRARY_PATH",
         "MBX_FUSE_LD",
-        "MBX_LINK_WRAPPER",
         "MBX_WORKING_DIRECTORY",
         "PATH",
         "SDKROOT",

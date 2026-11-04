@@ -289,17 +289,6 @@ Use private incremental state for crates whose sources keep changing.
 
 A workspace crate qualifies on its first source edit; any other crate after three consecutive misses with changed sources. A qualifying crate's outputs, and those of crates that link them, stay out of the shared cache. Off in CI (`CI` set to `1`, `true`, or `yes`), while `incremental` or `eager_incremental` is in effect, and for compilations selected for verification by `MBX_VERIFY` or `verify_sample_rate`. Not used for compiles that use LTO or are optimized at opt-level 2 or higher (including `s` and `z`), where rustc's incremental local ThinLTO can produce rlibs that do not link. A profile with `lto = "off"` or `codegen-units = 1` stays eligible; Cargo's default `lto = false` does not.
 
-### `link_wrappers`
-
-- **Type:** `option<list<string>>`
-- **Optional:** true
-- **Scope:** only from the environment or the command line
-- **Set with:** `MBX_LINK_WRAPPERS`
-
-Linker programs that only forward their arguments to a Clang or `cc` driver, by file name, comma-separated.
-
-A `-C linker` (`target.<triple>.linker`) mbx does not know by name bypasses, so a project that links through its own wrapper caches none of its test binaries, proc macros or build scripts. A wrapper named here is identified instead: every linker probe is asked through it, so the key holds the driver, linker and SDK it ends up using with its own flags, and the digest of its bytes joins the key. Name only a program that runs one driver with fixed arguments and reads no environment beyond what a link's key already holds. Not on Windows.
-
 ### `linker.default`
 
 - **Type:** `string`

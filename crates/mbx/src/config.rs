@@ -268,24 +268,6 @@ pub(crate) struct RawConfig {
         parse = "list_by_comma"
     )]
     _share_env: Option<Vec<String>>,
-    /// Linker programs that only forward their arguments to a Clang or `cc`
-    /// driver, by file name, comma-separated.
-    ///
-    /// A `-C linker` (`target.<triple>.linker`) mbx does not know by name
-    /// bypasses, so a project that links through its own wrapper caches none
-    /// of its test binaries, proc macros or build scripts. A wrapper named
-    /// here is identified instead: every linker probe is asked through it, so
-    /// the key holds the driver, linker and SDK it ends up using with its own
-    /// flags, and the digest of its bytes joins the key. Name only a program
-    /// that runs one driver with fixed arguments and reads no environment
-    /// beyond what a link's key already holds. Not on Windows.
-    #[usage(
-        key = "link_wrappers",
-        env = "MBX_LINK_WRAPPERS",
-        scope = "env",
-        parse = "list_by_comma"
-    )]
-    _link_wrappers: Option<Vec<String>>,
     /// Restore cached outputs by hard link when the filesystem cannot clone them.
     ///
     /// Filesystems with clone support (APFS, Btrfs, XFS with reflink, ZFS) are

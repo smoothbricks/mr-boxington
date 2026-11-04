@@ -3014,8 +3014,7 @@ impl CacheAgent {
     ) -> Result<ExecutableIdentityKey> {
         // Restricted to the variables that actually select what an identity
         // probe reports: the toolchain rustup resolves, the SDK a linker
-        // driver builds against, a `-fuse-ld` linker selection, the digest of
-        // a linker wrapper's bytes, the search
+        // driver builds against, a `-fuse-ld` linker selection, the search
         // path a driver finds its linker on, the working directory when
         // that search path reaches into it, and the sysroot and target whose
         // toolchain parts a compiler's record holds. Anything else would let
@@ -3027,7 +3026,6 @@ impl CacheAgent {
                     | "GCC_EXEC_PREFIX"
                     | "LIBRARY_PATH"
                     | "MBX_FUSE_LD"
-                    | "MBX_LINK_WRAPPER"
                     | "MBX_TOOLCHAIN_SYSROOT"
                     | "MBX_TOOLCHAIN_TARGET"
                     | "MBX_WORKING_DIRECTORY"

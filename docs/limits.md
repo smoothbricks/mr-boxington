@@ -197,13 +197,7 @@ Even on a host mbx can describe, a link bypasses when it:
   without one links for the host, and that is the only linker mbx identifies
 
 A `-C linker` override is identified rather than refused when its file name is
-`clang` or `clang++` (on Windows, `link.exe` or `lld-link`), or when
-[`link_wrappers`](/configuration#link-wrappers) (`MBX_LINK_WRAPPERS`) names it:
-a project's own program that forwards its arguments to a Clang or `cc` driver,
-such as a macOS wrapper that runs Xcode's `clang` with its `ld` and SDK. mbx
-asks every linker probe through the wrapper, so the key holds what the driver
-behind it reports with the wrapper's own flags, and adds the digest of the
-wrapper's bytes, so an edited wrapper is a different link. Any other
+`clang` or `clang++` (on Windows, `link.exe` or `lld-link`). Any other
 `-C linker` bypasses. On Linux and macOS, mbx also models
 `-C link-arg=-fuse-ld=<name>`: it resolves the `ld.<name>` the driver would
 run, or takes an absolute path as given, and puts that linker's path and
