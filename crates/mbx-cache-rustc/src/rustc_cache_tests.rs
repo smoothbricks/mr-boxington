@@ -2825,7 +2825,6 @@ fn test_linker() -> LinkerIdentity {
         crt_objects: BTreeMap::new(),
         sdk: Some("MacOSX15.0.sdk (24A335)".into()),
         deployment_target: None,
-        wrapper: None,
     }
 }
 
