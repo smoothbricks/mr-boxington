@@ -260,15 +260,29 @@ unused-byte averages use only successful unwrapped measurements. Missing peaks
 count as observations but do not contribute to measured statistics. Without
 observations, this section shows a short empty-state line.
 
-The pool admits requests in one order: `normal` priority before `low`. Within
-a priority, a request that has waited 30 seconds goes first, oldest first; every
+The pool admits requests in one order, band by band: `interactive` priority,
+then `normal` (the land gate), then `low`. Within a band, a request that has
+waited 30 seconds goes first, oldest first; every
 other request goes in order of its predicted run time, shortest first, then by
 arrival. A request's prediction is the median of its class's last eight
 successful run times, kept in the memory ledger: a compile's crate, a link's
 binary and profile, a test binary's or a nextest test's name, a reservation's
 `--name`. A class with none takes the median of its kind's classes, and a
 request whose kind has no history goes after every predicted request of its
-priority.
+band.
+
+An `interactive` request decays by the age of the job it runs for, named by
+`MBX_SCHEDULER_JOB_STARTED_MS`, `mbx reserve --job-started` or a reservation's
+`job_started_ms`, in milliseconds since the Unix epoch. Asking within 30
+seconds of that start, it is admitted as `interactive`; from 30 to 120 seconds,
+as `normal`; after that, as `low`. The band is decided once, when the request
+asks, and kept while it waits; one without a job start (absent, or empty as
+cowshed sets it for every job that is not interactive, so a nested job never
+inherits its caller's start) stays `interactive`. Only an `interactive`
+request reads its job start, so a `normal` or `low` request never decays. A
+decayed request's decision rows carry `decayed: {from, to, elapsed_ms}`. A
+granted request's band no longer matters: nothing admitted is preempted. A
+version that does not know a band reads it as `low`.
 
 A compiler or test process runs as many threads as it was charged for, so its
 request starts only when all of its cores fit. An
@@ -368,11 +382,13 @@ setting `scheduler.memory = "none"` also disables pressure control. If the
 pressure probes fail, scheduling falls back to the same permit and estimate
 checks.
 
-Use `scheduler.priority = "low"` (`MBX_SCHEDULER_PRIORITY=low`) for an editor's
-background check or CI on a shared machine. A waiting normal-priority request
-goes before every low-priority one, so low-priority work starts only on room no
-waiting normal-priority request can use; with none waiting, it may use the
-whole budget.
+Use `scheduler.priority = "interactive"` (`MBX_SCHEDULER_PRIORITY=interactive`)
+for work a person or agent waits on, such as an agent's edit-feedback test,
+with `MBX_SCHEDULER_JOB_STARTED_MS` set to its job's start, and
+`scheduler.priority = "low"` for an editor's background check or CI on a
+shared machine. A waiting request of a higher band goes before every one of a
+lower band, so lower-band work starts only on room no waiting higher-band
+request can use; with none waiting, it may use the whole budget.
 
 ## Reserve capacity for external work
 
@@ -400,8 +416,9 @@ its own, instead of queueing behind capacity its enclosing reservation holds;
 its command's `MBX_RESERVE_CPUS` is the smaller of its `--cpus` and the
 enclosing grant's, or its `--cpus` when no enclosing grant names one.
 `--memory` is measured against `scheduler.memory`; omit it when memory
-scheduling is disabled. Use `--priority low` for background work that
-should go after waiting normal-priority work; an admitted
+scheduling is disabled. Use `--priority interactive` with `--job-started` for
+work someone waits on, and `--priority low` for background work that should
+go after waiting normal-priority work; an admitted
 reservation, like an admitted compiler, is never preempted or narrowed. `--grant-fd` tells a
 supervisor when the reservation gets its capacity; see
 [Tell a supervisor when work holds capacity](#tell-a-supervisor-when-work-holds-capacity).
@@ -435,8 +452,9 @@ A client connects and writes one JSON object per line:
 ```
 
 `reserve` asks for at most `cpus` cores at a `priority`, with an optional
-`memory` in bytes and an optional `name`, the class its run time is predicted
-by, and is admitted exactly as `mbx reserve --cpus --priority --memory --name`
+`memory` in bytes, an optional `name`, the class its run time is predicted
+by, and an optional `job_started_ms`, and is admitted exactly as
+`mbx reserve --cpus --priority --memory --name --job-started`
 is: the same pool, the same order, and as many of its cores as are
 free once one is. The answer is `granted` with the cores the request holds, or
 `refused` with the pool's error, after which the connection keeps serving.
@@ -597,7 +615,7 @@ descriptor. Grant descriptors are a Unix interface.
 | `scheduler.cpus`, `scheduler.memory` | The shared compiler pool                                   |
 | `scheduler.reserve_cpus`             | CPU cores left outside that pool                           |
 | Cargo `-j` or `CARGO_BUILD_JOBS`     | CPU cores one build may hold                               |
-| `scheduler.priority = "low"`         | Whether a build goes after waiting normal-priority work    |
+| `scheduler.priority`                 | Whether a build goes before or after other waiting work    |
 | `scheduler.tests = true`             | Whether Cargo test binaries and nextest tests take permits |
 
 A memory budget schedules work using measurements; it is not an operating-system

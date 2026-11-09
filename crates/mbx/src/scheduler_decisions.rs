@@ -134,6 +134,10 @@ pub(super) struct Event {
     /// it among the requests of its priority that had not aged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     predicted_ms: Option<u64>,
+    /// The band below its declared one the age of the request's job put it
+    /// in when it asked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    decayed: Option<Decayed>,
     waited_ms: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     reason: Option<String>,
@@ -180,6 +184,7 @@ impl Event {
             ticket: record.ticket,
             first_arrival_ms: record.first_arrival_ms,
             predicted_ms: record.predicted_ms,
+            decayed: record.decayed.clone(),
             waited_ms: record
                 .first_arrival_ms
                 .map_or(0, |first| now.saturating_sub(first)),
