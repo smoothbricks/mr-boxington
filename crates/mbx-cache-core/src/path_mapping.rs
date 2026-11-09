@@ -136,7 +136,7 @@ pub fn normalize_resolved_mapped_path(
 /// them. Resolving a parent once and then only the last component of each
 /// path costs one `lstat` per path instead of one per component. The memo
 /// belongs to the caller and lives as long as the caller wants it to: one
-/// action's worth of paths, in practice, which is no longer than a link is
+/// compilation's worth of paths, in practice, which is no longer than a link is
 /// assumed to hold between two `realpath` calls today.
 #[derive(Debug, Default)]
 pub struct PathAliases {
@@ -145,19 +145,63 @@ pub struct PathAliases {
         std::cell::RefCell<std::collections::HashMap<PathBuf, std::rc::Rc<ResolvedDirectory>>>,
 }
 
-/// Maximum names remembered per directory. Large stores must not make a
-/// single path lookup proportional to their entire listing. Unlisted names
-/// fall back to `canonicalize`, preserving its case and symlink handling.
+/// Names read from a directory's listing by one lookup that misses them.
+/// A directory of up to this many names is read whole by its first lookup.
+/// A larger one is read further only as lookups miss, so its listing costs
+/// no more than the full calls those lookups pay anyway: a header in a
+/// directory of 1,600 stops taking `realpath` once the listing reaches it,
+/// and a lookup beside 130,000 Nix store paths never reads them all.
 #[cfg(unix)]
-const MAX_DIRECTORY_ENTRIES: usize = 256;
+const LISTING_CHUNK: usize = 256;
 
-/// A directory as `realpath` would name it, and some names it holds, so a
-/// child can be checked against the listing rather than resolved again.
+/// A directory as `realpath` would name it, and the names read from it so
+/// far, so a child can be checked against the listing rather than resolved
+/// again.
 #[cfg(unix)]
 #[derive(Debug)]
 struct ResolvedDirectory {
     path: PathBuf,
-    entries: std::collections::HashSet<std::ffi::OsString>,
+    listing: std::cell::RefCell<Listing>,
+}
+
+/// The names read from one directory, and the rest of its listing.
+#[cfg(unix)]
+#[derive(Debug)]
+struct Listing {
+    names: std::collections::HashSet<std::ffi::OsString>,
+    /// `None` once the directory has been read whole, or could not be read.
+    unread: Option<std::fs::ReadDir>,
+}
+
+#[cfg(unix)]
+impl Listing {
+    /// Whether the directory holds `name` as spelled, reading one more chunk
+    /// of its listing when the names read so far do not.
+    fn holds(&mut self, name: &std::ffi::OsStr) -> bool {
+        if self.names.contains(name) {
+            return true;
+        }
+        let Some(unread) = &mut self.unread else {
+            return false;
+        };
+        let mut found = false;
+        for _ in 0..LISTING_CHUNK {
+            match unread.next() {
+                Some(Ok(entry)) => {
+                    let entry = entry.file_name();
+                    found |= entry == name;
+                    self.names.insert(entry);
+                }
+                // A listing that fails part way keeps what it read: every
+                // other child takes the full call, which is where it started.
+                Some(Err(_)) | None => {
+                    self.unread = None;
+                    break;
+                }
+            }
+        }
+        found
+    }
 }
 
 /// [`normalize_resolved_mapped_path`], resolving directory aliases through
@@ -259,20 +303,15 @@ impl PathAliases {
                 // without enumerating them. Recursing through this memo would
                 // list /nix/store just to reach a header inside one package.
                 let resolved = std::fs::canonicalize(parent)?;
-                // A listing that cannot be read is an empty one: every child
-                // then takes the full call, which is where it started.
-                let entries = std::fs::read_dir(&resolved)
-                    .map(|listing| {
-                        listing
-                            .take(MAX_DIRECTORY_ENTRIES)
-                            .filter_map(Result::ok)
-                            .map(|entry| entry.file_name())
-                            .collect()
-                    })
-                    .unwrap_or_default();
+                // A listing that cannot be opened is an empty one: every
+                // child then takes the full call, which is where it started.
+                let unread = std::fs::read_dir(&resolved).ok();
                 let resolved = std::rc::Rc::new(ResolvedDirectory {
                     path: resolved,
-                    entries,
+                    listing: std::cell::RefCell::new(Listing {
+                        names: std::collections::HashSet::new(),
+                        unread,
+                    }),
                 });
                 self.directories
                     .borrow_mut()
@@ -284,9 +323,9 @@ impl PathAliases {
         // The name has to be in the listing as written: on a volume that
         // folds case, `realpath` would answer with the name on disk, and a
         // spelling the listing does not contain takes the full call so that
-        // it still does. So does a link, anything beyond the listing budget,
-        // and anything the listing predates.
-        if resolved_parent.entries.contains(name)
+        // it still does. So does a link, a name the listing has not reached
+        // yet, and anything the listing predates.
+        if resolved_parent.listing.borrow_mut().holds(name)
             && !std::fs::symlink_metadata(&candidate)?
                 .file_type()
                 .is_symlink()
@@ -432,31 +471,39 @@ mod unix_tests {
     }
 
     #[test]
-    fn large_directory_listings_are_bounded_without_losing_paths() {
+    fn large_directory_listings_are_read_as_lookups_need_them() {
         let directory = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(directory.path()).unwrap();
         let store = root.join("store");
         std::fs::create_dir(&store).unwrap();
-        for index in 0..MAX_DIRECTORY_ENTRIES * 2 {
+        for index in 0..LISTING_CHUNK * 2 {
             std::fs::write(store.join(format!("header-{index}.h")), "").unwrap();
         }
         std::os::unix::fs::symlink(store.join("header-0.h"), store.join("link.h")).unwrap();
         let aliases = PathAliases::default();
         let mappings = [PathMapping::new(&store, "store")];
-        for index in 0..MAX_DIRECTORY_ENTRIES * 2 {
+        let listed = || {
+            aliases.directories.borrow()[&store]
+                .listing
+                .borrow()
+                .names
+                .len()
+        };
+        for index in 0..LISTING_CHUNK * 2 {
             let name = format!("header-{index}.h");
             assert_eq!(
                 normalize_resolved_mapped_path_with(&aliases, &store.join(&name), &root, &mappings)
                     .unwrap(),
                 format!("${{store}}/{name}")
             );
+            // One lookup reads one chunk at most, so a store-sized directory
+            // is never read whole for a handful of names.
+            if index == 0 {
+                assert_eq!(listed(), LISTING_CHUNK);
+            }
         }
         // Only the immediate parent is listed, never its ancestors.
         assert_eq!(aliases.directories.borrow().len(), 1);
-        assert_eq!(
-            aliases.directories.borrow()[&store].entries.len(),
-            MAX_DIRECTORY_ENTRIES
-        );
         assert_eq!(
             normalize_resolved_mapped_path_with(&aliases, &store.join("link.h"), &root, &mappings)
                 .unwrap(),
@@ -472,6 +519,48 @@ mod unix_tests {
             .unwrap(),
             "${store}/missing/subdir/header.h"
         );
+    }
+
+    #[test]
+    fn every_name_in_a_large_directory_resolves_through_its_remembered_parent() {
+        // JavaScriptCore's headers sit in one directory of about 1,600 names,
+        // and a compilation reads hundreds of them.
+        const HEADERS: usize = 1024;
+        let directory = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(directory.path()).unwrap();
+        for side in ["one", "two"] {
+            let include = root.join(side).join("include");
+            std::fs::create_dir_all(&include).unwrap();
+            for index in 0..HEADERS {
+                std::fs::write(include.join(format!("header-{index}.h")), "").unwrap();
+            }
+        }
+        let mappings = [
+            PathMapping::new(root.join("one"), "one"),
+            PathMapping::new(root.join("two"), "two"),
+        ];
+        let aliases = PathAliases::default();
+        let header = |index: usize| root.join("one/include").join(format!("header-{index}.h"));
+        for index in 0..HEADERS {
+            assert_eq!(
+                normalize_resolved_mapped_path_with(&aliases, &header(index), &root, &mappings)
+                    .unwrap(),
+                format!("${{one}}/include/header-{index}.h")
+            );
+        }
+        // Turning `one` into a link to `two` tells the two kinds of lookup
+        // apart: a name checked against the remembered parent stays in `one`,
+        // while a full `realpath` walk would now land in `two`. Every name,
+        // however far into the listing, takes the first kind.
+        std::fs::rename(root.join("one"), root.join("moved")).unwrap();
+        std::os::unix::fs::symlink(root.join("two"), root.join("one")).unwrap();
+        for index in 0..HEADERS {
+            assert_eq!(
+                normalize_resolved_mapped_path_with(&aliases, &header(index), &root, &mappings)
+                    .unwrap(),
+                format!("${{one}}/include/header-{index}.h")
+            );
+        }
     }
 
     #[test]

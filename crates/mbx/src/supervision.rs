@@ -22,9 +22,20 @@ pub(crate) fn prepare(command: &mut Command, eligible: bool) -> Option<Action> {
         return None;
     }
     let pool = crate::scheduler::pool()?;
-    let settings = crate::config::Config::load().ok()?.scheduler;
-    let enabled = std::env::var("MBX_SCHED_SUSPEND").ok().map_or(
-        settings.suspend && settings.pressure && settings.memory_bytes.is_some(),
+    // A session hands its shims its decision (`session_environment_with_jobs`);
+    // only a shim outside one loads the configuration, which measures the
+    // cache and target disks on every compiler spawn.
+    let decided = std::env::var("MBX_SCHED_SUSPEND").ok();
+    let settings = match decided {
+        Some(_) => None,
+        None => Some(crate::config::Config::load().ok()?.scheduler),
+    };
+    let enabled = decided.map_or_else(
+        || {
+            settings.as_ref().is_some_and(|settings| {
+                settings.suspend && settings.pressure && settings.memory_bytes.is_some()
+            })
+        },
         |v| v == "1",
     );
     if !enabled {
@@ -37,7 +48,15 @@ pub(crate) fn prepare(command: &mut Command, eligible: bool) -> Option<Action> {
         }
         let root = std::env::var_os("MBX_SCHED_CGROUP_ROOT")
             .map(std::path::PathBuf::from)
-            .or(settings.cgroup_root);
+            .or_else(|| {
+                settings
+                    .or_else(|| {
+                        crate::config::Config::load()
+                            .ok()
+                            .map(|config| config.scheduler)
+                    })
+                    .and_then(|settings| settings.cgroup_root)
+            });
         match root
             .filter(|p| !p.as_os_str().is_empty())
             .ok_or_else(|| eyre::eyre!("scheduler.cgroup_root is not configured"))
