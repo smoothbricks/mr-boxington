@@ -172,9 +172,11 @@ native links are cached:
     target spelling). The wrapper adds link flags from them, and on macOS picks
     an SDK of its own, none of which the key covers. A link with no wrapper in
     it reads none of those variables, so they do not refuse it: a driver that
-    is no cc-wrapper, such as nixpkgs' `clang-unwrapped`, running the linker
-    `-C link-arg=-fuse-ld=<absolute path>` names, which is no bintools-wrapper
-    either.
+    is no cc-wrapper, such as Xcode's `clang` or nixpkgs' `clang-unwrapped`,
+    whose `ld` is no bintools-wrapper, whether that is the absolute path
+    `-C link-arg=-fuse-ld=<path>` names or the `ld` the driver names for
+    `-print-prog-name=ld`. A `-fuse-ld` word still refuses, and so does a link
+    whose linker cannot be told.
 
 The same goes for a driver that names no linker or reports no version. mbx
 refuses these hosts rather than leaving the missing input out of the key: two
