@@ -28,8 +28,8 @@ pub(super) struct ReserveArgs {
     #[usage(long, default = "normal")]
     pub(super) priority: SchedulerPriority,
     /// When the job an `interactive` reservation runs for started, in
-    /// milliseconds since the Unix epoch: asked 30 seconds after it, the
-    /// reservation is admitted as `normal`, and 120 seconds after it as `low`.
+    /// milliseconds since the Unix epoch: asked 120 seconds after it, the
+    /// reservation is admitted as `normal`, and 240 seconds after it as `low`.
     #[usage(long, value_name = "MS")]
     pub(super) job_started: Option<u64>,
     /// The class this reservation's run time is remembered and predicted by,

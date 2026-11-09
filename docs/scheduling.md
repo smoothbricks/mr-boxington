@@ -273,16 +273,17 @@ band.
 
 An `interactive` request decays by the age of the job it runs for, named by
 `MBX_SCHEDULER_JOB_STARTED_MS`, `mbx reserve --job-started` or a reservation's
-`job_started_ms`, in milliseconds since the Unix epoch. Asking within 30
-seconds of that start, it is admitted as `interactive`; from 30 to 120 seconds,
-as `normal`; after that, as `low`. The band is decided once, when the request
-asks, and kept while it waits; one without a job start (absent, or empty as
-cowshed sets it for every job that is not interactive, so a nested job never
-inherits its caller's start) stays `interactive`. Only an `interactive`
-request reads its job start, so a `normal` or `low` request never decays. A
-decayed request's decision rows carry `decayed: {from, to, elapsed_ms}`. A
-granted request's band no longer matters: nothing admitted is preempted. A
-version that does not know a band reads it as `low`.
+`job_started_ms`, in milliseconds since the Unix epoch. Asking within 120
+seconds of that start, it is admitted as `interactive`; from 120 to 240
+seconds, as `normal`; after that, as `low`. The band is decided once, when the
+request asks, and kept while it waits; one without a job start (absent, or
+empty as cowshed sets it for every job that is not interactive, so a nested
+job never inherits its caller's start) stays `interactive`. Only an
+`interactive` request reads its job start, so a `normal` or `low` request
+never decays. A decayed request's decision rows carry
+`decayed: {from, to, elapsed_ms}`. A granted request's band no longer
+matters: nothing admitted is preempted. A version that does not know a band
+reads it as `low`.
 
 A compiler or test process runs as many threads as it was charged for, so its
 request starts only when all of its cores fit. An

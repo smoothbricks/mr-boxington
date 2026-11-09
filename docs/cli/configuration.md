@@ -517,7 +517,7 @@ Cache hits never take a permit. A compilation that runs the compiler takes one f
 - **Scope:** only from the environment or the command line
 - **Set with:** `MBX_SCHEDULER_JOB_STARTED_MS`
 
-When the job this build runs for started, in milliseconds since the Unix epoch: an `interactive` request that asks 30 seconds after it is admitted as `normal`, and 120 seconds after it as `low`. Unset or empty, as cowshed sets it for every job that is not interactive, an `interactive` request stays `interactive`. Only an `interactive` request reads it.
+When the job this build runs for started, in milliseconds since the Unix epoch: an `interactive` request that asks 120 seconds after it is admitted as `normal`, and 240 seconds after it as `low`. Unset or empty, as cowshed sets it for every job that is not interactive, an `interactive` request stays `interactive`. Only an `interactive` request reads it.
 
 ### `scheduler.memory`
 
@@ -548,7 +548,7 @@ Works on Linux and macOS. Has no effect when `scheduler.memory` is `"none"`. Thi
 
 Priority of this build's compilations in the machine-wide permit pool.
 
-Waiting requests are admitted band by band: `interactive` (work a person or agent waits on), then `normal` (the land gate), then `low`, each band starting only on room no waiting request of a band above it can use. An `interactive` build decays to `normal` 30 seconds after `MBX_SCHEDULER_JOB_STARTED_MS` and to `low` 120 seconds after it. This may also be set in workspace `.mbx.toml`; the environment variable wins.
+Waiting requests are admitted band by band: `interactive` (work a person or agent waits on), then `normal` (the land gate), then `low`, each band starting only on room no waiting request of a band above it can use. An `interactive` build decays to `normal` 120 seconds after `MBX_SCHEDULER_JOB_STARTED_MS` and to `low` 240 seconds after it. This may also be set in workspace `.mbx.toml`; the environment variable wins.
 
 **Choices:**
 - `interactive`

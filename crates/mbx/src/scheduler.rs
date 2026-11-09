@@ -819,9 +819,12 @@ const AGING_MS: u64 = 30_000;
 
 /// How long after its job started an `interactive` request still asks as
 /// `interactive`; until [`NORMAL_UNTIL_MS`] it asks as `normal`, then as
-/// `low`. The bounds of the decay Danny set (tg#19152, tg#19154).
-const INTERACTIVE_FOR_MS: u64 = 30_000;
-const NORMAL_UNTIL_MS: u64 = 120_000;
+/// `low`. The bounds of the decay Danny set (tg#19152, tg#19154), moved to
+/// where the measured admission sweep put them: against 30 s and 120 s, its
+/// p95 fell 27 s and 0.85 pp more runs finished within the 240 s warm-cache
+/// window, and 120 s and 240 s sit inside its flat optimum.
+const INTERACTIVE_FOR_MS: u64 = 120_000;
+const NORMAL_UNTIL_MS: u64 = 240_000;
 
 /// The band a published priority is admitted in, the lower first: the pool's
 /// one lane order. A spelling this version does not know, a newer version's,

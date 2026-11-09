@@ -42,7 +42,7 @@ const TRACES: u64 = 2000;
 /// names is on it.
 const EPOCH_MS: u64 = 1_000_000_000;
 /// Asks come fewer than this many seconds into their jobs: past both bounds.
-const ELAPSED: u64 = 200;
+const ELAPSED: u64 = 320;
 const PRIORITIES: [SchedulerPriority; 3] = [
     SchedulerPriority::Interactive,
     SchedulerPriority::Normal,

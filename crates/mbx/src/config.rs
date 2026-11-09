@@ -469,8 +469,8 @@ struct RawScheduler {
     /// Waiting requests are admitted band by band: `interactive` (work a
     /// person or agent waits on), then `normal` (the land gate), then `low`,
     /// each band starting only on room no waiting request of a band above it
-    /// can use. An `interactive` build decays to `normal` 30 seconds after
-    /// `MBX_SCHEDULER_JOB_STARTED_MS` and to `low` 120 seconds after it. This
+    /// can use. An `interactive` build decays to `normal` 120 seconds after
+    /// `MBX_SCHEDULER_JOB_STARTED_MS` and to `low` 240 seconds after it. This
     /// may also be set in workspace `.mbx.toml`; the environment variable wins.
     #[usage(
         env = "MBX_SCHEDULER_PRIORITY",
@@ -507,8 +507,8 @@ struct RawScheduler {
     #[usage(env = "MBX_SCHEDULER_TESTS", default = false)]
     tests: bool,
     /// When the job this build runs for started, in milliseconds since the
-    /// Unix epoch: an `interactive` request that asks 30 seconds after it is
-    /// admitted as `normal`, and 120 seconds after it as `low`. Unset or
+    /// Unix epoch: an `interactive` request that asks 120 seconds after it is
+    /// admitted as `normal`, and 240 seconds after it as `low`. Unset or
     /// empty, as cowshed sets it for every job that is not interactive, an
     /// `interactive` request stays `interactive`. Only an `interactive`
     /// request reads it.
