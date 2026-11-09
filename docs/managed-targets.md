@@ -378,10 +378,13 @@ A target directory is removed when any of these is true:
 - It has gone unused for `target.max_age`, 30 days by default. The next build
   in that checkout can restore matching cached outputs. Evicted or unsupported
   work must compile again.
-- The managed targets together exceed `target.max_size`. The least recently
-  used go first, including the most recent directory if needed. Active builds
-  and `target.keep` protect targets; if protected state prevents meeting the
-  budget, mbx warns.
+- The managed targets together exceed `target.max_size` and its checkout is
+  out of reach: absent, but not provably deleted, such as one on a volume that
+  is not mounted. The least recently used go first, including the most recent
+  such directory if needed. The budget never takes the target of a checkout
+  that is present; see [Budgets scale with the disk](#budgets-scale-with-the-disk).
+  Active builds and `target.keep` protect targets; if protected or present
+  state prevents meeting the budget, mbx warns.
 - The disk is low on space. See [When the disk runs low](#when-the-disk-runs-low).
 
 [Keep or evict specific checkouts](#keep-or-evict-specific-checkouts) changes
@@ -470,6 +473,24 @@ measured, mbx uses 20 GiB, 30 GiB, and 20 GiB respectively. An explicit budget
 overrides these defaults, and `mbx gc --dry-run` previews the effect of a policy
 without deleting anything.
 
+`target.max_size` sorts each target directory by what its checkout is:
+
+- **Gone**: the checkout was deleted. Its target is always collected first,
+  whatever the budget.
+- **Out of reach**: the checkout is absent but cannot be proved deleted, such
+  as one on a volume that is not mounted now. The budget takes these, least
+  recently used first.
+- **Present**: the checkout is there. The budget never takes its target, since
+  the next build there would only do the same work again. Only a disk short of
+  `gc.min_free_size` takes these, least recently used first, because running
+  out of disk is worse than a rebuild. See [When the disk runs low](#when-the-disk-runs-low).
+
+So present checkouts can hold more than the budget, and `mbx gc` warns when
+they do. On one machine shared by many coding-agent checkouts, a single
+hourly sweep had evicted 34 present checkouts' targets, 107.1 GiB and about
+700,000 files, for those builds to recompile. At the time, 25 of the 32
+recorded targets belonged to present checkouts and 7 to absent ones.
+
 ### Keep or evict specific checkouts
 
 `target.keep` lists checkouts whose targets are never collected for age or
@@ -519,9 +540,9 @@ private state and shared cache data regardless of the budgets:
 1. Learned incremental state and generated source trees, least recently used
    first. Units of checkouts that builds are using lose their finished rustc
    sessions, including those used in the last hour.
-2. Managed target directories, least recently used first, with
-   `target.evict_first` checkouts ahead of the rest and `target.keep` checkouts
-   left alone.
+2. Managed target directories, least recently used first, those of present
+   checkouts included, with `target.evict_first` checkouts ahead of the rest
+   and `target.keep` checkouts left alone.
 3. Shared cache objects on the cache disk, after collecting private state and
    managed targets stops removing anything.
 

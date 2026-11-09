@@ -463,6 +463,7 @@ fn a_directory_and_one_inside_it_are_on_the_same_disk() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn a_combined_budget_shares_unoccupied_store_capacity() {
     for automatic in [false, true] {
@@ -476,15 +477,19 @@ fn a_combined_budget_shares_unoccupied_store_capacity() {
             min_free: None,
             ..always_short()
         };
+        // Out of reach, as a size budget takes no view of a present checkout.
         let views = [("older", 1), ("newer", 2)].map(|(name, updated_secs)| {
-            low_disk_view(
+            let parent = directory.path().join(name);
+            let view = low_disk_view(
                 &config,
-                directory.path(),
-                name,
+                &parent,
+                "checkout",
                 updated_secs,
                 &[("artifact", 64)],
                 false,
-            )
+            );
+            crate::target::unmount(&parent.join("checkout"));
+            view
         });
         let collect = || {
             if automatic {
@@ -1253,5 +1258,77 @@ fn only_a_background_sweep_with_room_on_the_disks_is_paced() {
     assert!(
         paced(&config, &always_short(), Pace::Background).is_none(),
         "a short disk gets its space back at full speed"
+    );
+}
+
+/// A budget sweep keeps the target directory of every checkout that is
+/// present, however far over `target.max_size` they are: evicting one only
+/// makes its next build redo the work. On 2026-11-10 one hourly sweep evicted
+/// 34 such views, 107.1 GiB.
+#[test]
+fn a_budget_sweep_keeps_every_present_checkouts_target() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut config = super::cargo_tests::managed_target_config(directory.path());
+    config.gc.auto = true;
+    config.gc.interval = Duration::ZERO;
+    let retention = RetentionSettings {
+        target_max_bytes: Some(0),
+        target_max_age: None,
+        min_free: None,
+        ..RetentionSettings::default()
+    };
+    let views = [("older", 1), ("newer", 2)].map(|(name, updated_secs)| {
+        low_disk_view(
+            &config,
+            directory.path(),
+            name,
+            updated_secs,
+            &[("artifact", 64)],
+            false,
+        )
+    });
+
+    let sweep = sweep_store(&config, &retention);
+
+    assert!(
+        views.iter().all(|view| view.exists()),
+        "present checkouts keep their targets over budget: {:?}",
+        sweep.lines
+    );
+}
+
+/// A disk short of `gc.min_free_size` still takes a present checkout's
+/// target, least recently used first: running out of disk is worse than a
+/// rebuild.
+#[test]
+fn a_short_disk_takes_present_checkouts_targets_oldest_first() {
+    let directory = tempfile::tempdir().unwrap();
+    let config = super::cargo_tests::managed_target_config(directory.path());
+    let [older, newer] = [("older", 1), ("newer", 2)].map(|(name, updated_secs)| {
+        low_disk_view(
+            &config,
+            directory.path(),
+            name,
+            updated_secs,
+            &[("artifact", 64)],
+            false,
+        )
+    });
+
+    let outcome = crate::target::collect_by(
+        &config.target.root,
+        Some(64),
+        None,
+        &Default::default(),
+        crate::target::Urgency::ShortDisk,
+        false,
+    )
+    .unwrap();
+
+    assert_eq!(outcome.removed_live_views, 1, "{outcome:?}");
+    assert!(!older.exists(), "the least recently used goes first");
+    assert!(
+        newer.exists(),
+        "one removal brings the targets within the limit"
     );
 }

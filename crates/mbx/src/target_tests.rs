@@ -787,8 +787,21 @@ fn keeps_the_target_directory_of_an_idle_checkout() {
     assert!(managed.join("artifact").exists());
 }
 
+/// A size limit applied as a disk short of \`gc.min_free_size\` applies it:
+/// the one collection that reaches the views of checkouts that are present.
+fn collect_short(root: &Path, max_bytes: Option<u64>, dry_run: bool) -> CollectionOutcome {
+    collect_by(
+        root,
+        max_bytes,
+        None,
+        &Precedence::default(),
+        Urgency::ShortDisk,
+        dry_run,
+    )
+    .unwrap()
+}
 #[test]
-fn target_budget_collects_oldest_live_view_first() {
+fn a_size_limit_collects_the_oldest_view_first() {
     let directory = tempfile::tempdir().unwrap();
     let config = test_config(directory.path(), true);
     let old_workspace = checkout(directory.path(), "old");
@@ -815,7 +828,7 @@ fn target_budget_collects_oldest_live_view_first() {
     record.updated_secs = 1;
     std::fs::write(&old_record, serde_json::to_vec(&record).unwrap()).unwrap();
 
-    let outcome = collect(&config.target.root, Some(10), None, false).unwrap();
+    let outcome = collect_short(&config.target.root, Some(10), false);
 
     assert_eq!(outcome.removed_live_views, 1);
     assert_eq!(outcome.removed_bytes, 5);
@@ -848,7 +861,7 @@ fn dry_run_leaves_selected_target_views_in_place() {
     std::fs::write(old.join("artifact"), b"outputs").unwrap();
     age_view(&config.target.root, &old_workspace, 1);
 
-    let outcome = collect(&config.target.root, Some(0), None, true).unwrap();
+    let outcome = collect_short(&config.target.root, Some(0), true);
 
     assert_eq!(outcome.removed_live_views, 1);
     assert!(old.join("artifact").exists());
@@ -864,7 +877,7 @@ fn age_view(root: &Path, workspace_root: &Path, updated_secs: u64) {
 }
 
 #[test]
-fn a_budget_smaller_than_one_target_directory_collects_it() {
+fn a_limit_smaller_than_one_target_directory_collects_it() {
     let directory = tempfile::tempdir().unwrap();
     let config = test_config(directory.path(), true);
     let workspace = checkout(directory.path(), "project");
@@ -873,8 +886,8 @@ fn a_budget_smaller_than_one_target_directory_collects_it() {
 
     age_view(&config.target.root, &workspace, 1);
 
-    // The budget applies even when just one inactive target remains.
-    let outcome = collect(&config.target.root, Some(16), None, false).unwrap();
+    // The limit applies even when just one inactive target remains.
+    let outcome = collect_short(&config.target.root, Some(16), false);
 
     assert_eq!(outcome.removed_views, 1);
     assert_eq!(outcome.remaining_bytes, 0);
@@ -882,7 +895,7 @@ fn a_budget_smaller_than_one_target_directory_collects_it() {
 }
 
 #[test]
-fn an_over_budget_sweep_collects_even_the_most_recently_used_view() {
+fn a_short_disk_collects_even_the_most_recently_used_view() {
     let directory = tempfile::tempdir().unwrap();
     let config = test_config(directory.path(), true);
     let old_workspace = checkout(directory.path(), "old");
@@ -906,8 +919,8 @@ fn an_over_budget_sweep_collects_even_the_most_recently_used_view() {
     age_view(&config.target.root, &old_workspace, 1);
     age_view(&config.target.root, &new_workspace, 2);
 
-    // Neither inactive view fits under this budget, so both go.
-    let outcome = collect(&config.target.root, Some(10), None, false).unwrap();
+    // Neither inactive view fits under this limit, so both go.
+    let outcome = collect_short(&config.target.root, Some(10), false);
 
     assert_eq!(outcome.removed_live_views, 2);
     assert!(!old.exists(), "the older view is collected");
@@ -1102,7 +1115,7 @@ fn a_view_a_build_is_compiling_in_is_kept() {
     let mut cargo = fslock::LockFile::open(&old.join("debug/.cargo-lock")).unwrap();
     assert!(cargo.try_lock().unwrap());
 
-    let outcome = collect(&config.target.root, Some(10), None, false).unwrap();
+    let outcome = collect_short(&config.target.root, Some(10), false);
 
     assert_eq!(outcome.kept_active_views, 1);
     assert_eq!(outcome.removed_views, 0);
@@ -1113,7 +1126,7 @@ fn a_view_a_build_is_compiling_in_is_kept() {
     // goes with the lock: Windows will not rename a directory while a file
     // inside it is open, which is the same answer as a held lock.
     drop(cargo);
-    let outcome = collect(&config.target.root, Some(10), None, false).unwrap();
+    let outcome = collect_short(&config.target.root, Some(10), false);
 
     assert_eq!(outcome.removed_live_views, 1);
     assert!(!old.exists());
@@ -1153,7 +1166,7 @@ fn a_view_claimed_since_the_selection_is_kept() {
         None,
         Some(Duration::from_secs(10)),
         &Precedence::default(),
-        RunningPrograms::Spare,
+        Urgency::Budget,
         false,
         now_secs(),
         move || {
@@ -1206,7 +1219,7 @@ fn a_checkout_recreated_since_the_selection_is_kept() {
         None,
         None,
         &Precedence::default(),
-        RunningPrograms::Spare,
+        Urgency::Budget,
         false,
         now_secs(),
         move || {
@@ -1250,7 +1263,7 @@ fn a_view_refreshed_within_the_last_seconds_is_kept() {
         None,
         Some(Duration::ZERO),
         &Precedence::default(),
-        RunningPrograms::Spare,
+        Urgency::Budget,
         false,
         now,
         || {},
@@ -1288,7 +1301,7 @@ fn a_record_rewritten_during_the_removal_is_kept() {
         None,
         None,
         &Precedence::default(),
-        RunningPrograms::Spare,
+        Urgency::Budget,
         false,
         now_secs(),
         || {},
@@ -1384,13 +1397,13 @@ fn a_kept_most_recent_target_does_not_spare_an_older_one() {
     };
 
     // Only the kept, most recent target fits: sparing `human` as well would
-    // leave the budget unmet for nothing.
+    // leave the limit unmet for nothing.
     let outcome = collect_by(
         &config.target.root,
         Some(1),
         None,
         &precedence,
-        RunningPrograms::Spare,
+        Urgency::ShortDisk,
         false,
     )
     .unwrap();
@@ -1420,7 +1433,7 @@ fn ranked_views(root: &Path, config: &Config) -> [(PathBuf, PathBuf); 4] {
 }
 
 #[test]
-fn over_budget_takes_evict_first_targets_before_older_ones_and_never_kept_ones() {
+fn a_short_disk_takes_evict_first_targets_before_older_ones_and_never_kept_ones() {
     let directory = tempfile::tempdir().unwrap();
     let config = test_config(directory.path(), true);
     let [kept, agent, human, newest] = ranked_views(directory.path(), &config);
@@ -1435,7 +1448,7 @@ fn over_budget_takes_evict_first_targets_before_older_ones_and_never_kept_ones()
         Some(21),
         None,
         &precedence,
-        RunningPrograms::Spare,
+        Urgency::ShortDisk,
         false,
     )
     .unwrap();
@@ -1446,13 +1459,13 @@ fn over_budget_takes_evict_first_targets_before_older_ones_and_never_kept_ones()
     assert!(kept.1.exists());
     assert!(newest.1.exists());
 
-    // Only the explicitly kept target survives a zero-byte budget.
+    // Only the explicitly kept target survives a zero-byte limit.
     let outcome = collect_by(
         &config.target.root,
         Some(0),
         None,
         &precedence,
-        RunningPrograms::Spare,
+        Urgency::ShortDisk,
         false,
     )
     .unwrap();
@@ -1477,7 +1490,7 @@ fn the_most_recent_target_is_collected_when_it_is_evict_first() {
         Some(0),
         None,
         &precedence,
-        RunningPrograms::Spare,
+        Urgency::ShortDisk,
         false,
     )
     .unwrap();
@@ -1505,7 +1518,7 @@ fn a_kept_target_outlives_its_age_but_not_its_checkout() {
         None,
         Some(Duration::from_secs(60)),
         &precedence,
-        RunningPrograms::Spare,
+        Urgency::Budget,
         false,
     )
     .unwrap();
@@ -1521,7 +1534,7 @@ fn a_kept_target_outlives_its_age_but_not_its_checkout() {
         None,
         None,
         &precedence,
-        RunningPrograms::Spare,
+        Urgency::Budget,
         false,
     )
     .unwrap();
@@ -1610,8 +1623,8 @@ fn views_sharing_a_seeded_link_count_it_once() {
     assert_eq!(stats(&config.target.root).unwrap().bytes, 115);
 
     // Removing the first view leaves the shared file in the second, so it
-    // frees only what the first held alone, and that meets the budget.
-    let outcome = collect(&config.target.root, Some(110), None, false).unwrap();
+    // frees only what the first held alone, and that meets the limit.
+    let outcome = collect_short(&config.target.root, Some(110), false);
     assert_eq!(outcome.removed_views, 1);
     assert_eq!(outcome.removed_bytes, 5);
     assert_eq!(outcome.released_bytes, 5);
@@ -1619,7 +1632,7 @@ fn views_sharing_a_seeded_link_count_it_once() {
     assert_eq!(outcome.remaining_bytes, 110);
     assert!(!first.exists());
 
-    let outcome = collect(&config.target.root, Some(0), None, false).unwrap();
+    let outcome = collect_short(&config.target.root, Some(0), false);
     assert_eq!(outcome.removed_bytes, 110, "the last link takes the file");
     assert_eq!(outcome.released_bytes, 110);
     assert_eq!(outcome.remaining_bytes, 0);
@@ -1641,7 +1654,7 @@ fn old_views_sharing_a_file_do_not_drag_a_newer_one_into_eviction() {
     std::fs::hard_link(first.join("shared"), second.join("shared")).unwrap();
     let newest = view_with(directory.path(), &config, "newest", 3, &[("own", 50)]);
 
-    let outcome = collect(&config.target.root, Some(60), None, false).unwrap();
+    let outcome = collect_short(&config.target.root, Some(60), false);
 
     assert_eq!(outcome.removed_views, 2);
     assert_eq!(outcome.removed_bytes, 102);
@@ -1659,7 +1672,7 @@ fn a_view_linked_to_the_store_is_removed_without_releasing_the_link() {
     std::fs::write(&object, vec![0_u8; 40]).unwrap();
     std::fs::hard_link(&object, view.join("restored")).unwrap();
 
-    let outcome = collect(&config.target.root, Some(0), None, false).unwrap();
+    let outcome = collect_short(&config.target.root, Some(0), false);
 
     assert_eq!(outcome.removed_bytes, 43);
     assert_eq!(
@@ -1678,12 +1691,41 @@ fn a_dry_run_weighs_shared_files_like_a_real_one() {
     let first = view_with(directory.path(), &config, "first", 1, &[("own", 5)]);
     view_with(directory.path(), &config, "second", 2, &[("own", 10)]);
 
-    let outcome = collect(&config.target.root, Some(10), None, true).unwrap();
+    let outcome = collect_short(&config.target.root, Some(10), true);
 
     assert_eq!(outcome.removed_views, 1);
     assert_eq!(outcome.removed_bytes, 5);
     assert_eq!(outcome.remaining_bytes, 10);
     assert!(first.join("own").exists());
+}
+
+/// A size budget keeps every view of a checkout that is present and takes
+/// those of checkouts out of reach, least recently used first.
+#[cfg(unix)]
+#[test]
+fn a_budget_takes_only_out_of_reach_checkouts_oldest_first() {
+    let directory = tempfile::tempdir().unwrap();
+    let config = test_config(directory.path(), true);
+    let present = view_with(directory.path(), &config, "present", 1, &[("own", 100)]);
+    let [older, newer] = [("older", 2), ("newer", 3)].map(|(name, updated_secs)| {
+        let parent = directory.path().join(name);
+        let view = view_with(&parent, &config, "checkout", updated_secs, &[("own", 10)]);
+        crate::target::unmount(&parent.join("checkout"));
+        view
+    });
+
+    let outcome = collect(&config.target.root, Some(110), None, false).unwrap();
+
+    assert_eq!(outcome.removed_live_views, 1, "{outcome:?}");
+    assert!(!older.exists(), "the least recently used goes first");
+    assert!(newer.exists(), "one removal meets the budget");
+    assert!(present.exists(), "a present checkout keeps its view");
+
+    let outcome = collect(&config.target.root, Some(0), None, false).unwrap();
+
+    assert_eq!(outcome.removed_live_views, 1, "{outcome:?}");
+    assert!(!newer.exists());
+    assert!(present.exists(), "however far over the budget");
 }
 
 #[test]
@@ -1774,7 +1816,7 @@ fn a_file_written_after_the_measure_is_not_credited() {
         None,
         Some(Duration::from_secs(10)),
         &Precedence::default(),
-        RunningPrograms::Spare,
+        Urgency::Budget,
         false,
         now_secs(),
         || {},

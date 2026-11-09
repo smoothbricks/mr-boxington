@@ -713,7 +713,7 @@ Collect managed targets, and build units inside them, unused this long, or `"non
 
 Size budget for managed targets, or `"none"`.
 
-Over budget, mbx collects inactive managed targets least recently used first. Use `target.keep` to protect specific checkouts.
+Over budget, mbx collects the targets of checkouts that are out of reach, least recently used first; a checkout that is present keeps its target until the disk is short of `gc.min_free_size`. Use `target.keep` to protect specific checkouts.
 
 ### `target.root`
 

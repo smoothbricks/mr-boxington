@@ -623,8 +623,10 @@ struct RawTarget {
     root: Option<PathBuf>,
     /// Size budget for managed targets, or `"none"`.
     ///
-    /// Over budget, mbx collects inactive managed targets least recently used
-    /// first. Use `target.keep` to protect specific checkouts.
+    /// Over budget, mbx collects the targets of checkouts that are out of
+    /// reach, least recently used first; a checkout that is present keeps its
+    /// target until the disk is short of `gc.min_free_size`. Use `target.keep`
+    /// to protect specific checkouts.
     #[usage(
         env = "MBX_TARGET_MAX_SIZE",
         default_note = "10% of the target disk, from 10 GiB to 100 GiB; shared budget when `gc.max_total_size` is set"

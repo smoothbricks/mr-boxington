@@ -259,7 +259,7 @@ fn a_lease_taken_after_the_selection_is_kept() {
         None,
         Some(Duration::from_secs(10)),
         &Precedence::default(),
-        RunningPrograms::Spare,
+        Urgency::Budget,
         false,
         now_secs(),
         || {
@@ -304,7 +304,7 @@ fn a_command_arriving_during_the_removal_waits_and_finds_the_view_gone() {
         None,
         Some(Duration::from_secs(10)),
         &Precedence::default(),
-        RunningPrograms::Spare,
+        Urgency::Budget,
         false,
         now_secs(),
         || {},
@@ -635,7 +635,7 @@ fn a_command_waiting_on_the_removal_keeps_the_record_it_writes() {
         None,
         Some(Duration::from_secs(10)),
         &Precedence::default(),
-        RunningPrograms::Spare,
+        Urgency::Budget,
         false,
         now_secs(),
         || {},
@@ -1250,10 +1250,10 @@ impl Drop for Program {
 }
 
 /// A budget collection with nothing else holding the view: the checkout is
-/// live and its record old, so only the budget selects it.
+/// out of reach and its record old, so only the budget selects it.
 #[cfg(target_os = "linux")]
-fn collect_to_nothing(root: &Path, programs: RunningPrograms) -> CollectionOutcome {
-    collect_by(root, Some(0), None, &Precedence::default(), programs, false).unwrap()
+fn collect_to_nothing(root: &Path, urgency: Urgency) -> CollectionOutcome {
+    collect_by(root, Some(0), None, &Precedence::default(), urgency, false).unwrap()
 }
 
 /// The original report: a harness ran `target/debug/<bin>` for a long time,
@@ -1270,8 +1270,10 @@ fn a_program_running_from_a_view_keeps_it_from_a_budget() {
     }
     let directory = tempfile::tempdir().unwrap();
     let config = lease_test_config(directory.path(), true);
-    let (workspace, view) = expired_view(directory.path(), &config, "project");
-    let (_idle_workspace, idle) = expired_view(directory.path(), &config, "idle");
+    let (workspace, view) = expired_view(&directory.path().join("project"), &config, "checkout");
+    let (idle_workspace, idle) = expired_view(&directory.path().join("idle"), &config, "checkout");
+    unmount(&workspace);
+    unmount(&idle_workspace);
     let mut program = run_from_view(&view);
 
     let preview = collect_by(
@@ -1279,11 +1281,11 @@ fn a_program_running_from_a_view_keeps_it_from_a_budget() {
         Some(0),
         None,
         &Precedence::default(),
-        RunningPrograms::Spare,
+        Urgency::Budget,
         true,
     )
     .unwrap();
-    let outcome = collect_to_nothing(&config.target.root, RunningPrograms::Spare);
+    let outcome = collect_to_nothing(&config.target.root, Urgency::Budget);
 
     assert_eq!(preview.kept_active_views, 1, "{preview:?}");
     assert_eq!(outcome.kept_active_views, 1, "{outcome:?}");
@@ -1293,7 +1295,7 @@ fn a_program_running_from_a_view_keeps_it_from_a_budget() {
     assert!(is_recorded(&config.target.root, &workspace));
 
     program.stop();
-    let outcome = collect_to_nothing(&config.target.root, RunningPrograms::Spare);
+    let outcome = collect_to_nothing(&config.target.root, Urgency::Budget);
 
     assert_eq!(outcome.kept_active_views, 0, "{outcome:?}");
     assert_eq!(outcome.removed_live_views, 1);
@@ -1317,7 +1319,7 @@ fn a_short_disk_collects_a_view_a_program_runs_from() {
     let (_workspace, view) = expired_view(directory.path(), &config, "project");
     let mut program = run_from_view(&view);
 
-    let outcome = collect_to_nothing(&config.target.root, RunningPrograms::Ignore);
+    let outcome = collect_to_nothing(&config.target.root, Urgency::ShortDisk);
 
     assert_eq!(outcome.kept_active_views, 0, "{outcome:?}");
     assert_eq!(outcome.removed_live_views, 1);
@@ -1338,16 +1340,17 @@ fn a_view_with_a_file_a_program_has_open_is_kept() {
     }
     let directory = tempfile::tempdir().unwrap();
     let config = lease_test_config(directory.path(), true);
-    let (_workspace, view) = expired_view(directory.path(), &config, "project");
+    let (workspace, view) = expired_view(&directory.path().join("project"), &config, "checkout");
+    unmount(&workspace);
     let open = std::fs::File::open(view.join("artifact")).unwrap();
 
-    let outcome = collect_to_nothing(&config.target.root, RunningPrograms::Spare);
+    let outcome = collect_to_nothing(&config.target.root, Urgency::Budget);
 
     assert_eq!(outcome.kept_active_views, 1, "{outcome:?}");
     assert!(view.join("artifact").exists());
 
     drop(open);
-    let outcome = collect_to_nothing(&config.target.root, RunningPrograms::Spare);
+    let outcome = collect_to_nothing(&config.target.root, Urgency::Budget);
 
     assert_eq!(outcome.removed_live_views, 1, "{outcome:?}");
     assert!(!view.exists());
