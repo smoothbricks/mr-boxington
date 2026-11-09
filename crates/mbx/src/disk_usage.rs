@@ -517,12 +517,13 @@ pub(crate) struct TreeRemoval<T> {
 
 /// Delete `root` and everything under it, and report what went.
 ///
-/// The deletion is [`std::fs::remove_dir_all`], which never follows a
-/// symbolic link or junction, even one swapped in for a directory while it
-/// runs; a walk that opens each directory by path could be led outside
-/// `root`. Each file is identified beforehand, while it can still be opened,
-/// and only that account is kept, not its path. A removal that stops partway
-/// lists what survived and reports the rest, matching files by `key`.
+/// The deletion is [`crate::store::unlink_pace::remove_dir_all`], which, as
+/// std's does, never follows a symbolic link or junction, even one swapped in
+/// for a directory while it runs; a walk that opens each directory by path
+/// could be led outside `root`. Each file is identified beforehand, while it
+/// can still be opened, and only that account is kept, not its path. A
+/// removal that stops partway lists what survived and reports the rest,
+/// matching files by `key`.
 pub(crate) fn remove_tree_reporting<T, K: Eq + std::hash::Hash>(
     root: &Path,
     mut identify: impl FnMut(&Path, &std::fs::Metadata) -> Option<T>,
@@ -530,7 +531,7 @@ pub(crate) fn remove_tree_reporting<T, K: Eq + std::hash::Hash>(
 ) -> TreeRemoval<T> {
     let (mut files, mut entries) = list_tree(root, &mut identify);
     let result = match std::fs::symlink_metadata(root) {
-        Ok(metadata) if metadata.is_dir() => std::fs::remove_dir_all(root),
+        Ok(metadata) if metadata.is_dir() => crate::store::unlink_pace::remove_dir_all(root),
         // On Windows std deletes a read-only file with the disposition that
         // ignores the attribute, and never clears it: a seeded output's
         // surviving link in another view must stay read-only, or the
