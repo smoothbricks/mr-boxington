@@ -260,9 +260,15 @@ unused-byte averages use only successful unwrapped measurements. Missing peaks
 count as observations but do not contribute to measured statistics. Without
 observations, this section shows a short empty-state line.
 
-The pool admits requests in one order: `normal` priority before `low`, and
-within a priority by arrival, except that a request which has waited 30 seconds
-goes ahead of every younger request of its priority.
+The pool admits requests in one order: `normal` priority before `low`. Within
+a priority, a request that has waited 30 seconds goes first, oldest first; every
+other request goes in order of its predicted run time, shortest first, then by
+arrival. A request's prediction is the median of its class's last eight
+successful run times, kept in the memory ledger: a compile's crate, a link's
+binary and profile, a test binary's or a nextest test's name, a reservation's
+`--name`. A class with none takes the median of its kind's classes, and a
+request whose kind has no history goes after every predicted request of its
+priority.
 
 A compiler or test process runs as many threads as it was charged for, so its
 request starts only when all of its cores fit. An
@@ -399,6 +405,10 @@ should go after waiting normal-priority work; an admitted
 reservation, like an admitted compiler, is never preempted or narrowed. `--grant-fd` tells a
 supervisor when the reservation gets its capacity; see
 [Tell a supervisor when work holds capacity](#tell-a-supervisor-when-work-holds-capacity).
+`--name nx:<workspace>:<task>` names the reservation's class: the pool records
+its run time under that name and orders it by the class's history. Without
+`--name`, a reservation is named `mbx reserve` and predicted by the median of
+the named classes.
 
 ### Serve reservations to many commands
 
@@ -425,8 +435,9 @@ A client connects and writes one JSON object per line:
 ```
 
 `reserve` asks for at most `cpus` cores at a `priority`, with an optional
-`memory` in bytes, and is admitted exactly as `mbx reserve --cpus --priority
---memory` is: the same pool, the same order, and as many of its cores as are
+`memory` in bytes and an optional `name`, the class its run time is predicted
+by, and is admitted exactly as `mbx reserve --cpus --priority --memory --name`
+is: the same pool, the same order, and as many of its cores as are
 free once one is. The answer is `granted` with the cores the request holds, or
 `refused` with the pool's error, after which the connection keeps serving.
 `release` gives a grant back, or withdraws a request that still waits; it has

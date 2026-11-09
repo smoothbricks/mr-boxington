@@ -18,6 +18,7 @@ This is for work such as a VM, Docker build, or another compiler that consumes t
 - **`--priority <PRIORITY>`** — Priority in the machine-wide pool: `low` goes after waiting normal-priority work.
 
   **Default:** `normal`
+- **`--name <CLASS>`** — The class this reservation's run time is remembered and predicted by, such as `nx:<workspace>:<task>`: within a priority, the pool admits the requests predicted shortest first. Without one, the reservation is named `mbx reserve` and predicted by the median of the named classes.
 - **`--grant-fd <FD>`** — Descriptor to announce the reservation on: one byte, `g`, once capacity is granted, and `r` once it is released after the command.
 
   mbx closes the descriptor after `r`, and the command never inherits it, so a reader sees end of file after `r`, or with no `g` when mbx exited before capacity was granted. The command starts only once `g` is written. A reservation nested in another is granted at once. For this reservation, the descriptor takes the place of an inherited `MBX_GRANT_FD`.

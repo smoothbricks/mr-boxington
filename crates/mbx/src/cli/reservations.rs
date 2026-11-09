@@ -10,7 +10,8 @@
 //! The protocol is newline-delimited JSON, one object per line:
 //!
 //! - `{"type":"reserve","id":N,"cpus":C,"priority":"normal"|"low"}`, with an
-//!   optional `"memory":BYTES`, asks for at most `C` cores. The reply is
+//!   optional `"memory":BYTES` and an optional `"name":"<class>"`, the class
+//!   the pool predicts its run time by, asks for at most `C` cores. The reply is
 //!   `{"type":"granted","id":N,"cpus":K}` once the pool admits it, `K` being
 //!   the cores it holds: as many of `C` as were free, at least one. A request
 //!   the pool refuses is answered `{"type":"refused","id":N,"error":"..."}`.
@@ -64,6 +65,10 @@ pub(super) enum Request {
         priority: SchedulerPriority,
         #[serde(default)]
         memory: Option<u64>,
+        /// The class the pool keeps this reservation's run times under and
+        /// predicts it by.
+        #[serde(default)]
+        name: Option<String>,
     },
     /// Give grant `id` back, or withdraw it while it waits.
     Release { id: u64 },
@@ -270,6 +275,7 @@ impl Drop for Withdraw {
 /// as `mbx reserve` records its own, with no command outcome to name.
 struct Hold {
     pool: Arc<Pool>,
+    name: Option<String>,
     admission: Admission,
     permit: Option<Permit>,
 }
@@ -277,7 +283,8 @@ struct Hold {
 impl Drop for Hold {
     fn drop(&mut self) {
         drop(self.permit.take());
-        self.pool.observe_reservation(self.admission, None);
+        self.pool
+            .observe_reservation(self.name.as_deref(), self.admission, None);
     }
 }
 
@@ -286,6 +293,7 @@ struct Answer {
     id: u64,
     ticket: u64,
     pool: Arc<Pool>,
+    name: Option<String>,
     outcome: Result<Option<(Permit, Admission)>>,
 }
 
@@ -305,7 +313,8 @@ impl Connection {
                 cpus,
                 priority,
                 memory,
-            }) => self.reserve(id, cpus, priority, memory),
+                name,
+            }) => self.reserve(id, cpus, priority, memory, name),
             Ok(Request::Release { id }) => match self.slots.remove(&id) {
                 Some(_) => Step::Quiet,
                 None => Step::Close(format!("no reservation {id} on this connection to release")),
@@ -320,6 +329,7 @@ impl Connection {
         cpus: u64,
         priority: SchedulerPriority,
         memory: Option<u64>,
+        name: Option<String>,
     ) -> Step {
         if self.slots.contains_key(&id) {
             return Step::Close(format!(
@@ -337,12 +347,13 @@ impl Connection {
         let started = std::thread::Builder::new()
             .name(format!("mbx-reservation-{id}"))
             .spawn(move || {
-                let outcome = pool.reserve_observed(Some(cpus), memory, &waiting);
+                let outcome = pool.reserve_observed(Some(cpus), memory, name.as_deref(), &waiting);
                 // A connection that has ended drops the answer, and any grant in it.
                 let _ = answers.send(Answer {
                     id,
                     ticket,
                     pool,
+                    name,
                     outcome,
                 });
             });
@@ -369,6 +380,7 @@ impl Connection {
             id,
             ticket,
             pool,
+            name,
             outcome,
         } = answer;
         let waiting = matches!(
@@ -388,6 +400,7 @@ impl Connection {
                     Slot::Held {
                         _grant: Hold {
                             pool,
+                            name,
                             admission,
                             permit: Some(permit),
                         },

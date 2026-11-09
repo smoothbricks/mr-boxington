@@ -22,6 +22,15 @@ impl Admission {
     pub(crate) fn cpus(&self) -> u64 {
         self.resources.cpu
     }
+
+    /// How long the admitted run has held its grant.
+    pub(crate) fn run_ms(&self) -> u64 {
+        self.started
+            .elapsed()
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX)
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -57,11 +66,19 @@ struct Observation {
 impl Pool {
     pub(super) fn observe(&self, demand: &Demand, status: &ExitStatus, peak: Option<u64>) {
         // Take once: repeated completion calls and unscheduled runs cannot log.
-        let admission = demand.observation.take();
+        let Some(admission) = demand.observation.take() else {
+            return;
+        };
+        let run_ms = admission.run_ms();
+        if status.success() {
+            let (kind, class) = demand.run_class();
+            if let Err(error) = self.record_run(kind, &class, run_ms) {
+                debug!("scheduler run time was not recorded: {error:#}");
+            }
+        }
         if !self.events || self.bytes_per_permit == 0 {
             return;
         }
-        let Some(admission) = admission else { return };
         let kind = if demand.per_test.is_some() {
             "nextest-test"
         } else if demand.learns_cpu {
@@ -97,12 +114,7 @@ impl Pool {
             outcome: outcome(status),
             wrapped: !demand.count_compile_samples,
             admission_wait_ms: admission.wait_ms,
-            run_ms: admission
-                .started
-                .elapsed()
-                .as_millis()
-                .try_into()
-                .unwrap_or(u64::MAX),
+            run_ms,
         };
         if let Err(error) = append(&self.dir, observation) {
             debug!("scheduler observation was not recorded: {error:#}");
@@ -115,10 +127,11 @@ impl Pool {
         &self,
         cpus: Option<u64>,
         memory_bytes: Option<u64>,
+        name: Option<&str>,
         withdrawn: &AtomicBool,
     ) -> Result<Option<(super::Permit, Admission)>> {
         let requested_at = Instant::now();
-        let Some(permit) = self.reserve(cpus, memory_bytes, withdrawn)? else {
+        let Some(permit) = self.reserve(cpus, memory_bytes, name, withdrawn)? else {
             return Ok(None);
         };
         let (resources, weight) = permit.granted()?;
@@ -140,7 +153,21 @@ impl Pool {
         )))
     }
 
-    pub(crate) fn observe_reservation(&self, admission: Admission, status: Option<&ExitStatus>) {
+    /// Record a named reservation's run under its class, then observe it. A
+    /// served reservation runs no command: its release ends its run.
+    pub(crate) fn observe_reservation(
+        &self,
+        name: Option<&str>,
+        admission: Admission,
+        status: Option<&ExitStatus>,
+    ) {
+        let run_ms = admission.run_ms();
+        if let Some(name) = name
+            && status.is_none_or(ExitStatus::success)
+            && let Err(error) = self.record_run(RunKind::Reservation, name, run_ms)
+        {
+            debug!("reservation run time was not recorded: {error:#}");
+        }
         if !self.events || self.bytes_per_permit == 0 {
             return;
         }
@@ -150,8 +177,8 @@ impl Pool {
             mbx_version: env!("CARGO_PKG_VERSION").into(),
             pressure_domain: self.pressure_domain.into(),
             kind: "reservation".into(),
-            name: "mbx reserve".into(),
-            key: "reservation".into(),
+            name: name.unwrap_or("mbx reserve").into(),
+            key: name.unwrap_or("reservation").into(),
             build_id: self.build.as_ref().map(|(id, _)| id.clone()),
             build_capacity: self.build.as_ref().map(|(_, capacity)| *capacity),
             domain_capacity: Some(self.domain_capacity),
@@ -165,12 +192,7 @@ impl Pool {
             outcome: status.map_or_else(|| "unknown".into(), outcome),
             wrapped: false,
             admission_wait_ms: admission.wait_ms,
-            run_ms: admission
-                .started
-                .elapsed()
-                .as_millis()
-                .try_into()
-                .unwrap_or(u64::MAX),
+            run_ms,
         };
         if let Err(error) = append(&self.dir, observation) {
             debug!("scheduler reservation observation was not recorded: {error:#}");
@@ -730,11 +752,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let observed_pool = pool(dir.path(), 100);
         let (permit, admission) = observed_pool
-            .reserve_observed(Some(3), None, &AtomicBool::default())
+            .reserve_observed(Some(3), None, None, &AtomicBool::default())
             .unwrap()
             .unwrap();
         drop(permit);
-        observed_pool.observe_reservation(admission, Some(&status(0)));
+        observed_pool.observe_reservation(None, admission, Some(&status(0)));
         let line = std::fs::read_to_string(dir.path().join(FILE)).unwrap();
         let value: serde_json::Value = serde_json::from_str(line.lines().next().unwrap()).unwrap();
         assert_eq!(value["kind"], "reservation");
@@ -758,11 +780,11 @@ mod tests {
             let mut gated_pool = pool(gated_dir.path(), bytes);
             gated_pool.events = events;
             let (permit, admission) = gated_pool
-                .reserve_observed(Some(1), None, &AtomicBool::default())
+                .reserve_observed(Some(1), None, None, &AtomicBool::default())
                 .unwrap()
                 .unwrap();
             drop(permit);
-            gated_pool.observe_reservation(admission, Some(&status(0)));
+            gated_pool.observe_reservation(None, admission, Some(&status(0)));
             assert!(!gated_dir.path().join(FILE).exists());
         }
     }
@@ -774,13 +796,13 @@ mod tests {
         // Wider than the pool: a moldable request starts on all of it, where
         // a rigid one would run alone on all it asked for.
         let (permit, admission) = pool
-            .reserve_observed(Some(20), None, &AtomicBool::default())
+            .reserve_observed(Some(20), None, None, &AtomicBool::default())
             .unwrap()
             .unwrap();
         assert_eq!(admission.cpus(), 16);
         assert_eq!(permit.granted().unwrap().0.cpu, 16);
         drop(permit);
-        pool.observe_reservation(admission, Some(&status(0)));
+        pool.observe_reservation(None, admission, Some(&status(0)));
         let line = std::fs::read_to_string(dir.path().join(FILE)).unwrap();
         let value: serde_json::Value = serde_json::from_str(line.lines().next().unwrap()).unwrap();
         assert_eq!(value["charged_cpu"], 16);
@@ -799,11 +821,11 @@ mod tests {
         assert_eq!(summary.overall.worst_peak_reserved_ratio, Some(1.5));
         assert_eq!(summary.keys[0].average_reserved_unused_bytes, Some(25.0));
         let (permit, admission) = pool(dir.path(), 100)
-            .reserve_observed(Some(2), Some(201), &AtomicBool::default())
+            .reserve_observed(Some(2), Some(201), None, &AtomicBool::default())
             .unwrap()
             .unwrap();
         drop(permit);
-        pool(dir.path(), 100).observe_reservation(admission, None);
+        pool(dir.path(), 100).observe_reservation(None, admission, None);
         let lines = std::fs::read_to_string(dir.path().join(FILE)).unwrap();
         let value: serde_json::Value =
             serde_json::from_str(lines.lines().next_back().unwrap()).unwrap();

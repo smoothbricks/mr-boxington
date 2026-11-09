@@ -27,6 +27,12 @@ pub(super) struct ReserveArgs {
     /// normal-priority work.
     #[usage(long, default = "normal")]
     priority: SchedulerPriority,
+    /// The class this reservation's run time is remembered and predicted by,
+    /// such as `nx:<workspace>:<task>`: within a priority, the pool admits
+    /// the requests predicted shortest first. Without one, the reservation is
+    /// named `mbx reserve` and predicted by the median of the named classes.
+    #[usage(long, value_name = "CLASS")]
+    name: Option<String>,
     /// Descriptor to announce the reservation on: one byte, `g`, once
     /// capacity is granted, and `r` once it is released after the command.
     ///
@@ -93,6 +99,9 @@ fn spawn_worker(args: &ReserveArgs, grant: Option<Descriptor>) -> Result<ExitCod
     if let Some(fd) = args.grant_fd {
         worker.args(["--grant-fd", &fd.to_string()]);
     }
+    if let Some(name) = &args.name {
+        worker.args(["--name", name]);
+    }
     worker.args(["--priority", args.priority.as_str(), "--"]);
     worker.args(&args.command);
     worker.env(WORKER_ENV, "1");
@@ -114,6 +123,7 @@ fn run_direct(config: &Config, args: &ReserveArgs, grant: Option<Descriptor>) ->
     let Some((mut permit, admission)) = pool.reserve_observed(
         args.cpus,
         args.memory.map(|memory| memory.as_u64()),
+        args.name.as_deref(),
         &AtomicBool::new(false),
     )?
     else {
@@ -139,7 +149,7 @@ fn run_direct(config: &Config, args: &ReserveArgs, grant: Option<Descriptor>) ->
                 .wrap_err_with(|| format!("failed to run {program}"))
         });
     drop(permit);
-    pool.observe_reservation(admission, status.as_ref().ok());
+    pool.observe_reservation(args.name.as_deref(), admission, status.as_ref().ok());
     let status = status?;
     Ok(exit_code(status))
 }

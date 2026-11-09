@@ -187,7 +187,7 @@ fn a_reservation_charges_cpu_and_memory_separately() {
     let pool = pool_at(directory.path(), 4, 1024);
 
     let reservation = pool
-        .reserve(Some(1), Some(3 * 1024), &AtomicBool::default())
+        .reserve(Some(1), Some(3 * 1024), None, &AtomicBool::default())
         .unwrap()
         .unwrap();
     let cpu_only =
@@ -206,7 +206,10 @@ fn a_reservation_requires_a_requested_resource() {
     let directory = tempfile::tempdir().unwrap();
     let pool = pool_at(directory.path(), 4, 1024);
 
-    assert!(pool.reserve(None, None, &AtomicBool::default()).is_err());
+    assert!(
+        pool.reserve(None, None, None, &AtomicBool::default())
+            .is_err()
+    );
 }
 
 #[test]
@@ -215,7 +218,7 @@ fn a_memory_reservation_needs_a_memory_budget() {
     let pool = pool_at(directory.path(), 4, 0);
 
     assert!(
-        pool.reserve(None, Some(1024), &AtomicBool::default())
+        pool.reserve(None, Some(1024), None, &AtomicBool::default())
             .is_err()
     );
 }
@@ -239,7 +242,7 @@ fn blocked_reservations_sleep_and_wake_in_fifo_order() {
                 crate::pressure::now_ms()
             };
             let permit = pool
-                .reserve(Some(1), None, &AtomicBool::default())
+                .reserve(Some(1), None, None, &AtomicBool::default())
                 .unwrap()
                 .unwrap();
             admitted.send((index, permit)).unwrap();
@@ -301,7 +304,7 @@ fn a_waiting_reservation_recovers_a_silently_unlocked_lease() {
         admitted
             .send(
                 pool_at(&dir, 1, 0)
-                    .reserve(Some(1), None, &AtomicBool::default())
+                    .reserve(Some(1), None, None, &AtomicBool::default())
                     .unwrap()
                     .unwrap(),
             )
@@ -2435,6 +2438,7 @@ fn scheduler_stats_rank_live_waiters_by_ticket_and_exclude_grants() {
             None,
             0,
             Shape::Rigid,
+            None,
             ticket,
         );
         record.pid = Some(pid);
@@ -2460,6 +2464,7 @@ fn scheduler_stats_rank_live_waiters_by_ticket_and_exclude_grants() {
         None,
         0,
         Shape::Rigid,
+        None,
         5,
     );
     abandoned.name = Some("abandoned".into());
@@ -2949,6 +2954,7 @@ fn waiter(ticket: u64, weight: u64, domain: (&str, u64), build: Option<(&str, u6
         bytes_per_permit: 0,
         build: build.map(|(id, capacity)| (id.into(), capacity)),
         shape: None,
+        predicted_ms: None,
         handoff: None,
     }
 }
@@ -3070,7 +3076,7 @@ fn reservation_vector_and_legacy_charge_are_both_preserved() {
     let dir = tempfile::tempdir().unwrap();
     let pool = pool_at(dir.path(), 8, GIB);
     let lease = pool
-        .reserve(Some(2), Some(5 * GIB + 1), &AtomicBool::default())
+        .reserve(Some(2), Some(5 * GIB + 1), None, &AtomicBool::default())
         .unwrap()
         .unwrap();
     let record: Lease = serde_json::from_slice(&std::fs::read(&lease.path).unwrap()).unwrap();
@@ -3085,7 +3091,7 @@ fn reservation_vector_and_legacy_charge_are_both_preserved() {
     assert_eq!(record.bytes_per_permit, GIB);
     drop(lease);
     let lease = pool
-        .reserve(Some(2), None, &AtomicBool::default())
+        .reserve(Some(2), None, None, &AtomicBool::default())
         .unwrap()
         .unwrap();
     let record: Lease = serde_json::from_slice(&std::fs::read(&lease.path).unwrap()).unwrap();
@@ -3098,7 +3104,7 @@ fn reservation_vector_and_legacy_charge_are_both_preserved() {
     );
     drop(lease);
     let lease = pool
-        .reserve(None, Some(GIB), &AtomicBool::default())
+        .reserve(None, Some(GIB), None, &AtomicBool::default())
         .unwrap()
         .unwrap();
     let record: Lease = serde_json::from_slice(&std::fs::read(&lease.path).unwrap()).unwrap();
@@ -4434,7 +4440,8 @@ fn nextest_admission_reads_only_per_test_history() {
     );
     LEDGER_READS.with(|reads| reads.set(0));
     let permit = pool.admit(&demand).unwrap();
-    assert_eq!(LEDGER_READS.with(|reads| reads.get()), 0);
+    // One read, for its class's run-time prediction: no compiler history.
+    assert_eq!(LEDGER_READS.with(|reads| reads.get()), 1);
     let observation = demand.observation.get().unwrap();
     assert_eq!(observation.resources, plan.resources);
     assert_eq!(observation.source, "test-history");
@@ -4463,7 +4470,8 @@ fn cpu_only_compile_admission_does_not_read_compiler_history() {
     assert!(cache.is_none());
     LEDGER_READS.with(|reads| reads.set(0));
     let permit = pool.admit(&demand).unwrap();
-    assert_eq!(LEDGER_READS.with(|reads| reads.get()), 0);
+    // One read, for its class's run-time prediction: no memory history.
+    assert_eq!(LEDGER_READS.with(|reads| reads.get()), 1);
     assert_eq!(demand.observation.get().unwrap().resources, plan.resources);
     assert_eq!(plan.resources.memory_bytes, 0);
     drop(permit);
@@ -4768,6 +4776,10 @@ fn an_admission_pass_grants_what_the_pool_rule_admits() {
         first_arrival_ms: Some(0),
         ..record
     };
+    let predicted = |ms: u64, record: Waiting| Waiting {
+        predicted_ms: Some(ms),
+        ..record
+    };
     let elsewhere = |record: Waiting| Waiting {
         domain: "other".into(),
         ..record
@@ -4972,10 +4984,83 @@ fn an_admission_pass_grants_what_the_pool_rule_admits() {
             context: idle,
             granted: vec![(3, false, 1), (5, true, 2)],
         },
+        PassCase {
+            name: "a younger request predicted shorter goes before an older, longer one",
+            live: vec![(1, 0); 17],
+            queue: vec![predicted(600_000, small(1))],
+            request: predicted(1_000, small(NEW)),
+            context: idle,
+            granted: vec![(NEW, true, 1)],
+        },
+        PassCase {
+            name: "an aged request still goes before a shorter, younger one",
+            live: vec![(1, 0); 17],
+            queue: vec![aged(predicted(600_000, small(1)))],
+            request: predicted(1_000, small(NEW)),
+            context: aging,
+            granted: vec![(1, false, 1)],
+        },
+        PassCase {
+            name: "requests that aged together go by ticket, whatever their predictions",
+            live: vec![(1, 0); 17],
+            queue: vec![
+                aged(predicted(600_000, small(1))),
+                aged(predicted(1_000, small(2))),
+            ],
+            request: small(NEW),
+            context: aging,
+            granted: vec![(1, false, 1)],
+        },
+        PassCase {
+            name: "an unpredicted request goes after the predicted ones of its priority",
+            live: vec![(1, 0); 17],
+            queue: vec![small(1)],
+            request: predicted(600_000, small(NEW)),
+            context: idle,
+            granted: vec![(NEW, true, 1)],
+        },
     ];
     for case in &cases {
         assert_eq!(pass_grants(case), case.granted, "{}", case.name);
     }
+}
+
+/// The `predicted_ms` of each admission in `dir`'s decision log, by name.
+fn admitted_predictions(dir: &Path) -> Vec<(String, Option<u64>)> {
+    std::fs::read_to_string(dir.join("decisions.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .filter(|row| row["event"] == "admitted")
+        .map(|row| {
+            (
+                row["name"].as_str().unwrap().to_owned(),
+                row.get("predicted_ms").and_then(serde_json::Value::as_u64),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn a_recorded_run_predicts_the_next_request_of_its_class() {
+    let dir = tempfile::tempdir().unwrap();
+    let pool = pool_at(dir.path(), 4, 0);
+    let admit = |demand: &Demand| drop(pool.admit(demand).unwrap());
+    let first = Demand::new("first", false);
+    admit(&first);
+    pool.observe(&first, &ExitStatus::default(), None);
+    admit(&Demand::new("first", false));
+    // An unseen compile takes the median of the compiles' medians; a link
+    // has no history of its kind yet.
+    admit(&Demand::new("second", false));
+    admit(&Demand::new("first", true));
+    let admitted = admitted_predictions(dir.path());
+    let names: Vec<&str> = admitted.iter().map(|(name, _)| name.as_str()).collect();
+    assert_eq!(names, ["first", "first", "second", "first"]);
+    assert_eq!(admitted[0].1, None, "nothing of its class has run");
+    let recorded = admitted[1].1.expect("the first run was recorded");
+    assert_eq!(admitted[2].1, Some(recorded), "the kind's median");
+    assert_eq!(admitted[3].1, None, "no link has run");
 }
 
 #[test]

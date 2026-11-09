@@ -370,6 +370,19 @@ impl Demand {
             }),
         }
     }
+
+    /// What this demand's run times are kept and predicted by: its kind, and
+    /// its class within that kind.
+    fn run_class(&self) -> (RunKind, String) {
+        let kind = if self.learns_cpu {
+            RunKind::Test
+        } else if self.links {
+            RunKind::Link
+        } else {
+            RunKind::Compile
+        };
+        (kind, ledger_key(&self.name, self.links))
+    }
 }
 
 /// One admitted compilation's capacity, released on drop or process death.
@@ -448,6 +461,11 @@ struct Waiting {
     name: Option<String>,
     #[serde(default)]
     mode_key: Option<String>,
+    /// The run time its class is predicted to take, which orders it among
+    /// the requests of its priority that have not aged. Absent for a class
+    /// with no history and from versions before that order.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    predicted_ms: Option<u64>,
     ticket: u64,
     weight: u64,
     #[serde(default)]
@@ -558,6 +576,8 @@ struct AdmissionState {
     claimed: Option<(Resources, u64)>,
     /// A timeout may share a recent admission pass; a lease event must not.
     periodic: bool,
+    /// What its class is predicted to run for, read once when it asks.
+    predicted_ms: Option<u64>,
 }
 
 impl AdmissionState {
@@ -571,6 +591,7 @@ impl AdmissionState {
             last_gate: None,
             claimed: None,
             periodic: false,
+            predicted_ms: None,
         }
     }
 }
@@ -791,7 +812,11 @@ const AGING_MS: u64 = 30_000;
 /// reference policy, over mbx's scopes and request shapes).
 ///
 /// - **Order.** `normal` before `low`. Within a priority, requests that have
-///   waited [`AGING_MS`] go first, oldest first, then the rest by ticket.
+///   waited [`AGING_MS`] go first, oldest first, then by ticket; the rest go
+///   shortest predicted run time first, a request with no prediction after
+///   every predicted one, then by ticket. This is the order of the proven
+///   model, SmoothBricks' `specs/cowshed/laws/admission.bend` (Spt), which
+///   `scheduler_bend_tests` runs this pass against.
 /// - **Grant.** Each request is judged against what the grants before it
 ///   leave of every scope it is charged in: the global pool, its memory
 ///   domain and its build. A rigid request starts when all of it fits; a
@@ -864,6 +889,11 @@ fn admission_pass(
             record.priority != "normal",
             !aged,
             if aged { since(record) } else { 0 },
+            if aged {
+                0
+            } else {
+                record.predicted_ms.unwrap_or(u64::MAX)
+            },
             record.ticket,
         )
     });
@@ -1546,6 +1576,11 @@ struct MemoryLedger {
     /// Derived once per read, never persisted alongside the raw observations.
     #[serde(skip)]
     pooled_spreads: BTreeMap<String, f64>,
+    /// Recent successful run times in milliseconds, newest last, by kind and
+    /// then class: what orders a request among the requests of its priority
+    /// that have not aged.
+    #[serde(default)]
+    run_ms: BTreeMap<String, BTreeMap<String, Vec<u64>>>,
 }
 
 impl Default for MemoryLedger {
@@ -1562,7 +1597,75 @@ impl Default for MemoryLedger {
             sibling_residuals: Vec::new(),
             sibling_spread: memory::default_sibling_spread(),
             pooled_spreads: BTreeMap::new(),
+            run_ms: BTreeMap::new(),
         }
+    }
+}
+
+/// Run times kept per class, newest last.
+const MAX_RUN_SAMPLES: usize = 8;
+
+/// What a run's history is kept under. An unseen class of a kind is
+/// predicted by the median of that kind's classes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RunKind {
+    Compile,
+    Link,
+    Test,
+    Reservation,
+}
+
+impl RunKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            RunKind::Compile => "compile",
+            RunKind::Link => "link",
+            RunKind::Test => "test",
+            RunKind::Reservation => "reservation",
+        }
+    }
+}
+
+impl MemoryLedger {
+    /// The run time a request of `class` is predicted to take: the median of
+    /// its class's recent runs, else the median of its kind's class medians,
+    /// else none.
+    fn predicted_run_ms(&self, kind: RunKind, class: Option<&str>) -> Option<u64> {
+        let classes = self.run_ms.get(kind.as_str())?;
+        class
+            .and_then(|class| classes.get(class))
+            .and_then(|window| median(window.iter().copied()))
+            .or_else(|| median(classes.values().filter_map(|w| median(w.iter().copied()))))
+    }
+
+    /// Add one successful run of `class`. A kind keeps at most
+    /// [`MAX_LEDGER_ENTRIES`] classes; the shortest other class goes first.
+    fn record_run(&mut self, kind: RunKind, class: &str, run_ms: u64) {
+        let classes = self.run_ms.entry(kind.as_str().into()).or_default();
+        let window = classes.entry(class.into()).or_default();
+        window.push(run_ms);
+        window.drain(..window.len().saturating_sub(MAX_RUN_SAMPLES));
+        while classes.len() > MAX_LEDGER_ENTRIES {
+            let shortest = classes
+                .iter()
+                .filter(|(other, _)| other.as_str() != class)
+                .min_by_key(|(_, window)| median(window.iter().copied()))
+                .map(|(other, _)| other.clone())
+                .expect("an overfull kind has another class");
+            classes.remove(&shortest);
+        }
+    }
+}
+
+/// The median of `values`, the mean of the middle two of an even count.
+fn median(values: impl Iterator<Item = u64>) -> Option<u64> {
+    let mut values: Vec<u64> = values.collect();
+    values.sort_unstable();
+    let middle = values.len() / 2;
+    match values.len() {
+        0 => None,
+        n if n % 2 == 1 => Some(values[middle]),
+        _ => Some(values[middle - 1].midpoint(values[middle])),
     }
 }
 
@@ -1974,10 +2077,20 @@ impl Pool {
         let _phase = crate::phase_timing::phase("permit_wait");
         demand.observation.set(None);
         let started = Instant::now();
-        let mut state = AdmissionState::new((self.clock)(), Shape::Rigid);
+        let mut ledger_cache: Option<LedgerCache> = None;
+        // Its class's prediction orders it among the requests that have not
+        // aged; read once, with the history its plan reads.
+        let (kind, class) = demand.run_class();
+        let predicted_ms = ledger_cache
+            .get_or_insert_with(LedgerCache::default)
+            .read(&self.ledger_path())
+            .predicted_run_ms(kind, Some(&class));
+        let mut state = AdmissionState {
+            predicted_ms,
+            ..AdmissionState::new((self.clock)(), Shape::Rigid)
+        };
         let mut wake: Option<wait::Wait> = None;
         let mut complained = false;
-        let mut ledger_cache = None;
         loop {
             // Reuse the plan until history reloads; its calibration features
             // remain paired with the cached charge.
@@ -2079,12 +2192,19 @@ impl Pool {
         &self,
         cpus: Option<u64>,
         memory_bytes: Option<u64>,
+        name: Option<&str>,
         withdrawn: &AtomicBool,
     ) -> Result<Option<Permit>> {
         let weight = self.reservation_weight(cpus, memory_bytes)?;
 
         let started = Instant::now();
-        let mut state = AdmissionState::new((self.clock)(), Shape::Moldable);
+        // A named reservation's records carry its class, as a compile's carry
+        // its crate.
+        let demand = name.map(|name| Demand::new(name, false));
+        let mut state = AdmissionState {
+            predicted_ms: self.predicted_run_ms(RunKind::Reservation, name),
+            ..AdmissionState::new((self.clock)(), Shape::Moldable)
+        };
         let mut wake: Option<wait::Wait> = None;
         loop {
             if withdrawn.load(Ordering::Acquire) {
@@ -2101,7 +2221,7 @@ impl Pool {
                 weight,
                 gate,
                 &mut state,
-                None,
+                demand.as_ref(),
             )? {
                 return Ok(Some(permit));
             }
@@ -2411,6 +2531,7 @@ impl Pool {
         let now = (self.clock)();
         let first_arrival_ms = state.first_arrival_ms;
         let shape = state.shape;
+        let predicted_ms = state.predicted_ms;
         // Broken sensing disables only this advisory gate, never CPU scheduling.
         let pressure_state = (self.pressure && self.bytes_per_permit > 0)
             .then(|| crate::pressure::domain_state(&self.dir, self.pressure_domain));
@@ -2422,7 +2543,15 @@ impl Pool {
             && crate::supervision::resumes_pending(&self.dir, now);
         if resuming && !live.is_empty() {
             self.gated(state, "resumes-pending", events, || {
-                self.waiting_record(resources, weight, demand, first_arrival_ms, shape, u64::MAX)
+                self.waiting_record(
+                    resources,
+                    weight,
+                    demand,
+                    first_arrival_ms,
+                    shape,
+                    predicted_ms,
+                    u64::MAX,
+                )
             });
             return Ok(None);
         }
@@ -2436,7 +2565,15 @@ impl Pool {
                     })))
         {
             self.gated(state, "pressure", events, || {
-                self.waiting_record(resources, weight, demand, first_arrival_ms, shape, u64::MAX)
+                self.waiting_record(
+                    resources,
+                    weight,
+                    demand,
+                    first_arrival_ms,
+                    shape,
+                    predicted_ms,
+                    u64::MAX,
+                )
             });
             return Ok(None);
         }
@@ -2456,7 +2593,15 @@ impl Pool {
             && available < needed
         {
             self.gated(state, "available-memory", events, || {
-                self.waiting_record(resources, weight, demand, first_arrival_ms, shape, u64::MAX)
+                self.waiting_record(
+                    resources,
+                    weight,
+                    demand,
+                    first_arrival_ms,
+                    shape,
+                    predicted_ms,
+                    u64::MAX,
+                )
             });
             return Ok(None);
         }
@@ -2469,7 +2614,15 @@ impl Pool {
         let pass = admission_pass(
             live,
             &records,
-            self.waiting_record(resources, weight, demand, first_arrival_ms, shape, ticket),
+            self.waiting_record(
+                resources,
+                weight,
+                demand,
+                first_arrival_ms,
+                shape,
+                predicted_ms,
+                ticket,
+            ),
             Handoff {
                 budget: self.budget(),
                 gate: predicted.map(|bytes| Gate {
@@ -2562,6 +2715,7 @@ impl Pool {
         Ok(None)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn waiting_record(
         &self,
         resources: Resources,
@@ -2569,6 +2723,7 @@ impl Pool {
         demand: Option<&Demand>,
         first_arrival_ms: u64,
         shape: Shape,
+        predicted_ms: Option<u64>,
         ticket: u64,
     ) -> Waiting {
         Waiting {
@@ -2596,6 +2751,7 @@ impl Pool {
             build: self.build.clone(),
             handoff: None,
             shape: Some(shape),
+            predicted_ms,
         }
     }
 
@@ -2991,6 +3147,27 @@ impl Pool {
         let mut contents = serde_json::to_vec(&ledger)?;
         contents.push(b'\n');
         crate::util::write_advisory(&path, &contents)
+    }
+
+    /// Record one successful admitted run's time under its class, for the
+    /// order of the next request of that class.
+    fn record_run(&self, kind: RunKind, class: &str, run_ms: u64) -> Result<()> {
+        std::fs::create_dir_all(&self.dir)
+            .wrap_err_with(|| format!("failed to create {}", self.dir.display()))?;
+        let mut lock = fslock::LockFile::open(&self.dir.join(LEDGER_LOCK))?;
+        lock.lock()?;
+        let path = self.ledger_path();
+        let mut ledger = read_ledger(&path);
+        ledger.version = LEDGER_VERSION;
+        ledger.record_run(kind, class, run_ms);
+        let mut contents = serde_json::to_vec(&ledger)?;
+        contents.push(b'\n');
+        crate::util::write_advisory(&path, &contents)
+    }
+
+    /// The run time a request of `class` is predicted to take.
+    fn predicted_run_ms(&self, kind: RunKind, class: Option<&str>) -> Option<u64> {
+        read_ledger(&self.ledger_path()).predicted_run_ms(kind, class)
     }
 }
 
@@ -4317,6 +4494,14 @@ fn activity_snapshot(dir: &Path) -> Vec<SchedulerActivity> {
     activity
 }
 
+#[cfg(test)]
+#[allow(clippy::all, clippy::pedantic)]
+#[rustfmt::skip]
+#[path = "scheduler_bend_model.rs"]
+mod scheduler_bend_model;
+#[cfg(test)]
+#[path = "scheduler_bend_tests.rs"]
+mod scheduler_bend_tests;
 #[cfg(test)]
 #[path = "scheduler_tests.rs"]
 mod tests;

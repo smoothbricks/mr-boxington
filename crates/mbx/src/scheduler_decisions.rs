@@ -130,6 +130,10 @@ pub(super) struct Event {
     priority: String,
     ticket: u64,
     first_arrival_ms: Option<u64>,
+    /// The run time the request's class was predicted to take: what ordered
+    /// it among the requests of its priority that had not aged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    predicted_ms: Option<u64>,
     waited_ms: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     reason: Option<String>,
@@ -175,6 +179,7 @@ impl Event {
             priority: record.priority.clone(),
             ticket: record.ticket,
             first_arrival_ms: record.first_arrival_ms,
+            predicted_ms: record.predicted_ms,
             waited_ms: record
                 .first_arrival_ms
                 .map_or(0, |first| now.saturating_sub(first)),
