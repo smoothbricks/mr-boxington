@@ -157,7 +157,7 @@ pub(crate) fn remove_tree(path: &Path) -> io::Result<()> {
                 }
             }
         }
-        std::fs::remove_dir_all(path)
+        crate::store::unlink_pace::remove_dir_all(path)
     })();
     match result {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),

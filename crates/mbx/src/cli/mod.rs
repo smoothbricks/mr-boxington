@@ -354,7 +354,8 @@ pub fn run() -> Result<ExitCode> {
             {
                 eyre::bail!("--automatic runs the configured sweep and takes no other option");
             }
-            gc::run_automatic(&config, &settings.retention).map(|()| ExitCode::SUCCESS)
+            gc::run_automatic(&config, &settings.retention, gc::Pace::Background)
+                .map(|()| ExitCode::SUCCESS)
         }
         Commands::Gc(args) => gc::run(
             &config,

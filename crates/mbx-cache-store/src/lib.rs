@@ -11,6 +11,7 @@
 //! rather than cache content.
 
 mod events;
+pub mod unlink_pace;
 
 use eyre::{Context, Result};
 use mbx_cache_core::{
@@ -1376,7 +1377,7 @@ fn prune_task_manifests(store: &Path, live: &BTreeSet<String>, dry_run: bool) ->
         }
         drop(guard);
         if removed.contains(identity) {
-            let _ = std::fs::remove_file(&lock_path);
+            let _ = unlink_pace::remove_file(&lock_path);
         }
     }
 
@@ -1404,7 +1405,7 @@ fn prune_task_manifests(store: &Path, live: &BTreeSet<String>, dry_run: bool) ->
                 .is_ok_and(|metadata| metadata.is_file() && task_manifest_is_idle(&metadata));
             if idle && let Some(guard) = claim_task_manifest_lock(&entry.path()) {
                 drop(guard);
-                let _ = std::fs::remove_file(entry.path());
+                let _ = unlink_pace::remove_file(&entry.path());
             }
         }
     }
@@ -2251,6 +2252,7 @@ fn gc_with_mode(
                         )? {
                             continue;
                         }
+                        unlink_pace::wait();
                         match slot.remove() {
                             Ok(true) => Removal::Removed,
                             Ok(false) => Removal::Missing,
@@ -2583,7 +2585,7 @@ fn prune_import_staging(store: &Path, dry_run: bool) {
                 .is_some_and(|extension| extension == "lock")
                 && !claimed_staging_path(&path).exists()
             {
-                let _ = std::fs::remove_file(&path);
+                let _ = unlink_pace::remove_file(&path);
             }
             continue;
         }
@@ -2599,7 +2601,7 @@ fn prune_import_staging(store: &Path, dry_run: bool) {
         if !matches!(lock.try_lock(), Ok(true)) {
             continue;
         }
-        if let Err(error) = std::fs::remove_dir_all(&path) {
+        if let Err(error) = unlink_pace::remove_dir_all(&path) {
             log::debug!(
                 "could not remove abandoned import staging {}: {error}",
                 path.display()
@@ -2607,7 +2609,7 @@ fn prune_import_staging(store: &Path, dry_run: bool) {
             continue;
         }
         drop(lock);
-        let _ = std::fs::remove_file(&lock_path);
+        let _ = unlink_pace::remove_file(&lock_path);
     }
 }
 
@@ -2692,12 +2694,12 @@ fn prune_sessions(store: &Path, dry_run: bool) -> Result<SessionPrune> {
         if matches!(remove(&paths.events)?, Removal::Removed) {
             prune.removed_streams += 1;
             prune.removed_bytes += metadata.len();
-            let _ = std::fs::remove_file(&paths.lock);
+            let _ = unlink_pace::remove_file(&paths.lock);
         }
     }
     if !dry_run {
         for lock in events::orphaned_locks(store) {
-            let _ = std::fs::remove_file(lock);
+            let _ = unlink_pace::remove_file(&lock);
         }
     }
     Ok(prune)
@@ -3108,7 +3110,7 @@ enum Removal {
 }
 
 fn remove(path: &Path) -> Result<Removal> {
-    match std::fs::remove_file(path) {
+    match unlink_pace::remove_file(path) {
         Ok(()) => Ok(Removal::Removed),
         // A concurrent build may have evicted or replaced it already.
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Removal::Missing),

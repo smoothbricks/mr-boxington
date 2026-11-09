@@ -1591,10 +1591,10 @@ fn collect_with(
                 continue;
             }
             // Cargo's lock ends with compilation, but a command can keep
-            // executing binaries from `deps/`. Hold the view lease for the
-            // whole pass too. A command starting meanwhile already waits on
-            // Cargo's lock while pruning, so this adds no new wait.
-            let _reservation = if dry_run {
+            // executing binaries from `deps/`. Hold the view lease while the
+            // units move too. A command starting meanwhile already waits on
+            // Cargo's lock for the move, so this adds no new wait.
+            let reservation = if dry_run {
                 // A preview must not create lock files. An unreadable lock is
                 // in use, just as it is for a real collection.
                 if view_in_use(directory) {
@@ -1609,7 +1609,7 @@ fn collect_with(
             };
             // Cargo's locks keep a build that starts meanwhile from reading a
             // fingerprint whose outputs are leaving.
-            let _locks = if dry_run {
+            let locks = if dry_run {
                 None
             } else {
                 match cargo_locks(directory) {
@@ -1624,13 +1624,19 @@ fn collect_with(
                     }
                 }
             };
-            let units = crate::target_units::prune(
+            let moved = crate::target_units::move_unused(
                 directory,
                 max_age,
                 UNIX_EPOCH + Duration::from_secs(now),
                 dry_run,
                 &mut ledger,
             );
+            // Deleted once Cargo's locks and the lease are let go: no build
+            // reaches a removal directory, and a paced collector would
+            // otherwise hold a build on Cargo's lock while its unlinks run.
+            drop(locks);
+            drop(reservation);
+            let units = moved.remove(&mut ledger);
             // The view no longer holds what went, so removing it later must
             // not count those files again.
             files.forget(&units.removal);

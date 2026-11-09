@@ -1377,7 +1377,7 @@ pub(crate) fn prune_flights(cache_dir: &Path) {
             // Swept with its lock below while the lock exists; on its own it
             // is a leftover from an interrupted sweep.
             if stale(&path) && !path.with_extension("").exists() {
-                let _ = std::fs::remove_file(&path);
+                let _ = crate::store::unlink_pace::remove_file(&path);
             }
             continue;
         }
@@ -1389,12 +1389,12 @@ pub(crate) fn prune_flights(cache_dir: &Path) {
             continue;
         };
         if lock.try_lock().is_ok_and(|taken| taken) {
-            let _ = std::fs::remove_file(&record);
-            let _ = std::fs::remove_file(attempt_path(&path));
+            let _ = crate::store::unlink_pace::remove_file(&record);
+            let _ = crate::store::unlink_pace::remove_file(&attempt_path(&path));
             // Closed before the removal, because Windows will not delete a
             // file that is still open anywhere.
             drop(lock);
-            let _ = std::fs::remove_file(&path);
+            let _ = crate::store::unlink_pace::remove_file(&path);
         }
     }
 }

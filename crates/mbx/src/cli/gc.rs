@@ -895,7 +895,7 @@ pub(super) fn schedule_sweep(config: &Config, retention: &RetentionSettings) {
     }
     if let Err(error) = spawn_collector(config) {
         log::debug!("the automatic sweep runs in the foreground: {error:#}");
-        if let Err(error) = run_automatic(config, retention) {
+        if let Err(error) = run_automatic(config, retention, Pace::Foreground) {
             log::warn!("the store was not swept: {error:#}");
         }
     }
@@ -1029,20 +1029,51 @@ fn detach(command: &mut Command) {
     command.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
 }
 
+/// How fast an automatic sweep unlinks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Pace {
+    /// The detached collector, which nobody waits on: its unlinks keep to
+    /// [`store::unlink_pace::UNLINKS_PER_SECOND`] while the disks have room.
+    Background,
+    /// A build sweeping in its own process because no collector could start:
+    /// the build's exit waits on every unlink.
+    Foreground,
+}
+
+/// The pace a sweep holds while it runs: none in the foreground, and none
+/// while a disk is short of `gc.min_free_size`, which needs its space back
+/// now rather than at a pace.
+pub(super) fn paced(
+    config: &Config,
+    retention: &RetentionSettings,
+    pace: Pace,
+) -> Option<store::unlink_pace::Paced> {
+    match pace {
+        Pace::Background if !disks_short(config, retention) => Some(store::unlink_pace::pace()),
+        Pace::Background | Pace::Foreground => None,
+    }
+}
+
 /// The sweep a build scheduled: `mbx gc --automatic`.
 ///
 /// Records the throttle stamp after the sweep returns, counts what it freed
 /// toward the lifetime totals, and leaves the description for the next build.
 /// A panic hook also records the stamp before an abort, so crashes wait their
 /// turn while collectors killed by a sandbox exiting can retry on the next
-/// build. Its own stderr is the sweep log.
-pub(super) fn run_automatic(config: &Config, retention: &RetentionSettings) -> Result<()> {
+/// build. Its own stderr is the sweep log. A background collector keeps its
+/// unlinks to a pace; see [`Pace`].
+pub(super) fn run_automatic(
+    config: &Config,
+    retention: &RetentionSettings,
+    pace: Pace,
+) -> Result<()> {
     let store = config.store_dir();
     let mut collector = collector_lock(&store)?;
     if !collector.try_lock()? {
         log::debug!("another collector is sweeping the store");
         return Ok(());
     }
+    let _paced = paced(config, retention, pace);
     // A collector that panics records the sweep, so a crash waits its turn
     // instead of repeating on every build. Release builds abort on a panic and
     // run no drop guard, but they do run the hook. The previous hook still
@@ -1636,12 +1667,16 @@ pub(super) fn low_disk(retention: &RetentionSettings, path: &Path) -> Option<Low
     (disk.shortfall() > 0).then_some(disk)
 }
 
+/// Whether a disk the sweep could relieve is short of `gc.min_free_size`.
+fn disks_short(config: &Config, retention: &RetentionSettings) -> bool {
+    low_disk(retention, &config.cache_dir).is_some()
+        || (config.target.views && low_disk(retention, &config.target.root).is_some())
+}
+
 /// How long sweeps wait for one another: `gc.interval`, or less while a disk
 /// the sweep could relieve is short of space.
 pub(super) fn sweep_interval(config: &Config, retention: &RetentionSettings) -> Duration {
-    let low = low_disk(retention, &config.cache_dir).is_some()
-        || (config.target.views && low_disk(retention, &config.target.root).is_some());
-    if low {
+    if disks_short(config, retention) {
         config.gc.interval.min(LOW_DISK_INTERVAL)
     } else {
         config.gc.interval

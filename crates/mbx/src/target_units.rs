@@ -64,13 +64,24 @@ pub(crate) fn probe_access_times(directory: &Path) -> std::io::Result<bool> {
     Ok(std::fs::metadata(file.path())?.accessed()? > past + ACCESS_TIME_SLACK)
 }
 
-/// Remove the units in the target directory `view` that no build has used for
-/// `max_age`.
+/// Unused units of one target directory, moved aside to be deleted.
 ///
-/// The caller holds Cargo's locks for `view`, so no build reads a unit while
-/// it goes. A dry run reports what would be removed and touches nothing on
-/// disk. `ledger` holds the caller's measure of `view`; each file is released
-/// from it once it is gone, or as if gone in a dry run.
+/// The move happens under Cargo's locks, so no build reads a unit while it
+/// goes. The deletion needs no lock: nothing reaches a removal directory, and
+/// a collector keeping its unlinks to a pace would otherwise keep a build
+/// waiting on Cargo's lock for as long as they take.
+#[must_use = "moved units stay on the disk until removed"]
+pub(crate) struct Moved {
+    dry_run: bool,
+    /// Each profile, with the units this pass moved into its removal directory.
+    profiles: Vec<(PathBuf, u64)>,
+    /// What a dry run counted in place of moving.
+    outcome: UnitOutcome,
+}
+
+/// Remove the units in the target directory `view` that no build has used for
+/// `max_age`: [`move_unused`], then [`Moved::remove`].
+#[cfg(test)]
 pub(crate) fn prune(
     view: &Path,
     max_age: Duration,
@@ -78,47 +89,78 @@ pub(crate) fn prune(
     dry_run: bool,
     ledger: &mut Ledger,
 ) -> UnitOutcome {
-    let mut outcome = UnitOutcome::default();
+    move_unused(view, max_age, now, dry_run, ledger).remove(ledger)
+}
+
+/// Move the units in the target directory `view` that no build has used for
+/// `max_age` aside, for [`Moved::remove`] to delete.
+///
+/// The caller holds Cargo's locks for `view`, so no build reads a unit while
+/// it moves. A dry run moves nothing and counts what would go: `ledger` holds
+/// the caller's measure of `view`, and each file is released from it as if
+/// gone.
+pub(crate) fn move_unused(
+    view: &Path,
+    max_age: Duration,
+    now: SystemTime,
+    dry_run: bool,
+    ledger: &mut Ledger,
+) -> Moved {
+    let mut moved = Moved {
+        dry_run,
+        profiles: Vec::new(),
+        outcome: UnitOutcome::default(),
+    };
     let Some(cutoff) = now.checked_sub(max_age.saturating_add(ACCESS_TIME_SLACK)) else {
-        return outcome;
+        return moved;
     };
     for profile in profiles(view) {
-        // Counted, because the caller measured the view before this pass and
-        // would otherwise weigh bytes already gone against the budget.
-        outcome
-            .removal
-            .add(remove_abandoned_removals(&profile, dry_run, ledger));
         let (units, doomed) = unused(&profile, cutoff);
-        if doomed.is_empty() {
-            continue;
-        }
+        let mut moved_units = 0;
         if dry_run {
             for path in &doomed {
-                outcome
+                moved
+                    .outcome
                     .removal
                     .add(remove_tree_counting_with_keys(path, ledger, false));
             }
-            outcome.removed_units += units;
-            continue;
-        }
-        match remove(&profile, &doomed, ledger) {
-            Ok((removal, gone)) => {
-                // Units count as removed once nothing of them is left; files
-                // count as they go.
-                if gone {
-                    outcome.removed_units += units;
+            moved.outcome.removed_units += units;
+        } else if !doomed.is_empty() {
+            match move_aside(&profile, &doomed) {
+                Ok(()) => moved_units = units,
+                Err(error) => {
+                    log::warn!(
+                        "could not remove unused build units in {}: {error}",
+                        profile.display()
+                    );
                 }
-                outcome.removal.add(removal);
-            }
-            Err(error) => {
-                log::warn!(
-                    "could not remove unused build units in {}: {error}",
-                    profile.display()
-                );
             }
         }
+        moved.profiles.push((profile, moved_units));
     }
-    outcome
+    moved
+}
+
+impl Moved {
+    /// Delete what this pass moved aside and whatever an interrupted one
+    /// left, releasing each file from `ledger` once it is gone; a dry run
+    /// only counts what an interrupted pass left.
+    pub(crate) fn remove(self, ledger: &mut Ledger) -> UnitOutcome {
+        let mut outcome = self.outcome;
+        for (profile, units) in self.profiles {
+            // Counted, because the caller measured the view before this pass
+            // and would otherwise weigh bytes already gone against the budget.
+            outcome
+                .removal
+                .add(remove_removals(&profile, self.dry_run, ledger));
+            // Units count as removed once nothing of them is left; files
+            // count as they go.
+            if units > 0 && !removal_path(&profile).exists() {
+                outcome.removed_units += units;
+            }
+        }
+        outcome
+    }
 }
 
 /// The profile directories in `view`: those Cargo keeps a `.cargo-lock` in,
@@ -239,18 +281,13 @@ fn modified(path: &Path) -> Option<SystemTime> {
         .ok()
 }
 
-/// Move `doomed` into one directory in `profile`, then delete it.
+/// Move `doomed` into this process's removal directory in `profile`.
 ///
 /// A unit is moved whole before any of its files go, so an interrupted
 /// removal never leaves a fingerprint vouching for outputs that are gone. The
 /// next collection finishes whatever an interrupted one left.
-/// Returns what went, and whether all of it did.
-fn remove(
-    profile: &Path,
-    doomed: &[PathBuf],
-    ledger: &mut Ledger,
-) -> std::io::Result<(Removal, bool)> {
-    let removal = profile.join(format!("{REMOVAL_PREFIX}{}", std::process::id()));
+fn move_aside(profile: &Path, doomed: &[PathBuf]) -> std::io::Result<()> {
+    let removal = removal_path(profile);
     std::fs::create_dir_all(&removal)?;
     for (index, path) in doomed.iter().enumerate() {
         std::fs::rename(path, removal.join(index.to_string()))?;
@@ -261,13 +298,16 @@ fn remove(
             let _ = std::fs::remove_dir(package);
         }
     }
-    let counted = remove_tree_counting_with_keys(&removal, ledger, true);
-    Ok((counted, !removal.exists()))
+    Ok(())
 }
 
-/// Finish deleting what an interrupted collection moved aside in `profile`,
-/// releasing what goes from `ledger`; a dry run only counts it.
-fn remove_abandoned_removals(profile: &Path, dry_run: bool, ledger: &mut Ledger) -> Removal {
+fn removal_path(profile: &Path) -> PathBuf {
+    profile.join(format!("{REMOVAL_PREFIX}{}", std::process::id()))
+}
+
+/// Delete what this collection and any interrupted one moved aside in
+/// `profile`, releasing what goes from `ledger`; a dry run only counts it.
+fn remove_removals(profile: &Path, dry_run: bool, ledger: &mut Ledger) -> Removal {
     let mut removal = Removal::default();
     let Ok(listing) = std::fs::read_dir(profile) else {
         return removal;

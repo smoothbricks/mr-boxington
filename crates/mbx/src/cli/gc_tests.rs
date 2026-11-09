@@ -78,7 +78,7 @@ fn an_automatic_sweep_that_is_not_due_leaves_no_report() {
     config.gc.interval = std::time::Duration::from_secs(3600);
     assert!(crate::store::claim_sweep(&config.store_dir(), config.gc.interval).unwrap());
 
-    run_automatic(&config, &RetentionSettings::default()).unwrap();
+    run_automatic(&config, &RetentionSettings::default(), Pace::Background).unwrap();
 
     assert!(!config.store_dir().join(SWEEP_REPORT).exists());
 }
@@ -93,7 +93,7 @@ fn an_automatic_sweep_stands_down_while_another_collector_holds_the_store() {
     let mut other = collector_lock(&store).unwrap();
     assert!(other.try_lock().unwrap());
 
-    run_automatic(&config, &RetentionSettings::default()).unwrap();
+    run_automatic(&config, &RetentionSettings::default(), Pace::Background).unwrap();
 
     assert!(
         !store.join("gc/v1/last-sweep").exists(),
@@ -949,7 +949,7 @@ fn automatic_collector_subprocess() {
             std::process::abort();
         }));
     }
-    run_automatic(&config, &RetentionSettings::default()).unwrap();
+    run_automatic(&config, &RetentionSettings::default(), Pace::Background).unwrap();
 }
 
 struct TestCollector(std::process::Child);
@@ -1211,4 +1211,47 @@ fn a_program_keeps_its_target_from_the_budget_but_not_from_a_short_disk() {
         &mut collection
     ));
     assert!(!view.exists());
+}
+
+/// The detached collector removes a 3,000-file target directory at no more
+/// than 1,000 unlinks a second after the first second's burst, so the sweep
+/// takes at least two seconds where an unpaced removal takes milliseconds.
+#[test]
+fn a_background_sweep_paces_its_unlinks() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut config = super::cargo_tests::managed_target_config(directory.path());
+    config.gc.auto = true;
+    config.gc.interval = Duration::ZERO;
+    let names = (0..3_000)
+        .map(|index| format!("unit-{index}.o"))
+        .collect::<Vec<_>>();
+    let files = names
+        .iter()
+        .map(|name| (name.as_str(), 0))
+        .collect::<Vec<_>>();
+    // A checkout that is gone loses its target whatever the budgets say.
+    let view = low_disk_view(&config, directory.path(), "gone", 1, &files, true);
+
+    let started = std::time::Instant::now();
+    run_automatic(&config, &RetentionSettings::default(), Pace::Background).unwrap();
+    let elapsed = started.elapsed();
+
+    assert!(!view.exists(), "the gone checkout's target was collected");
+    assert!(
+        elapsed >= Duration::from_secs(2),
+        "3,000 unlinks at 1,000 a second after a one-second burst took {elapsed:?}"
+    );
+}
+
+#[test]
+fn only_a_background_sweep_with_room_on_the_disks_is_paced() {
+    let directory = tempfile::tempdir().unwrap();
+    let config = super::cargo_tests::managed_target_config(directory.path());
+
+    assert!(paced(&config, &RetentionSettings::default(), Pace::Background).is_some());
+    assert!(paced(&config, &RetentionSettings::default(), Pace::Foreground).is_none());
+    assert!(
+        paced(&config, &always_short(), Pace::Background).is_none(),
+        "a short disk gets its space back at full speed"
+    );
 }
