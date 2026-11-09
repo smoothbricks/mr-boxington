@@ -583,7 +583,9 @@ fn an_sdk_outside_a_developer_directory_describes_itself() {
 /// identity does not cover, so it is refused: a driver that is a nixpkgs
 /// cc-wrapper, and any variable of the wrapper's link families, under any
 /// role or target spelling. A compiler in the store that wraps nothing, a
-/// driver outside it, and Nix variables no link reads are not.
+/// driver outside it, and Nix variables no link reads are not. Nor is a driver
+/// that is no cc-wrapper running an `ld` that is no bintools-wrapper: Xcode's
+/// driver and linker in a shell that carries a Nix stdenv's variables.
 #[cfg(unix)]
 #[test]
 fn a_link_a_nix_wrapper_shapes_is_not_identified() {
@@ -665,6 +667,37 @@ fn a_link_a_nix_wrapper_shapes_is_not_identified() {
             driver.display()
         );
     }
+
+    // A driver that is no cc-wrapper runs the `ld` it names: the variables
+    // reach its link only when that `ld` is a bintools-wrapper.
+    let naming = |name: &str, ld: &Path| {
+        use std::os::unix::fs::PermissionsExt;
+        let driver = root.join("bin").join(name);
+        std::fs::create_dir_all(driver.parent().unwrap()).unwrap();
+        std::fs::write(&driver, format!("#!/bin/sh\necho {}\n", ld.display())).unwrap();
+        std::fs::set_permissions(&driver, std::fs::Permissions::from_mode(0o755)).unwrap();
+        driver
+    };
+    let xcode_ld = executable(root.join("Xcode/usr/bin/ld"));
+    assert!(
+        refuse_nix_wrapped_link(
+            &naming("cc-xcode", &xcode_ld),
+            &store,
+            None,
+            variables.clone()
+        )
+        .is_ok(),
+        "a driver running an unwrapped ld was refused for variables only a wrapper reads"
+    );
+    let refusal = refuse_nix_wrapped_link(
+        &naming("cc-nix-ld", &wrapped_ld),
+        &store,
+        None,
+        variables.clone(),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(refusal.contains("NIX_LDFLAGS"), "{refusal}");
 }
 
 /// Reading the SDK's own files describes an Xcode SDK exactly as `xcrun`
