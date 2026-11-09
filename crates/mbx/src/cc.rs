@@ -25,7 +25,7 @@ use mbx_cache_cc::{
 };
 use mbx_cache_core::{
     ActionPrediction, AgentRequest, AgentResponse, CacheDigest, CacheDirectory, CacheFileNode,
-    CcMetadata, FileDigestScope, FileIdentity, FileSnapshot, NIX_STORE, PathMapping,
+    CcMetadata, FileDigestScope, FileIdentity, FileSnapshot, NIX_STORE, PathAliases, PathMapping,
     RecordedFileDigest, RemoteActionResult, RestoreStats, canonical_json, normalize_mapped_path,
 };
 use std::borrow::Cow;
@@ -90,7 +90,11 @@ pub fn compile(compiler: &OsStr, arguments: &[OsString], language: CcLanguage) -
         return build_precompiled_header(compiler, &invocation, &compiler_arguments, context);
     }
     drop(setup);
-    let invocation_digest = prediction_invocation(&invocation.invocation_digest(&context)?);
+    // One memo for every key this compilation builds: they name the same
+    // headers, so each directory is resolved and listed once, not once a key.
+    let aliases = PathAliases::default();
+    let invocation_digest =
+        prediction_invocation(&invocation.invocation_digest(&context, &aliases)?);
     let _verification = session::verification::select(|| Ok(invocation_digest.clone()))?;
     let verify = session::verify_requested();
     let task = prediction_task(&invocation_digest);
@@ -121,7 +125,7 @@ pub fn compile(compiler: &OsStr, arguments: &[OsString], language: CcLanguage) -
         discovered.clone().apply_to(&mut candidate)?;
         crate::pch_identity::substitute(&mut candidate);
         let action = crate::phase_timing::measure("key", || {
-            invocation.action_with_path_binding(candidate, prediction.path_specific)
+            invocation.action_with_path_binding(candidate, prediction.path_specific, &aliases)
         })?;
         lookup.record(&action, &invocation_digest, prediction.path_specific);
         // A restore that fails is a miss, not a bypass. Bypassing would leave
@@ -199,6 +203,7 @@ pub fn compile(compiler: &OsStr, arguments: &[OsString], language: CcLanguage) -
             &invocation_digest,
             &mut lookup,
             None,
+            &aliases,
         ) {
             Ok(Some((action, cached, discovered))) => {
                 flight.finish_restore(true);
@@ -248,6 +253,7 @@ pub fn compile(compiler: &OsStr, arguments: &[OsString], language: CcLanguage) -
                         &invocation_digest,
                         &mut lookup,
                         Some(&prediction.action),
+                        &aliases,
                     ) {
                         Ok(Some((action, cached, discovered))) => {
                             // Mirror the successful fleet handoff locally:
@@ -379,6 +385,7 @@ pub fn compile(compiler: &OsStr, arguments: &[OsString], language: CcLanguage) -
             flight.as_ref(),
             remote_claim.as_deref(),
             &portable,
+            &aliases,
         )
     {
         session::report_cc_publication_failure(&compilation_name(&invocation), &error);
@@ -442,7 +449,8 @@ fn record_precompiled_header(
     discovered.apply_to(context)?;
     // A PCH built while another was loaded keys that one by its build too.
     crate::pch_identity::substitute(context);
-    let action = invocation.action_with_path_binding(context.clone(), false)?;
+    let action =
+        invocation.action_with_path_binding(context.clone(), false, &PathAliases::default())?;
     crate::pch_identity::record(pch, &action.digest)
 }
 
@@ -483,6 +491,7 @@ fn publish(
     flight: Option<&crate::scheduler::Flight>,
     remote_claim: Option<&str>,
     portable: &Portable,
+    aliases: &PathAliases,
 ) -> Result<()> {
     let _phase = crate::phase_timing::phase("store");
     let input_snapshots = input_snapshots
@@ -501,7 +510,7 @@ fn publish(
     // working directory, and the cache agent that stores the object does not
     // share it. OpenSSL's makefiles compile every object that way.
     let object = invocation.output_in(&context.working_dir);
-    let mut prediction = invocation.prediction(context, duration_ns)?;
+    let mut prediction = invocation.prediction(context, duration_ns, aliases)?;
     prediction.path_specific = !portable.outputs_are_clean(&object, &context.path_mappings);
     if prediction.path_specific
         && std::env::var_os("MBX_CC_STORE_PATH_SPECIFIC")
@@ -509,7 +518,8 @@ fn publish(
     {
         return Err(CcBypassReason::PathSpecificStorageDisabled.into());
     }
-    let action = invocation.action_with_path_binding(context.clone(), prediction.path_specific)?;
+    let action =
+        invocation.action_with_path_binding(context.clone(), prediction.path_specific, aliases)?;
     if let Err(error) = publish_result(&action, &object, output, &context.path_mappings) {
         // GCC can name a random assembler tempfile in stderr. An immutable
         // result may already exist even though this task has no prediction.
@@ -569,6 +579,7 @@ impl LookupState {
 /// stale or foreign record can do is miss. A restore that works is recorded
 /// into this session's own manifest, which is how the next build finds it
 /// without a flight.
+#[allow(clippy::too_many_arguments)]
 fn restore_flight_prediction(
     payload: &str,
     invocation: &CcInvocation,
@@ -577,6 +588,7 @@ fn restore_flight_prediction(
     invocation_digest: &CacheDigest,
     lookup: &mut LookupState,
     recorded_action: Option<&CacheDigest>,
+    aliases: &PathAliases,
 ) -> Result<Option<(CacheDigest, CachedCompilation, CcDiscoveredInputs)>> {
     let _phase = crate::phase_timing::phase("key");
     let prediction: CcInputPrediction = serde_json::from_str(payload)?;
@@ -589,7 +601,7 @@ fn restore_flight_prediction(
     discovered.clone().apply_to(&mut candidate)?;
     crate::pch_identity::substitute(&mut candidate);
     let action = crate::phase_timing::measure("key", || {
-        invocation.action_with_path_binding(candidate, prediction.path_specific)
+        invocation.action_with_path_binding(candidate, prediction.path_specific, aliases)
     })?;
     if recorded_action.is_some_and(|recorded| recorded != &action.digest) {
         bail!("the action promise no longer matches its predicted inputs");

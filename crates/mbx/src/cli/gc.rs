@@ -917,6 +917,13 @@ pub(crate) fn schedule_low_disk_sweep(
         return;
     }
 
+    // Every compiler miss asks, and a fresh stamp answers most of them for
+    // one stat; the probes below are statfs calls on up to two volumes.
+    let interval = config.gc.interval.min(LOW_DISK_INTERVAL);
+    if !store::sweep_is_due(&config.store_dir(), interval) {
+        return;
+    }
+
     let is_short = |path: &Path| {
         disk_space(path).is_some_and(|space| space.available < min_free.bytes(space.total))
     };
@@ -925,11 +932,6 @@ pub(crate) fn schedule_low_disk_sweep(
         && !crate::util::same_disk(&config.cache_dir, &config.target.root)
         && is_short(&config.target.root);
     if !(cache_short || target_short) {
-        return;
-    }
-
-    let interval = config.gc.interval.min(LOW_DISK_INTERVAL);
-    if !store::sweep_is_due(&config.store_dir(), interval) {
         return;
     }
     if let Err(error) = spawn(config) {

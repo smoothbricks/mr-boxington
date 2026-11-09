@@ -1225,11 +1225,15 @@ impl CcInvocation {
     }
 
     /// Digest of the pre-input fingerprint, used to look up a prediction.
+    ///
+    /// `aliases` remembers the directories this compilation has resolved, so
+    /// each of its keys walks a shared parent once rather than once per key.
     pub fn invocation_digest(
         &self,
         context: &CcActionContext,
+        aliases: &PathAliases,
     ) -> Result<CacheDigest, CcBypassReason> {
-        let builder = ActionBuilder::new(self, context.clone());
+        let builder = ActionBuilder::new(self, context.clone(), aliases);
         let descriptor = builder.invocation_descriptor()?;
         let bytes = canonical_json(&descriptor)
             .map_err(|error| CcBypassReason::Serialization(error.to_string()))?;
@@ -1237,9 +1241,9 @@ impl CcInvocation {
     }
 
     /// Build the canonical action for this invocation and its discovered
-    /// inputs.
+    /// inputs, resolving its paths from scratch.
     pub fn action(&self, context: CcActionContext) -> Result<CcAction, CcBypassReason> {
-        self.action_with_path_binding(context, false)
+        self.action_with_path_binding(context, false, &PathAliases::default())
     }
 
     /// Build an action tied to literal path spellings when the output retained them.
@@ -1248,8 +1252,9 @@ impl CcInvocation {
         &self,
         context: CcActionContext,
         path_specific: bool,
+        aliases: &PathAliases,
     ) -> Result<CcAction, CcBypassReason> {
-        ActionBuilder::new(self, context).build(path_specific)
+        ActionBuilder::new(self, context, aliases).build(path_specific)
     }
 
     /// Record the normalized inputs of a successful compile so the next cold
@@ -1258,8 +1263,9 @@ impl CcInvocation {
         &self,
         context: &CcActionContext,
         compiler_duration_ns: u64,
+        aliases: &PathAliases,
     ) -> Result<CcInputPrediction, CcBypassReason> {
-        let builder = ActionBuilder::new(self, context.clone());
+        let builder = ActionBuilder::new(self, context.clone(), aliases);
         let mut inputs = context
             .inputs
             .iter()
@@ -1663,19 +1669,23 @@ struct ActionBuilder<'a> {
     invocation: &'a CcInvocation,
     context: CcActionContext,
     mappings: Vec<PathMapping>,
-    /// Reuse parent resolution across the inputs of this action only.
-    aliases: PathAliases,
+    /// Parent resolution the caller shares across one compilation's keys.
+    aliases: &'a PathAliases,
 }
 
 impl<'a> ActionBuilder<'a> {
-    fn new(invocation: &'a CcInvocation, mut context: CcActionContext) -> Self {
+    fn new(
+        invocation: &'a CcInvocation,
+        mut context: CcActionContext,
+        aliases: &'a PathAliases,
+    ) -> Self {
         context.path_mappings = PathMapping::ordered(&context.path_mappings);
         let mappings = resolve_path_mappings(&context.path_mappings);
         Self {
             invocation,
             context,
             mappings,
-            aliases: PathAliases::default(),
+            aliases,
         }
     }
 
@@ -1839,23 +1849,33 @@ impl<'a> ActionBuilder<'a> {
     /// location is a property of the machine, and its contents are digested
     /// like any other input.
     fn normalize_path(&self, path: &Path) -> Result<String, CcBypassReason> {
+        let absolute = absolute_path(path, &self.context.working_dir);
+        let verbatim = |absolute: PathBuf| {
+            absolute
+                .into_os_string()
+                .into_string()
+                .map_err(|raw| CcBypassReason::NonUtf8Path(raw.into()))
+        };
+        // A system path no mapped root spells keeps its own path, so it is
+        // never resolved: realpath would walk every component of every SDK
+        // and store header only to find that no mapping applies.
+        if is_system_path(&absolute)
+            && !self
+                .mappings
+                .iter()
+                .any(|mapping| absolute.starts_with(&mapping.root))
+        {
+            return verbatim(absolute);
+        }
         match normalize_resolved_mapped_path_with(
-            &self.aliases,
+            self.aliases,
             path,
             &self.context.working_dir,
             &self.mappings,
         ) {
             Ok(normalized) => Ok(normalized),
-            Err(reason) => {
-                let absolute = absolute_path(path, &self.context.working_dir);
-                if is_system_path(&absolute) {
-                    return absolute
-                        .to_str()
-                        .map(ToOwned::to_owned)
-                        .ok_or_else(|| CcBypassReason::NonUtf8Path(absolute.clone()));
-                }
-                Err(reason.into())
-            }
+            Err(_) if is_system_path(&absolute) => verbatim(absolute),
+            Err(reason) => Err(reason.into()),
         }
     }
 

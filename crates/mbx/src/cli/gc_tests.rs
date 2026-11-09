@@ -322,6 +322,29 @@ fn low_disk_collection_respects_auto_off_and_the_sweep_stamp() {
 }
 
 #[test]
+fn a_sweep_that_is_not_due_measures_no_disk() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut config = super::cargo_tests::managed_target_config(directory.path());
+    config.target.views = false;
+    config.gc.interval = Duration::from_secs(3600);
+    let probes = std::cell::Cell::new(0);
+    let disk = |_path: &Path| {
+        probes.set(probes.get() + 1);
+        Some(crate::util::DiskSpace {
+            total: 100,
+            available: 10,
+        })
+    };
+    let spawn = |_config: &Config| Ok(());
+    assert!(crate::store::claim_sweep(&config.store_dir(), config.gc.interval).unwrap());
+
+    schedule_low_disk_sweep(&config, crate::config::MinFree::Bytes(90), &disk, &spawn);
+
+    // Every compiler miss asks, and a fresh stamp answers for one stat.
+    assert_eq!(probes.get(), 0);
+}
+
+#[test]
 fn a_short_disk_collects_live_targets_past_their_budget() {
     let directory = tempfile::tempdir().unwrap();
     let config = super::cargo_tests::managed_target_config(directory.path());

@@ -774,7 +774,7 @@ fn path_specific_actions_bind_checkout_target_and_source_spelling() {
             digest: digest_of("source"),
         });
         invocation
-            .action_with_path_binding(context, bound)
+            .action_with_path_binding(context, bound, &PathAliases::default())
             .unwrap()
             .digest
     };
@@ -1045,7 +1045,9 @@ fn a_nix_store_driver_is_keyed_by_its_store_path() {
             path: workspace.join("src/a.c"),
             digest: digest_of("source"),
         }];
-        let prediction = invocation.invocation_digest(&context).unwrap();
+        let prediction = invocation
+            .invocation_digest(&context, &PathAliases::default())
+            .unwrap();
         (prediction, invocation.action(context).unwrap())
     };
     let (first_prediction, first) = keyed(nix_wrapper(WRAPPER));
@@ -1448,7 +1450,9 @@ fn predictions_round_trip_through_normalized_names() {
             digest: digest_of("manifest"),
         },
     ];
-    let prediction = invocation.prediction(&context, 42).expect("prediction");
+    let prediction = invocation
+        .prediction(&context, 42, &PathAliases::default())
+        .expect("prediction");
     assert_eq!(prediction.version, COMPACT_PREDICTION_VERSION);
     assert_eq!(prediction.compiler_duration_ns, 42);
     assert_eq!(prediction.source_name, "a.c");
@@ -1492,7 +1496,9 @@ fn a_cpp_build_records_every_prediction_in_one_task_manifest() {
                     digest: digest_of(&source),
                 }])
                 .collect();
-            let prediction = invocation.prediction(&context, 42).expect("prediction");
+            let prediction = invocation
+                .prediction(&context, 42, &PathAliases::default())
+                .expect("prediction");
             let payload = serde_json::to_string(&prediction).expect("payload");
             assert_eq!(
                 serde_json::from_str::<CcInputPrediction>(&payload).expect("payload decodes"),
@@ -1999,26 +2005,26 @@ fn preprocessor_keys_retain_checkout_and_argument_spellings() {
     let (second, second_target) = checkout("second");
     let invocation = CcInvocation::parse(&argv(&["-E", "main.c", "-o", "main.i"])).unwrap();
     let digest = invocation
-        .invocation_digest(&context(&first, &first_target))
+        .invocation_digest(&context(&first, &first_target), &PathAliases::default())
         .unwrap();
     assert_ne!(
         digest,
         invocation
-            .invocation_digest(&context(&second, &second_target))
+            .invocation_digest(&context(&second, &second_target), &PathAliases::default())
             .unwrap()
     );
     let spelled = CcInvocation::parse(&argv(&["-E", "./main.c", "-o", "main.i"])).unwrap();
     assert_ne!(
         digest,
         spelled
-            .invocation_digest(&context(&first, &first_target))
+            .invocation_digest(&context(&first, &first_target), &PathAliases::default())
             .unwrap()
     );
     let compiled = CcInvocation::parse(&argv(&["-c", "main.c", "-o", "main.i"])).unwrap();
     assert_ne!(
         digest,
         compiled
-            .invocation_digest(&context(&first, &first_target))
+            .invocation_digest(&context(&first, &first_target), &PathAliases::default())
             .unwrap()
     );
 }
