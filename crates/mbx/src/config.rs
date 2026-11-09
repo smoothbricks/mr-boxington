@@ -466,13 +466,16 @@ struct RawScheduler {
     memory: Option<String>,
     /// Priority of this build's compilations in the machine-wide permit pool.
     ///
-    /// A waiting normal-priority request goes before every `low` one, which
-    /// starts only on room no waiting normal-priority request can use. This
+    /// Waiting requests are admitted band by band: `interactive` (work a
+    /// person or agent waits on), then `normal` (the land gate), then `low`,
+    /// each band starting only on room no waiting request of a band above it
+    /// can use. An `interactive` build decays to `normal` 30 seconds after
+    /// `MBX_SCHEDULER_JOB_STARTED_MS` and to `low` 120 seconds after it. This
     /// may also be set in workspace `.mbx.toml`; the environment variable wins.
     #[usage(
         env = "MBX_SCHEDULER_PRIORITY",
         default = "normal",
-        choices("normal", "low")
+        choices("interactive", "normal", "low")
     )]
     priority: String,
     /// Delay additional compilations while memory is under pressure.
@@ -503,6 +506,18 @@ struct RawScheduler {
     /// variable wins.
     #[usage(env = "MBX_SCHEDULER_TESTS", default = false)]
     tests: bool,
+    /// When the job this build runs for started, in milliseconds since the
+    /// Unix epoch: an `interactive` request that asks 30 seconds after it is
+    /// admitted as `normal`, and 120 seconds after it as `low`. Unset or
+    /// empty, as cowshed sets it for every job that is not interactive, an
+    /// `interactive` request stays `interactive`. Only an `interactive`
+    /// request reads it.
+    #[usage(
+        key = "job_started_ms",
+        env = "MBX_SCHEDULER_JOB_STARTED_MS",
+        scope = "env"
+    )]
+    job_started_ms: Option<String>,
 }
 
 #[derive(Debug, usage_rs::Config)]
@@ -909,6 +924,9 @@ pub struct SchedulerSettings {
     pub memory_bytes: Option<u64>,
     /// Priority of this build's compilations against other builds.
     pub priority: SchedulerPriority,
+    /// When the job this build runs for started, on the pool clock: what an
+    /// `interactive` build's requests decay by.
+    pub job_started_ms: Option<u64>,
     /// Whether `cargo test` and `cargo nextest` binaries take permits too.
     pub tests: bool,
     /// Gate new compilations on live memory pressure.
@@ -941,6 +959,7 @@ impl Default for SchedulerSettings {
             reserve_cpus: 0,
             memory_bytes: None,
             priority: SchedulerPriority::Normal,
+            job_started_ms: None,
             tests: false,
             pressure: false,
             suspend: false,
@@ -951,12 +970,16 @@ impl Default for SchedulerSettings {
 
 /// Whose compilations wait when the machine is contended.
 ///
-/// `Low` is for builds nobody is sitting at, such as CI on a shared box or an
-/// editor's background check. Normal-priority work waiting for the pool goes
-/// before them.
+/// `Interactive` is work a person or agent waits on, such as an agent's
+/// edit-feedback test; `Normal` is the work a land gate runs; `Low` is for
+/// builds nobody is sitting at, such as CI on a shared box or an editor's
+/// background check. The pool admits waiting requests band by band in that
+/// order, and an interactive request decays through the bands below it as its
+/// job ages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SchedulerPriority {
+    Interactive,
     #[default]
     Normal,
     Low,
@@ -966,8 +989,20 @@ impl SchedulerPriority {
     /// The spelling the configuration and the session environment use.
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Interactive => "interactive",
             Self::Normal => "normal",
             Self::Low => "low",
+        }
+    }
+
+    /// The priority `value` spells, or `None` for one this version does not
+    /// know, such as a newer version's.
+    pub fn named(value: &str) -> Option<Self> {
+        match value {
+            "interactive" => Some(Self::Interactive),
+            "normal" => Some(Self::Normal),
+            "low" => Some(Self::Low),
+            _ => None,
         }
     }
 }
@@ -976,11 +1011,9 @@ impl std::str::FromStr for SchedulerPriority {
     type Err = eyre::Report;
 
     fn from_str(value: &str) -> Result<Self> {
-        match value {
-            "normal" => Ok(Self::Normal),
-            "low" => Ok(Self::Low),
-            other => Err(eyre::eyre!("priority must be normal or low, not {other:?}")),
-        }
+        Self::named(value).ok_or_else(|| {
+            eyre::eyre!("priority must be interactive, normal or low, not {value:?}")
+        })
     }
 }
 
@@ -1485,6 +1518,19 @@ impl Config {
                 .priority
                 .parse()
                 .wrap_err(Invalid("scheduler.priority"))?,
+            job_started_ms: raw
+                .scheduler
+                .job_started_ms
+                .as_deref()
+                // Set empty for a job that is not interactive, so a nested
+                // job never inherits its caller's start.
+                .filter(|value| !value.is_empty())
+                .map(str::parse::<u64>)
+                .transpose()
+                .map_err(|_| {
+                    eyre::eyre!("must be milliseconds since the Unix epoch")
+                        .wrap_err(Invalid("scheduler.job_started_ms"))
+                })?,
             tests: raw.scheduler.tests,
             pressure: raw.scheduler.pressure,
             suspend: raw.scheduler.suspend,
@@ -3580,6 +3626,32 @@ default = "rust-lld"
         );
         let error = configured(None, &[("MBX_SCHEDULER_PRIORITY", "loud")]).unwrap_err();
         assert!(error.to_string().contains("scheduler.priority"), "{error}");
+
+        let config = configured(
+            None,
+            &[
+                ("MBX_SCHEDULER_PRIORITY", "interactive"),
+                ("MBX_SCHEDULER_JOB_STARTED_MS", "1700000000000"),
+            ],
+        )
+        .unwrap();
+        assert_eq!(config.scheduler.priority, SchedulerPriority::Interactive);
+        assert_eq!(config.scheduler.job_started_ms, Some(1_700_000_000_000));
+        let error = configured(None, &[("MBX_SCHEDULER_JOB_STARTED_MS", "-1")]).unwrap_err();
+        assert!(
+            error.to_string().contains("scheduler.job_started_ms"),
+            "{error}"
+        );
+        // Empty is no job start: the request does not decay.
+        let config = configured(
+            None,
+            &[
+                ("MBX_SCHEDULER_PRIORITY", "interactive"),
+                ("MBX_SCHEDULER_JOB_STARTED_MS", ""),
+            ],
+        )
+        .unwrap();
+        assert_eq!(config.scheduler.job_started_ms, None);
     }
 
     #[test]

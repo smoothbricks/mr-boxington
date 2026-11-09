@@ -64,8 +64,45 @@ fn a_reservation_inside_a_reservation_runs_under_the_enclosing_grant() {
 }
 
 #[test]
+fn reserve_names_each_priority_and_its_jobs_start() {
+    use crate::config::SchedulerPriority;
+    for (priority, expected) in [
+        ("interactive", SchedulerPriority::Interactive),
+        ("normal", SchedulerPriority::Normal),
+        ("low", SchedulerPriority::Low),
+    ] {
+        let argv = [
+            "mbx",
+            "reserve",
+            "--priority",
+            priority,
+            "--job-started",
+            "1700000000000",
+            "--",
+            "true",
+        ]
+        .map(std::ffi::OsStr::new);
+        let cli = Cli::try_parse_from(&argv).unwrap();
+        let Commands::Reserve(args) = cli.command else {
+            panic!("reserve should be reserved by mbx");
+        };
+        assert_eq!(
+            (args.priority, args.job_started),
+            (expected, Some(1_700_000_000_000))
+        );
+    }
+    let argv = ["mbx", "reserve", "--priority", "urgent", "--", "true"].map(std::ffi::OsStr::new);
+    assert!(Cli::try_parse_from(&argv).is_err());
+}
+#[test]
 fn reserve_options_stay_out_of_its_command() {
-    for options in [&["--grant-fd", "5"][..], &["--grant-fd=5"]] {
+    for options in [
+        &["--grant-fd", "5"][..],
+        &["--grant-fd=5"],
+        &["--name", "nx:ws:test"],
+        &["--job-started", "1700000000000"],
+        &["--job-started=1700000000000"],
+    ] {
         let argv = ["mbx", "reserve", "--cpus", "1"]
             .iter()
             .chain(options)

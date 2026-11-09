@@ -510,6 +510,15 @@ Coordinate real compilations machine-wide through a permit pool.
 
 Cache hits never take a permit. A compilation that runs the compiler takes one first, so concurrent mbx builds on one machine share one pool. This may also be set in workspace `.mbx.toml`; the environment variable wins.
 
+### `scheduler.job_started_ms`
+
+- **Type:** `option<string>`
+- **Optional:** true
+- **Scope:** only from the environment or the command line
+- **Set with:** `MBX_SCHEDULER_JOB_STARTED_MS`
+
+When the job this build runs for started, in milliseconds since the Unix epoch: an `interactive` request that asks 30 seconds after it is admitted as `normal`, and 120 seconds after it as `low`. Unset or empty, as cowshed sets it for every job that is not interactive, an `interactive` request stays `interactive`. Only an `interactive` request reads it.
+
 ### `scheduler.memory`
 
 - **Type:** `option<string>`
@@ -539,9 +548,10 @@ Works on Linux and macOS. Has no effect when `scheduler.memory` is `"none"`. Thi
 
 Priority of this build's compilations in the machine-wide permit pool.
 
-A waiting normal-priority request goes before every `low` one, which starts only on room no waiting normal-priority request can use. This may also be set in workspace `.mbx.toml`; the environment variable wins.
+Waiting requests are admitted band by band: `interactive` (work a person or agent waits on), then `normal` (the land gate), then `low`, each band starting only on room no waiting request of a band above it can use. An `interactive` build decays to `normal` 30 seconds after `MBX_SCHEDULER_JOB_STARTED_MS` and to `low` 120 seconds after it. This may also be set in workspace `.mbx.toml`; the environment variable wins.
 
 **Choices:**
+- `interactive`
 - `normal`
 - `low`
 
@@ -598,6 +608,7 @@ Uses `.` as the working directory in debug info and backtrace frames. On stable 
 Share the generated-source directories these environment variables name, comma-separated, as `OUT_DIR` is shared.
 
 A build that hands rustc generated sources through a variable of its own (Bun's `BUN_CODEGEN_DIR`) keys every compilation that reads it to the checkout's path. Each named variable that names a directory, read by a crate whose sources mention it, is copied into the same content-addressed cache directory as `OUT_DIR` and handed to rustc as that path; the key keeps the literal copy's path. Needs `share_out_dir`.
+
 ### `share_out_dir`
 
 - **Type:** `bool`

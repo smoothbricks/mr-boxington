@@ -8,6 +8,7 @@ use tokio::io::{DuplexStream, Lines, ReadHalf, WriteHalf};
 /// grants below depend only on the requests each test makes.
 fn pools(dir: &Path, cpus: u64) -> Pools {
     Pools::new(
+        Pool::isolated(dir, cpus, 0, SchedulerPriority::Interactive),
         Pool::isolated(dir, cpus, 0, SchedulerPriority::Normal),
         Pool::isolated(dir, cpus, 0, SchedulerPriority::Low),
     )
@@ -99,6 +100,7 @@ fn a_request_is_exactly_one_of_the_protocol_lines() {
                 priority: SchedulerPriority::Low,
                 memory: None,
                 name: None,
+                job_started_ms: None,
             }),
         ),
         (
@@ -109,6 +111,7 @@ fn a_request_is_exactly_one_of_the_protocol_lines() {
                 priority: SchedulerPriority::Normal,
                 memory: Some(1024),
                 name: None,
+                job_started_ms: None,
             }),
         ),
         (
@@ -119,11 +122,35 @@ fn a_request_is_exactly_one_of_the_protocol_lines() {
                 priority: SchedulerPriority::Low,
                 memory: None,
                 name: Some("nx:ws:build".into()),
+                job_started_ms: None,
             }),
         ),
         (
             r#"{"type":"release","id":3}"#,
             Some(Request::Release { id: 3 }),
+        ),
+        (
+            r#"{"type":"reserve","id":3,"cpus":4,"priority":"interactive","job_started_ms":1700000000000}"#,
+            Some(Request::Reserve {
+                id: 3,
+                cpus: 4,
+                priority: SchedulerPriority::Interactive,
+                memory: None,
+                name: None,
+                job_started_ms: Some(1_700_000_000_000),
+            }),
+        ),
+        // Absent or null is no job start: the request does not decay.
+        (
+            r#"{"type":"reserve","id":3,"cpus":4,"priority":"interactive","job_started_ms":null}"#,
+            Some(Request::Reserve {
+                id: 3,
+                cpus: 4,
+                priority: SchedulerPriority::Interactive,
+                memory: None,
+                name: None,
+                job_started_ms: None,
+            }),
         ),
         // A priority is named, never defaulted: the pool's order depends on it.
         (r#"{"type":"reserve","id":3,"cpus":4}"#, None),

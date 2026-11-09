@@ -327,7 +327,7 @@ enabled = true
 cpus = 16                # default: logical CPUs
 reserve_cpus = 2         # default: 0
 memory = "24GiB"         # default: 85% of physical memory
-priority = "normal"      # or "low"
+priority = "normal"      # or "interactive", "low"
 ```
 
 </details>

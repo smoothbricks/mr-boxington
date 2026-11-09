@@ -23,10 +23,15 @@ pub(super) struct ReserveArgs {
     /// Memory to hold from the configured scheduler budget.
     #[usage(long, value_name = "SIZE")]
     memory: Option<ByteSize>,
-    /// Priority in the machine-wide pool: `low` goes after waiting
-    /// normal-priority work.
+    /// Priority in the machine-wide pool: waiting `interactive` work goes
+    /// first, then `normal` (the land gate), then `low`.
     #[usage(long, default = "normal")]
-    priority: SchedulerPriority,
+    pub(super) priority: SchedulerPriority,
+    /// When the job an `interactive` reservation runs for started, in
+    /// milliseconds since the Unix epoch: asked 30 seconds after it, the
+    /// reservation is admitted as `normal`, and 120 seconds after it as `low`.
+    #[usage(long, value_name = "MS")]
+    pub(super) job_started: Option<u64>,
     /// The class this reservation's run time is remembered and predicted by,
     /// such as `nx:<workspace>:<task>`: within a priority, the pool admits
     /// the requests predicted shortest first. Without one, the reservation is
@@ -102,6 +107,9 @@ fn spawn_worker(args: &ReserveArgs, grant: Option<Descriptor>) -> Result<ExitCod
     if let Some(name) = &args.name {
         worker.args(["--name", name]);
     }
+    if let Some(job_started) = args.job_started {
+        worker.args(["--job-started", &job_started.to_string()]);
+    }
     worker.args(["--priority", args.priority.as_str(), "--"]);
     worker.args(&args.command);
     worker.env(WORKER_ENV, "1");
@@ -124,6 +132,7 @@ fn run_direct(config: &Config, args: &ReserveArgs, grant: Option<Descriptor>) ->
         args.cpus,
         args.memory.map(|memory| memory.as_u64()),
         args.name.as_deref(),
+        args.job_started,
         &AtomicBool::new(false),
     )?
     else {

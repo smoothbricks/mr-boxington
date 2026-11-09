@@ -437,12 +437,17 @@ fn original_reserve_arguments(arguments: &[std::ffi::OsString]) -> Result<Vec<St
     };
     let mut rest = &arguments[index + 1..];
     while let Some(first) = rest.first().and_then(|argument| argument.to_str()) {
-        if matches!(first, "--cpus" | "--memory" | "--priority" | "--grant-fd") {
+        if matches!(
+            first,
+            "--cpus" | "--memory" | "--priority" | "--grant-fd" | "--name" | "--job-started"
+        ) {
             rest = rest.get(2..).unwrap_or_default();
         } else if first.starts_with("--cpus=")
             || first.starts_with("--memory=")
             || first.starts_with("--priority=")
             || first.starts_with("--grant-fd=")
+            || first.starts_with("--name=")
+            || first.starts_with("--job-started=")
         {
             rest = &rest[1..];
         } else {

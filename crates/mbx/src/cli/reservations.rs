@@ -9,9 +9,11 @@
 //!
 //! The protocol is newline-delimited JSON, one object per line:
 //!
-//! - `{"type":"reserve","id":N,"cpus":C,"priority":"normal"|"low"}`, with an
-//!   optional `"memory":BYTES` and an optional `"name":"<class>"`, the class
-//!   the pool predicts its run time by, asks for at most `C` cores. The reply is
+//! - `{"type":"reserve","id":N,"cpus":C,"priority":"interactive"|"normal"|"low"}`,
+//!   with an optional `"memory":BYTES`, an optional `"name":"<class>"`, the
+//!   class the pool predicts its run time by, and an optional
+//!   `"job_started_ms":MS`, when the job an `interactive` request runs for
+//!   started, which it decays by. It asks for at most `C` cores. The reply is
 //!   `{"type":"granted","id":N,"cpus":K}` once the pool admits it, `K` being
 //!   the cores it holds: as many of `C` as were free, at least one. A request
 //!   the pool refuses is answered `{"type":"refused","id":N,"error":"..."}`.
@@ -69,6 +71,10 @@ pub(super) enum Request {
         /// predicts it by.
         #[serde(default)]
         name: Option<String>,
+        /// When the job an `interactive` request runs for started, in
+        /// milliseconds since the Unix epoch.
+        #[serde(default)]
+        job_started_ms: Option<u64>,
     },
     /// Give grant `id` back, or withdraw it while it waits.
     Release { id: u64 },
@@ -90,13 +96,15 @@ pub(super) enum Reply {
 /// `mbx reserve --priority` reserves from.
 #[derive(Clone)]
 pub(super) struct Pools {
+    interactive: Arc<Pool>,
     normal: Arc<Pool>,
     low: Arc<Pool>,
 }
 
 impl Pools {
-    pub(super) fn new(normal: Pool, low: Pool) -> Self {
+    pub(super) fn new(interactive: Pool, normal: Pool, low: Pool) -> Self {
         Self {
+            interactive: Arc::new(interactive),
             normal: Arc::new(normal),
             low: Arc::new(low),
         }
@@ -108,6 +116,7 @@ impl Pools {
                 .ok_or_else(|| eyre::eyre!("reservations need scheduler.enabled"))
         };
         Ok(Self::new(
+            pool(SchedulerPriority::Interactive)?,
             pool(SchedulerPriority::Normal)?,
             pool(SchedulerPriority::Low)?,
         ))
@@ -115,6 +124,7 @@ impl Pools {
 
     fn at(&self, priority: SchedulerPriority) -> &Arc<Pool> {
         match priority {
+            SchedulerPriority::Interactive => &self.interactive,
             SchedulerPriority::Normal => &self.normal,
             SchedulerPriority::Low => &self.low,
         }
@@ -314,7 +324,8 @@ impl Connection {
                 priority,
                 memory,
                 name,
-            }) => self.reserve(id, cpus, priority, memory, name),
+                job_started_ms,
+            }) => self.reserve(id, cpus, priority, memory, name, job_started_ms),
             Ok(Request::Release { id }) => match self.slots.remove(&id) {
                 Some(_) => Step::Quiet,
                 None => Step::Close(format!("no reservation {id} on this connection to release")),
@@ -330,6 +341,7 @@ impl Connection {
         priority: SchedulerPriority,
         memory: Option<u64>,
         name: Option<String>,
+        job_started_ms: Option<u64>,
     ) -> Step {
         if self.slots.contains_key(&id) {
             return Step::Close(format!(
@@ -347,7 +359,13 @@ impl Connection {
         let started = std::thread::Builder::new()
             .name(format!("mbx-reservation-{id}"))
             .spawn(move || {
-                let outcome = pool.reserve_observed(Some(cpus), memory, name.as_deref(), &waiting);
+                let outcome = pool.reserve_observed(
+                    Some(cpus),
+                    memory,
+                    name.as_deref(),
+                    job_started_ms,
+                    &waiting,
+                );
                 // A connection that has ended drops the answer, and any grant in it.
                 let _ = answers.send(Answer {
                     id,

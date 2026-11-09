@@ -121,6 +121,8 @@ const SCHED_MEMORY_BYTES_ENV: &str = "MBX_SCHED_MEMORY_BYTES";
 pub(crate) const SCHED_SLOT_BYTES_ENV: &str = "MBX_SCHED_SLOT_BYTES";
 /// Permit priority of this build's compilations.
 pub(crate) const SCHED_PRIORITY_ENV: &str = "MBX_SCHED_PRIORITY";
+/// When the job this build's compilations run for started, on the pool clock.
+pub(crate) const SCHED_JOB_STARTED_ENV: &str = "MBX_SCHED_JOB_STARTED_MS";
 /// Identity shared by every compiler shim in one Cargo build.
 const SCHED_PRESSURE_ENV: &str = "MBX_SCHED_PRESSURE";
 /// The session's resolved events gate, including workspace overrides.
@@ -495,6 +497,10 @@ struct Waiting {
     /// the pool rule, which orders its own requests by ticket.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     shape: Option<Shape>,
+    /// The band it was declared at and the age of its job when it asked,
+    /// when that age put it in a band below the declared one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    decayed: Option<Decayed>,
 }
 
 /// What any registrar holder needs to admit a queued request on its holder's
@@ -578,6 +584,9 @@ struct AdmissionState {
     periodic: bool,
     /// What its class is predicted to run for, read once when it asks.
     predicted_ms: Option<u64>,
+    /// The band below its declared one its job's age put it in when it
+    /// asked, decided once: a request keeps the band it asked with.
+    decayed: Option<Decayed>,
 }
 
 impl AdmissionState {
@@ -592,6 +601,7 @@ impl AdmissionState {
             claimed: None,
             periodic: false,
             predicted_ms: None,
+            decayed: None,
         }
     }
 }
@@ -740,7 +750,7 @@ enum AdmissionDecision {
 }
 
 fn priority_exception(older: &Waiting, request: &Waiting) -> bool {
-    older.priority == "low" && request.priority == "normal"
+    band(&older.priority) > band(&request.priority)
 }
 
 fn older_exception(live: &[Lease], older: &Waiting, request: &Waiting) -> Option<&'static str> {
@@ -807,11 +817,65 @@ struct Pass {
 /// it in the scopes it is short of: the starvation bound.
 const AGING_MS: u64 = 30_000;
 
+/// How long after its job started an `interactive` request still asks as
+/// `interactive`; until [`NORMAL_UNTIL_MS`] it asks as `normal`, then as
+/// `low`. The bounds of the decay Danny set (tg#19152, tg#19154).
+const INTERACTIVE_FOR_MS: u64 = 30_000;
+const NORMAL_UNTIL_MS: u64 = 120_000;
+
+/// The band a published priority is admitted in, the lower first: the pool's
+/// one lane order. A spelling this version does not know, a newer version's,
+/// goes with `low`, so no record fails the pass.
+fn band(priority: &str) -> u8 {
+    match SchedulerPriority::named(priority) {
+        Some(SchedulerPriority::Interactive) => 0,
+        Some(SchedulerPriority::Normal) => 1,
+        Some(SchedulerPriority::Low) | None => 2,
+    }
+}
+
+/// An `interactive` request that asked in a lower band because its job had
+/// run past a bound: what its records and decision rows name. Spelled as
+/// published priorities are, so any version reads it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct Decayed {
+    from: String,
+    to: String,
+    elapsed_ms: u64,
+}
+
+/// The band below `declared` a request asking at `asked_ms` is admitted in,
+/// `None` when it keeps its declared one. Only `interactive` decays, and only
+/// by the age of a job whose start it names; a grant is never re-ranked, since
+/// nothing granted is preempted.
+fn decayed(
+    declared: SchedulerPriority,
+    job_started_ms: Option<u64>,
+    asked_ms: u64,
+) -> Option<Decayed> {
+    if declared != SchedulerPriority::Interactive {
+        return None;
+    }
+    let elapsed_ms = asked_ms.saturating_sub(job_started_ms?);
+    let to = if elapsed_ms < INTERACTIVE_FOR_MS {
+        return None;
+    } else if elapsed_ms < NORMAL_UNTIL_MS {
+        SchedulerPriority::Normal
+    } else {
+        SchedulerPriority::Low
+    };
+    Some(Decayed {
+        from: declared.as_str().into(),
+        to: to.as_str().into(),
+        elapsed_ms,
+    })
+}
+
 /// One admission pass: the pool rule over every live queued request and the
 /// caller's own (`POOL_RULE` of SmoothBricks' admission simulator, the
 /// reference policy, over mbx's scopes and request shapes).
 ///
-/// - **Order.** `normal` before `low`. Within a priority, requests that have
+/// - **Order.** `interactive`, then `normal`, then `low` ([`band`]). Within a priority, requests that have
 ///   waited [`AGING_MS`] go first, oldest first, then by ticket; the rest go
 ///   shortest predicted run time first, a request with no prediction after
 ///   every predicted one, then by ticket. This is the order of the proven
@@ -886,7 +950,7 @@ fn admission_pass(
         let record = record_of(grantee);
         let aged = aged(record);
         (
-            record.priority != "normal",
+            band(&record.priority),
             !aged,
             if aged { since(record) } else { 0 },
             if aged {
@@ -1709,6 +1773,9 @@ pub(crate) struct Pool {
     bytes_per_permit: u64,
     events: bool,
     priority: SchedulerPriority,
+    /// When the job this pool's compilations run for started: what an
+    /// `interactive` request's band decays by.
+    job_started_ms: Option<u64>,
     /// Probe for currently available memory, injectable for tests.
     available_memory: fn() -> Option<u64>,
     pressure: bool,
@@ -1769,6 +1836,7 @@ fn resolve_pool() -> Option<Pool> {
                     .and_then(|value| value.parse().ok())
                     .unwrap_or_default(),
             );
+            pool.job_started_ms = env_number(SCHED_JOB_STARTED_ENV);
             pool.domain_capacity = env_number(SCHED_CPUS_ENV)
                 .unwrap_or(capacity)
                 .min(default_capacity())
@@ -1851,6 +1919,12 @@ pub(crate) fn session_environment_with_jobs(
         (
             SCHED_PRIORITY_ENV.into(),
             scheduler.priority.as_str().into(),
+        ),
+        (
+            SCHED_JOB_STARTED_ENV.into(),
+            scheduler
+                .job_started_ms
+                .map_or_else(String::new, |ms| ms.to_string()),
         ),
         (
             "MBX_SCHED_SUSPEND".into(),
@@ -2023,6 +2097,7 @@ impl Pool {
             bytes_per_permit,
             events: true,
             priority,
+            job_started_ms: None,
             available_memory: crate::util::memory_available_bytes,
             pressure: true,
             pressure_probe: crate::pressure::probe,
@@ -2065,6 +2140,7 @@ impl Pool {
             pool.set_memory_capacity(scheduler.memory_bytes.unwrap_or(0));
             pool.events = config.events;
             pool.pressure = scheduler.pressure;
+            pool.job_started_ms = scheduler.job_started_ms;
             pool
         })
     }
@@ -2085,9 +2161,11 @@ impl Pool {
             .get_or_insert_with(LedgerCache::default)
             .read(&self.ledger_path())
             .predicted_run_ms(kind, Some(&class));
+        let now_ms = (self.clock)();
         let mut state = AdmissionState {
             predicted_ms,
-            ..AdmissionState::new((self.clock)(), Shape::Rigid)
+            decayed: decayed(self.priority, self.job_started_ms, now_ms),
+            ..AdmissionState::new(now_ms, Shape::Rigid)
         };
         let mut wake: Option<wait::Wait> = None;
         let mut complained = false;
@@ -2193,6 +2271,7 @@ impl Pool {
         cpus: Option<u64>,
         memory_bytes: Option<u64>,
         name: Option<&str>,
+        job_started_ms: Option<u64>,
         withdrawn: &AtomicBool,
     ) -> Result<Option<Permit>> {
         let weight = self.reservation_weight(cpus, memory_bytes)?;
@@ -2201,9 +2280,11 @@ impl Pool {
         // A named reservation's records carry its class, as a compile's carry
         // its crate.
         let demand = name.map(|name| Demand::new(name, false));
+        let now_ms = (self.clock)();
         let mut state = AdmissionState {
             predicted_ms: self.predicted_run_ms(RunKind::Reservation, name),
-            ..AdmissionState::new((self.clock)(), Shape::Moldable)
+            decayed: decayed(self.priority, job_started_ms, now_ms),
+            ..AdmissionState::new(now_ms, Shape::Moldable)
         };
         let mut wake: Option<wait::Wait> = None;
         loop {
@@ -2532,6 +2613,7 @@ impl Pool {
         let first_arrival_ms = state.first_arrival_ms;
         let shape = state.shape;
         let predicted_ms = state.predicted_ms;
+        let decayed = state.decayed.clone();
         // Broken sensing disables only this advisory gate, never CPU scheduling.
         let pressure_state = (self.pressure && self.bytes_per_permit > 0)
             .then(|| crate::pressure::domain_state(&self.dir, self.pressure_domain));
@@ -2550,6 +2632,7 @@ impl Pool {
                     first_arrival_ms,
                     shape,
                     predicted_ms,
+                    decayed.as_ref(),
                     u64::MAX,
                 )
             });
@@ -2572,6 +2655,7 @@ impl Pool {
                     first_arrival_ms,
                     shape,
                     predicted_ms,
+                    decayed.as_ref(),
                     u64::MAX,
                 )
             });
@@ -2600,6 +2684,7 @@ impl Pool {
                     first_arrival_ms,
                     shape,
                     predicted_ms,
+                    decayed.as_ref(),
                     u64::MAX,
                 )
             });
@@ -2621,6 +2706,7 @@ impl Pool {
                 first_arrival_ms,
                 shape,
                 predicted_ms,
+                decayed.as_ref(),
                 ticket,
             ),
             Handoff {
@@ -2724,6 +2810,7 @@ impl Pool {
         first_arrival_ms: u64,
         shape: Shape,
         predicted_ms: Option<u64>,
+        decayed: Option<&Decayed>,
         ticket: u64,
     ) -> Waiting {
         Waiting {
@@ -2737,7 +2824,9 @@ impl Pool {
             }),
             ticket,
             weight,
-            priority: self.priority.as_str().into(),
+            priority: decayed
+                .map_or(self.priority.as_str(), |decayed| decayed.to.as_str())
+                .into(),
             domain: self.pressure_domain.into(),
             domain_capacity: self.legacy_domain_capacity,
             domain_cpu_cap: Some(self.domain_capacity),
@@ -2752,6 +2841,7 @@ impl Pool {
             handoff: None,
             shape: Some(shape),
             predicted_ms,
+            decayed: decayed.cloned(),
         }
     }
 

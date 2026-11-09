@@ -187,7 +187,7 @@ fn a_reservation_charges_cpu_and_memory_separately() {
     let pool = pool_at(directory.path(), 4, 1024);
 
     let reservation = pool
-        .reserve(Some(1), Some(3 * 1024), None, &AtomicBool::default())
+        .reserve(Some(1), Some(3 * 1024), None, None, &AtomicBool::default())
         .unwrap()
         .unwrap();
     let cpu_only =
@@ -207,7 +207,7 @@ fn a_reservation_requires_a_requested_resource() {
     let pool = pool_at(directory.path(), 4, 1024);
 
     assert!(
-        pool.reserve(None, None, None, &AtomicBool::default())
+        pool.reserve(None, None, None, None, &AtomicBool::default())
             .is_err()
     );
 }
@@ -218,7 +218,7 @@ fn a_memory_reservation_needs_a_memory_budget() {
     let pool = pool_at(directory.path(), 4, 0);
 
     assert!(
-        pool.reserve(None, Some(1024), None, &AtomicBool::default())
+        pool.reserve(None, Some(1024), None, None, &AtomicBool::default())
             .is_err()
     );
 }
@@ -242,7 +242,7 @@ fn blocked_reservations_sleep_and_wake_in_fifo_order() {
                 crate::pressure::now_ms()
             };
             let permit = pool
-                .reserve(Some(1), None, None, &AtomicBool::default())
+                .reserve(Some(1), None, None, None, &AtomicBool::default())
                 .unwrap()
                 .unwrap();
             admitted.send((index, permit)).unwrap();
@@ -304,7 +304,7 @@ fn a_waiting_reservation_recovers_a_silently_unlocked_lease() {
         admitted
             .send(
                 pool_at(&dir, 1, 0)
-                    .reserve(Some(1), None, None, &AtomicBool::default())
+                    .reserve(Some(1), None, None, None, &AtomicBool::default())
                     .unwrap()
                     .unwrap(),
             )
@@ -2439,6 +2439,7 @@ fn scheduler_stats_rank_live_waiters_by_ticket_and_exclude_grants() {
             0,
             Shape::Rigid,
             None,
+            None,
             ticket,
         );
         record.pid = Some(pid);
@@ -2464,6 +2465,7 @@ fn scheduler_stats_rank_live_waiters_by_ticket_and_exclude_grants() {
         None,
         0,
         Shape::Rigid,
+        None,
         None,
         5,
     );
@@ -2955,6 +2957,7 @@ fn waiter(ticket: u64, weight: u64, domain: (&str, u64), build: Option<(&str, u6
         build: build.map(|(id, capacity)| (id.into(), capacity)),
         shape: None,
         predicted_ms: None,
+        decayed: None,
         handoff: None,
     }
 }
@@ -3076,7 +3079,13 @@ fn reservation_vector_and_legacy_charge_are_both_preserved() {
     let dir = tempfile::tempdir().unwrap();
     let pool = pool_at(dir.path(), 8, GIB);
     let lease = pool
-        .reserve(Some(2), Some(5 * GIB + 1), None, &AtomicBool::default())
+        .reserve(
+            Some(2),
+            Some(5 * GIB + 1),
+            None,
+            None,
+            &AtomicBool::default(),
+        )
         .unwrap()
         .unwrap();
     let record: Lease = serde_json::from_slice(&std::fs::read(&lease.path).unwrap()).unwrap();
@@ -3091,7 +3100,7 @@ fn reservation_vector_and_legacy_charge_are_both_preserved() {
     assert_eq!(record.bytes_per_permit, GIB);
     drop(lease);
     let lease = pool
-        .reserve(Some(2), None, None, &AtomicBool::default())
+        .reserve(Some(2), None, None, None, &AtomicBool::default())
         .unwrap()
         .unwrap();
     let record: Lease = serde_json::from_slice(&std::fs::read(&lease.path).unwrap()).unwrap();
@@ -3104,7 +3113,7 @@ fn reservation_vector_and_legacy_charge_are_both_preserved() {
     );
     drop(lease);
     let lease = pool
-        .reserve(None, Some(GIB), None, &AtomicBool::default())
+        .reserve(None, Some(GIB), None, None, &AtomicBool::default())
         .unwrap()
         .unwrap();
     let record: Lease = serde_json::from_slice(&std::fs::read(&lease.path).unwrap()).unwrap();
@@ -4798,6 +4807,10 @@ fn an_admission_pass_grants_what_the_pool_rule_admits() {
         priority: "normal".into(),
         ..small(NEW)
     };
+    let at = |priority: &str, record: Waiting| Waiting {
+        priority: priority.into(),
+        ..record
+    };
     let at_its_build_ceiling = aged(Waiting {
         build: Some(("run".into(), 2)),
         ..rigid(1, 2)
@@ -5019,6 +5032,46 @@ fn an_admission_pass_grants_what_the_pool_rule_admits() {
             context: idle,
             granted: vec![(NEW, true, 1)],
         },
+        PassCase {
+            name: "interactive work goes before an older, shorter gate request",
+            live: vec![(1, 0); 17],
+            queue: vec![at("normal", predicted(1_000, small(1)))],
+            request: at("interactive", predicted(600_000, small(NEW))),
+            context: idle,
+            granted: vec![(NEW, true, 1)],
+        },
+        PassCase {
+            name: "with a gate leaf and an interactive leaf both waiting, the interactive one goes first",
+            live: vec![(1, 0); 17],
+            queue: vec![at("normal", small(1)), at("interactive", small(2))],
+            request: small(NEW),
+            context: idle,
+            granted: vec![(2, false, 1)],
+        },
+        PassCase {
+            name: "fresh interactive work goes before an aged gate request: each band waits for the bands above it",
+            live: vec![(1, 0); 17],
+            queue: vec![aged(at("normal", small(1)))],
+            request: at("interactive", small(NEW)),
+            context: aging,
+            granted: vec![(NEW, true, 1)],
+        },
+        PassCase {
+            name: "interactive work goes before an older low request",
+            live: vec![(1, 0); 17],
+            queue: vec![small(1)],
+            request: at("interactive", small(NEW)),
+            context: idle,
+            granted: vec![(NEW, true, 1)],
+        },
+        PassCase {
+            name: "a priority this version does not know goes with low, never failing the pass",
+            live: vec![(1, 0); 17],
+            queue: vec![at("urgent", small(1))],
+            request: predicted(1_000, small(NEW)),
+            context: idle,
+            granted: vec![(NEW, true, 1)],
+        },
     ];
     for case in &cases {
         assert_eq!(pass_grants(case), case.granted, "{}", case.name);
@@ -5061,6 +5114,88 @@ fn a_recorded_run_predicts_the_next_request_of_its_class() {
     let recorded = admitted[1].1.expect("the first run was recorded");
     assert_eq!(admitted[2].1, Some(recorded), "the kind's median");
     assert_eq!(admitted[3].1, None, "no link has run");
+}
+
+/// The priority and decay of each admission in `dir`'s decision log, by name.
+fn admitted_bands(dir: &Path) -> Vec<(String, String, Option<serde_json::Value>)> {
+    std::fs::read_to_string(dir.join("decisions.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .filter(|row| row["event"] == "admitted")
+        .map(|row| {
+            (
+                row["name"].as_str().unwrap().to_owned(),
+                row["priority"].as_str().unwrap().to_owned(),
+                row.get("decayed").cloned(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn an_interactive_request_decays_by_its_jobs_age_when_it_asks() {
+    const NOW: u64 = 1_000_000;
+    let dir = tempfile::tempdir().unwrap();
+    let mut pool = pool_at(dir.path(), 4, 0);
+    pool.clock = || NOW;
+    pool.priority = SchedulerPriority::Interactive;
+    for (name, started) in [
+        ("unstarted", None),
+        ("fresh", Some(NOW - INTERACTIVE_FOR_MS + 1)),
+        ("gate", Some(NOW - INTERACTIVE_FOR_MS)),
+        ("late-gate", Some(NOW - NORMAL_UNTIL_MS + 1)),
+        ("low", Some(NOW - NORMAL_UNTIL_MS)),
+    ] {
+        pool.job_started_ms = started;
+        drop(pool.admit(&Demand::new(name, false)).unwrap());
+    }
+    // A reservation asks the same way, by the job start it names.
+    drop(
+        pool.reserve(
+            Some(1),
+            None,
+            Some("reservation"),
+            Some(NOW - NORMAL_UNTIL_MS),
+            &AtomicBool::default(),
+        )
+        .unwrap()
+        .unwrap(),
+    );
+    // Only an interactive request reads its job start: a gate or low request
+    // never decays, however old its job.
+    for (priority, name) in [
+        (SchedulerPriority::Normal, "normal"),
+        (SchedulerPriority::Low, "low-declared"),
+    ] {
+        pool.priority = priority;
+        drop(pool.admit(&Demand::new(name, false)).unwrap());
+    }
+    let decayed = |to: &str, elapsed_ms: u64| {
+        Some(serde_json::json!({"from": "interactive", "to": to, "elapsed_ms": elapsed_ms}))
+    };
+    let admitted = admitted_bands(dir.path());
+    let admitted: Vec<(&str, &str, Option<serde_json::Value>)> = admitted
+        .iter()
+        .map(|(name, priority, decayed)| (name.as_str(), priority.as_str(), decayed.clone()))
+        .collect();
+    assert_eq!(
+        admitted,
+        [
+            ("unstarted", "interactive", None),
+            ("fresh", "interactive", None),
+            ("gate", "normal", decayed("normal", INTERACTIVE_FOR_MS)),
+            (
+                "late-gate",
+                "normal",
+                decayed("normal", NORMAL_UNTIL_MS - 1)
+            ),
+            ("low", "low", decayed("low", NORMAL_UNTIL_MS)),
+            ("reservation", "low", decayed("low", NORMAL_UNTIL_MS)),
+            ("normal", "normal", None),
+            ("low-declared", "low", None),
+        ]
+    );
 }
 
 #[test]
