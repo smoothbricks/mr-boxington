@@ -40,6 +40,7 @@
 
 use crate::config::Config;
 use crate::disk_usage::{Ledger, Removal};
+use crate::store::CheckoutPresence;
 use eyre::{Context, Result};
 use mbx_cache_core::CacheDigest;
 use serde::{Deserialize, Serialize};
@@ -1435,8 +1436,10 @@ pub fn prune(root: &Path) -> Result<PruneOutcome> {
 
 /// Collect abandoned, expired, and over-budget managed target directories.
 ///
-/// Limits are opt-in. Abandoned checkouts are always collected; live views
-/// are considered oldest-first only when an age or size policy requests it.
+/// Limits are opt-in. Abandoned checkouts are always collected; the rest are
+/// considered oldest-first only when an age or size policy requests it, and a
+/// size budget reaches a checkout that is present only when `urgency` says
+/// the disk is short.
 pub(crate) fn collect(
     root: &Path,
     max_bytes: Option<u64>,
@@ -1448,35 +1451,39 @@ pub(crate) fn collect(
         max_bytes,
         max_age,
         &Precedence::default(),
-        RunningPrograms::Spare,
+        Urgency::Budget,
         dry_run,
     )
 }
 
-/// Whether collection leaves alone a view a running program is using, found
-/// by [`crate::target_processes`] rather than by a lease.
+/// Why a collection runs, which decides what it may take beyond abandoned
+/// and expired views.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum RunningPrograms {
-    /// Keep such a view, as a budget collection does.
-    Spare,
-    /// Treat it like any other. A disk short of `gc.min_free_size` outranks
-    /// a binary someone started from `target/` by hand: builds failing with
-    /// "No space left on device" is the worse outcome.
-    Ignore,
+pub(crate) enum Urgency {
+    /// A size budget. It keeps the view of a checkout that is present, since
+    /// that checkout's next build would only redo the work: one hourly sweep
+    /// on 2026-11-10 evicted 34 such views, 107.1 GiB. It also keeps a view a
+    /// running program is using, found by [`crate::target_processes`] rather
+    /// than by a lease.
+    Budget,
+    /// A disk short of `gc.min_free_size`, which takes either: builds failing
+    /// with "No space left on device" are worse than a rebuild or a binary
+    /// someone started from `target/` by hand stopping.
+    ShortDisk,
 }
 
-/// The process scan behind [`RunningPrograms::Spare`], taken the first time
+/// The process scan behind [`Urgency::Budget`], taken the first time
 /// collection asks, so a collection with nothing to remove never walks the
 /// process table.
 struct Running<'a> {
     root: &'a Path,
-    programs: RunningPrograms,
+    urgency: Urgency,
     scanned: Option<crate::target_processes::InUse>,
 }
 
 impl Running<'_> {
     fn holds(&mut self, directory: &Path) -> bool {
-        self.programs == RunningPrograms::Spare
+        self.urgency == Urgency::Budget
             && self
                 .scanned
                 .get_or_insert_with(|| crate::target_processes::scan(&views_root(self.root)))
@@ -1498,7 +1505,7 @@ pub(crate) fn collect_by(
     max_bytes: Option<u64>,
     max_age: Option<Duration>,
     precedence: &Precedence,
-    programs: RunningPrograms,
+    urgency: Urgency,
     dry_run: bool,
 ) -> Result<CollectionOutcome> {
     collect_with(
@@ -1506,7 +1513,7 @@ pub(crate) fn collect_by(
         max_bytes,
         max_age,
         precedence,
-        programs,
+        urgency,
         dry_run,
         now_secs(),
         || {},
@@ -1527,7 +1534,7 @@ fn collect_with(
     max_bytes: Option<u64>,
     max_age: Option<Duration>,
     precedence: &Precedence,
-    programs: RunningPrograms,
+    urgency: Urgency,
     dry_run: bool,
     now: u64,
     before_removal: impl FnOnce(),
@@ -1537,7 +1544,7 @@ fn collect_with(
     let mut outcome = CollectionOutcome::default();
     let mut running = Running {
         root,
-        programs,
+        urgency,
         scanned: None,
     };
     // One ledger for the sweep, so a file several views link is counted once,
@@ -1585,7 +1592,7 @@ fn collect_with(
             // budget's order go by.
             record.updated_secs.max(last_run.min(now)),
             files,
-            crate::store::checkout_is_live_on(root, &record.workspace_root),
+            crate::store::checkout_presence(root, &record.workspace_root),
             precedence.standing(&record.workspace_root),
             // When a build last claimed it, which tells a build arriving
             // during the removal apart.
@@ -1618,7 +1625,9 @@ fn collect_with(
             directory,
             changed,
             files,
-            true,
+            // Not gone, and not a present checkout a budget must spare:
+            // the budget may take it, as it takes an unreachable one.
+            CheckoutPresence::Unreachable,
             Standing::Normal,
             // What the walk saw, uncapped, for the recheck under the
             // reservation to compare against: a write after the sweep's
@@ -1646,15 +1655,22 @@ fn collect_with(
     // a whole directory somebody may still be using.
     if let Some(max_age) = max_age
         && entries.iter().any(|entry| {
-            entry.4 && !entry.7 && entry.5 != Standing::Keep && !expired(entry.2, entry.5)
+            entry.4 != CheckoutPresence::Gone
+                && !entry.7
+                && entry.5 != Standing::Keep
+                && !expired(entry.2, entry.5)
         })
         && runs_tracked
     {
-        for (_, directory, updated, files, live, standing, built, untracked) in &mut entries {
+        for (_, directory, updated, files, presence, standing, built, untracked) in &mut entries {
             // A kept target keeps what it holds: one built for a bisect or a
             // release and left alone is exactly one whose units look unused.
             // One without a record is taken whole or not at all.
-            if !*live || *untracked || *standing == Standing::Keep || expired(*updated, *standing) {
+            if *presence == CheckoutPresence::Gone
+                || *untracked
+                || *standing == Standing::Keep
+                || expired(*updated, *standing)
+            {
                 continue;
             }
             // So does one only its programs' runs keep: no build has read its
@@ -1731,8 +1747,8 @@ fn collect_with(
     let mut projection = max_bytes.map(|_| ledger.clone());
     let mut remaining = ledger.total();
     let mut selected = HashSet::new();
-    for (record_path, _, updated, files, live, standing, _, _) in &entries {
-        if !live || expired(*updated, *standing) {
+    for (record_path, _, updated, files, presence, standing, _, _) in &entries {
+        if *presence == CheckoutPresence::Gone || expired(*updated, *standing) {
             selected.insert(record_path.clone());
             if let Some(projection) = &mut projection {
                 remaining = remaining.saturating_sub(projection.release(files).logical);
@@ -1745,7 +1761,12 @@ fn collect_with(
         entries.sort_by_key(|entry| entry.2);
         let mut candidates: Vec<_> = entries
             .iter()
-            .filter(|entry| !selected.contains(&entry.0) && entry.5 != Standing::Keep)
+            .filter(|entry| {
+                !selected.contains(&entry.0)
+                    && entry.5 != Standing::Keep
+                    && (running.urgency == Urgency::ShortDisk
+                        || entry.4 != CheckoutPresence::Present)
+            })
             .collect();
         // Stable, so each standing stays oldest-first.
         candidates.sort_by_key(|entry| entry.5);
@@ -1759,7 +1780,7 @@ fn collect_with(
         }
         if remaining > max_bytes {
             log::warn!(
-                "managed target directories still hold {} after collection, over the {} budget; protected or untracked targets are kept",
+                "managed target directories still hold {} after collection, over the {} budget; protected, present or untracked targets are kept",
                 bytesize::ByteSize::b(remaining).display().iec(),
                 bytesize::ByteSize::b(max_bytes).display().iec(),
             );
@@ -1767,7 +1788,8 @@ fn collect_with(
     }
 
     before_removal();
-    for (record_path, directory, _, files, live, _, updated, untracked) in entries {
+    for (record_path, directory, _, files, presence, _, updated, untracked) in entries {
+        let live = presence != CheckoutPresence::Gone;
         if !selected.contains(&record_path) {
             continue;
         }
@@ -2253,6 +2275,19 @@ pub(crate) fn trees_bytes(roots: Vec<PathBuf>) -> u64 {
         .total()
 }
 
+/// Take \`workspace\` out of reach the way an unmounted volume does: absent,
+/// but not provably deleted, because its parent is no longer a directory. A
+/// size budget may take the view of such a checkout, never of one present.
+#[cfg(all(test, unix))]
+pub(crate) fn unmount(workspace: &Path) {
+    let parent = workspace.parent().expect("a checkout has a parent");
+    std::fs::remove_dir_all(parent).unwrap();
+    std::fs::write(parent, b"").unwrap();
+    assert_eq!(
+        crate::store::checkout_presence(parent, workspace),
+        CheckoutPresence::Unreachable
+    );
+}
 #[cfg(test)]
 #[path = "target_tests.rs"]
 mod tests;
