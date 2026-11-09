@@ -98,6 +98,7 @@ fn a_request_is_exactly_one_of_the_protocol_lines() {
                 cpus: 4,
                 priority: SchedulerPriority::Low,
                 memory: None,
+                name: None,
             }),
         ),
         (
@@ -107,6 +108,17 @@ fn a_request_is_exactly_one_of_the_protocol_lines() {
                 cpus: 4,
                 priority: SchedulerPriority::Normal,
                 memory: Some(1024),
+                name: None,
+            }),
+        ),
+        (
+            r#"{"type":"reserve","id":3,"cpus":4,"priority":"low","name":"nx:ws:build"}"#,
+            Some(Request::Reserve {
+                id: 3,
+                cpus: 4,
+                priority: SchedulerPriority::Low,
+                memory: None,
+                name: Some("nx:ws:build".into()),
             }),
         ),
         (
@@ -264,4 +276,39 @@ async fn a_client_that_breaks_the_protocol_loses_its_connection_and_its_grants()
         next.close().await;
         client.close().await;
     }
+}
+
+#[tokio::test]
+async fn a_named_reservation_names_its_class_and_prediction_in_its_decisions() {
+    let dir = tempfile::tempdir().unwrap();
+    let pools = pools(dir.path(), 1);
+    let mut client = Client::connect(&pools);
+    let named = |id: u64| json!({"type": "reserve", "id": id, "cpus": 1, "priority": "low", "name": "nx:ws:build"});
+    client.send(named(1)).await;
+    assert_eq!(client.reply().await, granted(1, 1));
+    client.send(release(1)).await;
+    client.send(named(2)).await;
+    assert_eq!(client.reply().await, granted(2, 1));
+    client.close().await;
+    let admitted: Vec<Value> = std::fs::read_to_string(dir.path().join("decisions.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|row| row["event"] == "admitted")
+        .collect();
+    assert_eq!(admitted.len(), 2);
+    for row in &admitted {
+        assert_eq!(row["name"], "nx:ws:build");
+        assert_eq!(row["mode_key"], "nx:ws:build");
+    }
+    assert_eq!(
+        admitted[0].get("predicted_ms"),
+        None,
+        "none of its class has run"
+    );
+    assert!(
+        admitted[1]["predicted_ms"].is_u64(),
+        "the first one's release recorded its run: {}",
+        admitted[1]
+    );
 }
