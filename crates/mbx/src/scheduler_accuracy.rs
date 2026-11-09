@@ -128,10 +128,12 @@ impl Pool {
         cpus: Option<u64>,
         memory_bytes: Option<u64>,
         name: Option<&str>,
+        job_started_ms: Option<u64>,
         withdrawn: &AtomicBool,
     ) -> Result<Option<(super::Permit, Admission)>> {
         let requested_at = Instant::now();
-        let Some(permit) = self.reserve(cpus, memory_bytes, name, withdrawn)? else {
+        let Some(permit) = self.reserve(cpus, memory_bytes, name, job_started_ms, withdrawn)?
+        else {
             return Ok(None);
         };
         let (resources, weight) = permit.granted()?;
@@ -752,7 +754,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let observed_pool = pool(dir.path(), 100);
         let (permit, admission) = observed_pool
-            .reserve_observed(Some(3), None, None, &AtomicBool::default())
+            .reserve_observed(Some(3), None, None, None, &AtomicBool::default())
             .unwrap()
             .unwrap();
         drop(permit);
@@ -780,7 +782,7 @@ mod tests {
             let mut gated_pool = pool(gated_dir.path(), bytes);
             gated_pool.events = events;
             let (permit, admission) = gated_pool
-                .reserve_observed(Some(1), None, None, &AtomicBool::default())
+                .reserve_observed(Some(1), None, None, None, &AtomicBool::default())
                 .unwrap()
                 .unwrap();
             drop(permit);
@@ -796,7 +798,7 @@ mod tests {
         // Wider than the pool: a moldable request starts on all of it, where
         // a rigid one would run alone on all it asked for.
         let (permit, admission) = pool
-            .reserve_observed(Some(20), None, None, &AtomicBool::default())
+            .reserve_observed(Some(20), None, None, None, &AtomicBool::default())
             .unwrap()
             .unwrap();
         assert_eq!(admission.cpus(), 16);
@@ -821,7 +823,7 @@ mod tests {
         assert_eq!(summary.overall.worst_peak_reserved_ratio, Some(1.5));
         assert_eq!(summary.keys[0].average_reserved_unused_bytes, Some(25.0));
         let (permit, admission) = pool(dir.path(), 100)
-            .reserve_observed(Some(2), Some(201), None, &AtomicBool::default())
+            .reserve_observed(Some(2), Some(201), None, None, &AtomicBool::default())
             .unwrap()
             .unwrap();
         drop(permit);
