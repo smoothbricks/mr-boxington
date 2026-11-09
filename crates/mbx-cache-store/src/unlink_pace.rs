@@ -20,15 +20,22 @@ use std::time::{Duration, Instant};
 /// minutes of its hour.
 pub const UNLINKS_PER_SECOND: u32 = 1_000;
 
-const INTERVAL: Duration = Duration::from_nanos(1_000_000_000 / UNLINKS_PER_SECOND as u64);
+/// Unlinks a paced process issues per second while it sweeps scheduler flight
+/// files: a fifth of [`UNLINKS_PER_SECOND`].
+///
+/// A flight sweep removes up to three small files for every invocation nobody
+/// compiles any more, and nothing waits on them. The first sweep of a shared
+/// cache under seven-day retention removes about 248,000: four minutes of
+/// filesystem events at the collector's pace, about twenty-one at this one.
+pub const FLIGHT_UNLINKS_PER_SECOND: u32 = 200;
 
 /// How far ahead of now the pace may run: a second's worth of unlinks goes
 /// at once, so a sweep that removes a few files never waits.
 const BURST: Duration = Duration::from_secs(1);
 
 /// The pace while any guard holds it: how many do, and the moment the next
-/// unlink is due. One unlink moves that on by [`INTERVAL`]; an unlink due
-/// more than [`BURST`] from now waits for the difference.
+/// unlink is due. One unlink moves that on by its share of a second at its
+/// rate; an unlink due more than [`BURST`] from now waits for the difference.
 struct Armed {
     guards: usize,
     due: Instant,
@@ -76,6 +83,13 @@ impl Drop for Paced {
 /// The lock is held while sleeping, so threads unlinking together share one
 /// pace rather than each keeping its own.
 pub fn wait() {
+    wait_at(UNLINKS_PER_SECOND);
+}
+
+/// `wait` for an unlink that keeps to `per_second`, one of this module's
+/// rates. It moves the one shared pace on by its own share of a second, so a
+/// slower unlink also holds back the unlinks after it.
+fn wait_at(per_second: u32) {
     let mut armed = armed();
     let Some(Armed { due, .. }) = armed.as_mut() else {
         return;
@@ -85,12 +99,19 @@ pub fn wait() {
     if let Some(early) = slot.checked_duration_since(now + BURST) {
         std::thread::sleep(early);
     }
-    *due = slot + INTERVAL;
+    *due = slot + Duration::from_secs(1) / per_second;
 }
 
 /// [`std::fs::remove_file`] at the pace.
 pub fn remove_file(path: &Path) -> io::Result<()> {
     wait();
+    std::fs::remove_file(path)
+}
+
+/// [`std::fs::remove_file`] at `per_second`, one of this module's rates,
+/// while the pace is armed.
+pub fn remove_file_at(path: &Path, per_second: u32) -> io::Result<()> {
+    wait_at(per_second);
     std::fs::remove_file(path)
 }
 

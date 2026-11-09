@@ -275,8 +275,11 @@ The automatic collector and `mbx gc` list `inflight/` once per collection and
 remove a flight whose lock nobody holds when none of its files has changed for
 seven days. A flight with no `.prediction` goes after one hour instead: its
 holder was killed, failed, or produced nothing cacheable, so it carries nothing
-for the next build. The automatic collector paces these removals at 1,000
-unlinks a second; an explicit `mbx gc` removes at full speed.
+for the next build. The automatic collector removes these files at 200 a
+second, a fifth of its pace for everything else, so a first sweep of about
+250,000 files takes about 21 minutes. A sweep while a disk runs low, one a
+build runs in the foreground, and an explicit `mbx gc` remove them at full
+speed.
 
 The pool admits requests in one order, band by band: `interactive` priority,
 then `normal` (the land gate), then `low`. Within a band, a request that has

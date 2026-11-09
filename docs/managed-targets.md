@@ -330,7 +330,9 @@ the first second's worth. Each deleted file is an event for every filesystem
 watcher, and on macOS fseventsd holds each one in memory: a sweep that
 removed 34 target directories, about 700,000 files, at full speed grew
 fseventsd by 1-2 MB a second while it ran. A sweep of that size takes about
-twelve minutes at the pace. Collection runs at full speed while
+twelve minutes at the pace. Scheduler flight files go at 200 a second; see
+[Machine-wide compile scheduling](/scheduling#machine-wide-compile-scheduling).
+Collection runs at full speed while
 [the disk runs low](#when-the-disk-runs-low), when the build collects in the
 foreground, and for `mbx gc`. Unused build units move aside under Cargo's
 lock and are deleted after it is released, so a build never waits on the

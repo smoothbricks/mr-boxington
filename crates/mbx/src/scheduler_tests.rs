@@ -1116,6 +1116,42 @@ fn a_flight_whose_holder_was_killed_before_publishing_is_reclaimed() {
     assert!(!attempt.exists());
 }
 
+/// A background collector removes 200 unused flights, 600 files, at no more
+/// than 200 unlinks a second after the first second's burst, so the sweep
+/// takes at least two seconds where the collector's own pace takes a few
+/// milliseconds.
+#[test]
+fn a_paced_flight_sweep_keeps_to_two_hundred_unlinks_a_second() {
+    let cache = tempfile::tempdir().unwrap();
+    let inflight = cache.path().join(SCHEDULER_DIR).join(INFLIGHT_DIR);
+    std::fs::create_dir_all(&inflight).unwrap();
+    let unused = std::time::SystemTime::now() - FLIGHT_MAX_AGE - Duration::from_secs(60);
+    for index in 0..200 {
+        let lock = inflight.join(format!("rustc-{index}"));
+        for path in [record_path(&lock), attempt_path(&lock), lock] {
+            std::fs::write(&path, b"").unwrap();
+            backdate(&path, unused);
+        }
+    }
+
+    let started = Instant::now();
+    let _paced = crate::store::unlink_pace::pace();
+    prune_flights(cache.path());
+    let elapsed = started.elapsed();
+
+    assert_eq!(
+        std::fs::read_dir(&inflight).unwrap().count(),
+        0,
+        "every unused flight went"
+    );
+    // The 600th unlink is due 2.995 s after the pace was armed and goes a
+    // second early, inside the burst: at 1.995 s.
+    assert!(
+        elapsed >= Duration::from_millis(1_990),
+        "600 unlinks at 200 a second after a one-second burst took {elapsed:?}"
+    );
+}
+
 #[test]
 fn an_oversized_payload_is_not_left_behind() {
     let directory = tempfile::tempdir().unwrap();

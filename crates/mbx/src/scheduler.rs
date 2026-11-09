@@ -1370,9 +1370,14 @@ const UNPUBLISHED_FLIGHT_MAX_AGE: Duration = Duration::from_secs(60 * 60);
 /// [`UNPUBLISHED_FLIGHT_MAX_AGE`] when it holds no prediction. Losing a record
 /// costs at most one compilation that would have been a hit; a lock that
 /// cannot be taken belongs to a live compilation and is left alone together
-/// with its record.
+/// with its record. A paced collector removes these files at
+/// [`FLIGHT_UNLINKS_PER_SECOND`](crate::store::unlink_pace::FLIGHT_UNLINKS_PER_SECOND).
 pub(crate) fn prune_flights(cache_dir: &Path) {
     let dir = cache_dir.join(SCHEDULER_DIR).join(INFLIGHT_DIR);
+    let unlink = |path: &Path| {
+        use crate::store::unlink_pace::{FLIGHT_UNLINKS_PER_SECOND, remove_file_at};
+        let _ = remove_file_at(path, FLIGHT_UNLINKS_PER_SECOND);
+    };
     let Ok(entries) = std::fs::read_dir(&dir) else {
         return;
     };
@@ -1393,7 +1398,7 @@ pub(crate) fn prune_flights(cache_dir: &Path) {
             // Swept with its lock below while the lock exists; on its own it
             // is a leftover from an interrupted sweep.
             if older_than(&path, FLIGHT_MAX_AGE) && !path.with_extension("").exists() {
-                let _ = crate::store::unlink_pace::remove_file(&path);
+                unlink(&path);
             }
             continue;
         }
@@ -1414,12 +1419,12 @@ pub(crate) fn prune_flights(cache_dir: &Path) {
             continue;
         };
         if lock.try_lock().is_ok_and(|taken| taken) {
-            let _ = crate::store::unlink_pace::remove_file(&record);
-            let _ = crate::store::unlink_pace::remove_file(&attempt);
+            unlink(&record);
+            unlink(&attempt);
             // Closed before the removal, because Windows will not delete a
             // file that is still open anywhere.
             drop(lock);
-            let _ = crate::store::unlink_pace::remove_file(&path);
+            unlink(&path);
         }
     }
 }

@@ -1,16 +1,16 @@
 use super::*;
 
-/// 1,500 unlinks at 1,000 a second, after a second's burst, take at least
-/// half a second.
+/// 1,500 unlinks at 1,000 a second, after a second's burst: the 1,500th is due
+/// 1.499 s after the pace is armed and goes a second early, at 0.499 s.
 #[test]
 fn a_paced_process_keeps_to_the_pace_after_a_seconds_burst() {
-    let _paced = pace();
     let started = Instant::now();
+    let _paced = pace();
     for _ in 0..UNLINKS_PER_SECOND + UNLINKS_PER_SECOND / 2 {
         wait();
     }
     let elapsed = started.elapsed();
-    assert!(elapsed >= Duration::from_millis(500), "took {elapsed:?}");
+    assert!(elapsed >= Duration::from_millis(499), "took {elapsed:?}");
 }
 
 #[cfg(unix)]
