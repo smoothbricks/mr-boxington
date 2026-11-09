@@ -18,7 +18,7 @@ This is for work such as a VM, Docker build, or another compiler that consumes t
 - **`--priority <PRIORITY>`** — Priority in the machine-wide pool: waiting `interactive` work goes first, then `normal` (the land gate), then `low`.
 
   **Default:** `normal`
-- **`--job-started <MS>`** — When the job an `interactive` reservation runs for started, in milliseconds since the Unix epoch: asked 30 seconds after it, the reservation is admitted as `normal`, and 120 seconds after it as `low`.
+- **`--job-started <MS>`** — When the job an `interactive` reservation runs for started, in milliseconds since the Unix epoch: asked 120 seconds after it, the reservation is admitted as `normal`, and 240 seconds after it as `low`.
 - **`--name <CLASS>`** — The class this reservation's run time is remembered and predicted by, such as `nx:<workspace>:<task>`: within a priority, the pool admits the requests predicted shortest first. Without one, the reservation is named `mbx reserve` and predicted by the median of the named classes.
 - **`--grant-fd <FD>`** — Descriptor to announce the reservation on: one byte, `g`, once capacity is granted, and `r` once it is released after the command.
 
