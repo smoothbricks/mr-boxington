@@ -260,6 +260,24 @@ unused-byte averages use only successful unwrapped measurements. Missing peaks
 count as observations but do not contribute to measured statistics. Without
 observations, this section shows a short empty-state line.
 
+Identical compilations meet in `<cache_dir>/scheduler/inflight/`, apart from
+admission: admission reads the lease and waiter directories and never lists
+`inflight/`. Each compiler invocation has a lock file there, named by its
+compiler adapter and invocation digest, plus an `.attempt` file each
+compilation writes when it joins and a `.prediction` file holding the input
+list a finished compilation leaves for the next build. Joining opens that one
+path and never lists the directory, but each lookup gets slower as the
+directory grows, which is why it is swept. The lock is an advisory file
+lock, which the kernel releases when its holder exits or is killed; the files
+stay behind for the next build of the same invocation.
+
+The automatic collector and `mbx gc` list `inflight/` once per collection and
+remove a flight whose lock nobody holds when none of its files has changed for
+seven days. A flight with no `.prediction` goes after one hour instead: its
+holder was killed, failed, or produced nothing cacheable, so it carries nothing
+for the next build. The automatic collector paces these removals at 1,000
+unlinks a second; an explicit `mbx gc` removes at full speed.
+
 The pool admits requests in one order, band by band: `interactive` priority,
 then `normal` (the land gate), then `low`. Within a band, a request that has
 waited 30 seconds goes first, oldest first; every
