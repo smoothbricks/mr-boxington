@@ -745,11 +745,19 @@ fn relative_linker_searches_key_the_identity_by_working_directory() {
         assert!(identity_for(None, None).is_err());
         return;
     }
-    if which::which("cc").is_err() {
-        return;
-    }
     let directory = tempfile::tempdir().unwrap();
     let socket = directory.path().join("agent.sock");
+    // The child resolves `cc` from this directory alone, in a cleared environment: the driver
+    // under test is this stub, never the host's `cc` (a Nix cc-wrapper in a devenv shell, refused
+    // before any identity lookup) and never a Nix link variable the parent's shell carries.
+    let programs = directory.path().join("bin");
+    std::fs::create_dir(&programs).unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let stub = programs.join("cc");
+        std::fs::write(&stub, "#!/bin/sh\nexit 1\n").unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
     let listener = UnixListener::bind(&socket).unwrap();
     listener.set_nonblocking(true).unwrap();
     let agent = std::thread::spawn(move || {
@@ -807,6 +815,8 @@ fn relative_linker_searches_key_the_identity_by_working_directory() {
             "--nocapture",
         ])
         .current_dir(directory.path())
+        .env_clear()
+        .env("PATH", &programs)
         .env(CHILD, "1")
         .env("MBX_SOCKET", &socket)
         .env("LIBRARY_PATH", "/usr/lib/wsl/lib:")
