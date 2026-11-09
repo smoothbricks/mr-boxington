@@ -1550,6 +1550,7 @@ dependencies = [
  "libc",
  "log",
  "mbx-cache-core",
+ "rustix",
  "serde",
  "serde_json",
  "tar",
