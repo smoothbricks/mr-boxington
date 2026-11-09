@@ -1036,8 +1036,11 @@ fn sdk_description(sdk: &Path) -> Result<(String, String)> {
 /// A link with no wrapper in it reads none of those variables: a driver that
 /// is no cc-wrapper, running the linker `-fuse-ld` names by absolute path,
 /// which is no bintools-wrapper either. Its variables are not refused. A
-/// linker the driver finds itself (no `-fuse-ld`, or one named by a word) may
-/// be a wrapper on `PATH`, so the variables still refuse it.
+/// linker the driver finds itself (no `-fuse-ld`) is the `ld` it names for
+/// `-print-prog-name=ld`, so the variables refuse it only when that `ld` is a
+/// bintools-wrapper, or when which one it is cannot be told. A linker named by
+/// a word in `-fuse-ld` is one the driver searches for itself, which may be a
+/// wrapper on `PATH`, so the variables still refuse it.
 fn refuse_nix_wrapped_link(
     driver: &Path,
     store: &Path,
@@ -1070,13 +1073,35 @@ fn refuse_nix_wrapped_link(
             })
         })
     });
-    if let Some(name) = link_variable {
-        bail!(
-            "{} is set, and a Nix wrapper's link reads it, which the linker identity does not cover",
-            name.to_string_lossy()
-        );
+    let Some(name) = link_variable else {
+        return Ok(());
+    };
+    if fuse_ld.is_none()
+        && !driver_runs_bintools_wrapper(driver, store).wrap_err_with(|| {
+            format!(
+                "{} is set, and a Nix wrapper's link reads it; which linker the driver runs could not be told",
+                name.to_string_lossy()
+            )
+        })?
+    {
+        return Ok(());
     }
-    Ok(())
+    bail!(
+        "{} is set, and a Nix wrapper's link reads it, which the linker identity does not cover",
+        name.to_string_lossy()
+    );
+}
+
+/// Whether the `ld` a driver runs is a nixpkgs bintools-wrapper: the one it
+/// names for `-print-prog-name=ld`, or the one `PATH` finds when it names a
+/// bare word, exactly as the probe locates it.
+fn driver_runs_bintools_wrapper(driver: &Path, store: &Path) -> Result<bool> {
+    let named = PathBuf::from(
+        run(driver, &["-print-prog-name=ld"]).wrap_err("the linker driver named no linker")?,
+    );
+    let located = Located::program(OsStr::new("ld"), &named, None)
+        .wrap_err_with(|| format!("failed to find the linker `{}`", named.display()))?;
+    nix_bintools_wrapper(&located.path, store)
 }
 
 /// Whether `linker` resolves into a store entry that is a nixpkgs
