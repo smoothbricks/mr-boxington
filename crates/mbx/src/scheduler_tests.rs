@@ -1053,6 +1053,69 @@ fn the_sweep_keeps_fresh_and_held_flights_and_drops_the_rest() {
     drop(held);
 }
 
+/// Set in the child that holds a flight until it is killed, to its pool dir.
+const HOLD_FLIGHT_ENV: &str = "MBX_TEST_HOLD_FLIGHT";
+
+#[test]
+fn a_flight_whose_holder_was_killed_before_publishing_is_reclaimed() {
+    use std::io::BufRead as _;
+    if let Some(scheduler) = std::env::var_os(HOLD_FLIGHT_ENV) {
+        let _flight = flight_at(Path::new(&scheduler), "rustc", "killed").unwrap();
+        // On stderr, which the harness leaves alone.
+        eprintln!("joined");
+        // Held until the parent kills this process.
+        let _ = std::io::stdin().read_line(&mut String::new());
+        return;
+    }
+
+    let cache = tempfile::tempdir().unwrap();
+    let scheduler = cache.path().join(SCHEDULER_DIR);
+    let inflight = scheduler.join(INFLIGHT_DIR);
+    let lock = inflight.join("rustc-killed");
+    let attempt = inflight.join("rustc-killed.attempt");
+    // A compiler joins its flight from its own process and is killed before
+    // it publishes a prediction: what an OOM kill or a cancelled CI job
+    // leaves.
+    let mut holder = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "scheduler::tests::a_flight_whose_holder_was_killed_before_publishing_is_reclaimed",
+            "--exact",
+            "--nocapture",
+        ])
+        .env(HOLD_FLIGHT_ENV, &scheduler)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stderr = std::io::BufReader::new(holder.stderr.take().unwrap());
+    assert!(
+        stderr
+            .lines()
+            .any(|line| line.is_ok_and(|line| line == "joined")),
+        "the holder never joined its flight"
+    );
+    holder.kill().unwrap();
+    holder.wait().unwrap();
+    assert!(lock.exists() && attempt.exists());
+    assert!(!inflight.join("rustc-killed.prediction").exists());
+
+    // Within the hour its holder may still be compiling after releasing the
+    // lock, so the sweep leaves it.
+    prune_flights(cache.path());
+    assert!(lock.exists(), "a fresh unpublished flight stays");
+
+    let past_the_hour = std::time::SystemTime::now() - Duration::from_secs(2 * 60 * 60);
+    backdate(&lock, past_the_hour);
+    backdate(&attempt, past_the_hour);
+    prune_flights(cache.path());
+    assert!(
+        !lock.exists(),
+        "an unheld flight that never published holds nothing worth keeping"
+    );
+    assert!(!attempt.exists());
+}
+
 #[test]
 fn an_oversized_payload_is_not_left_behind() {
     let directory = tempfile::tempdir().unwrap();
@@ -1670,7 +1733,7 @@ fn nextest_history_pruning_removes_old_regular_files() {
     std::fs::write(&stale, b"old\n").unwrap();
     std::fs::write(&legacy, b"old\n").unwrap();
     std::fs::write(&recent, b"new\n").unwrap();
-    let old = SystemTime::now() - FLIGHT_MAX_AGE - Duration::from_secs(1);
+    let old = SystemTime::now() - TEST_HISTORY_MAX_AGE - Duration::from_secs(1);
     backdate(&stale, old);
     backdate(&legacy, old);
 
@@ -1707,7 +1770,7 @@ fn planning_keeps_history_a_stable_suite_still_uses_from_looking_unused() {
             .elapsed()
             .unwrap_or_default()
     };
-    let old = SystemTime::now() - FLIGHT_MAX_AGE + Duration::from_secs(60);
+    let old = SystemTime::now() - TEST_HISTORY_MAX_AGE + Duration::from_secs(60);
     backdate(&path, old);
 
     pool.plan(&Demand::nextest("bin", "case"));

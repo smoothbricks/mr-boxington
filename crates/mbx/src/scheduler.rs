@@ -171,6 +171,8 @@ const UNMEASURED_TEST_WEIGHT: u64 = 2;
 /// Refreshing at most once a day keeps that one metadata write per binary
 /// per day, rather than one per test.
 const TEST_HISTORY_REFRESH: Duration = Duration::from_secs(24 * 60 * 60);
+/// How long nextest history no test binary has updated is kept for.
+const TEST_HISTORY_MAX_AGE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 /// Most test names retained for one nextest binary.
 const MAX_TEST_HISTORY_ENTRIES: usize = 16_384;
 /// How recently an admission pass must have run for a queued request to
@@ -1342,17 +1344,30 @@ fn record_path(lock_path: &Path) -> PathBuf {
     PathBuf::from(path)
 }
 
-/// How long an untouched flight is kept for.
+/// How long a published flight is kept after its last use.
 ///
-/// A flight's files get a fresh timestamp every time its invocation
-/// really compiles, so age here means nobody has compiled this identity in a
-/// month -- and identities churn with every toolchain and dependency bump,
-/// which is why the directory needs a sweep at all.
-const FLIGHT_MAX_AGE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+/// A flight's files get a fresh timestamp every time its invocation joins to
+/// compile and every time it publishes, so age here means nobody has compiled
+/// this identity for a week. Identities churn with every toolchain and
+/// dependency bump, which is why the directory needs a sweep at all, and an
+/// invocation is seldom compiled again after a week of silence.
+const FLIGHT_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+/// How long a flight that never published a prediction is kept after its last
+/// use.
+///
+/// Its holder was killed, failed or produced nothing cacheable, so its files
+/// carry no input list for anyone. The hour covers a holder that released its
+/// lock after an unusable handoff and is still compiling towards the
+/// prediction it will leave.
+const UNPUBLISHED_FLIGHT_MAX_AGE: Duration = Duration::from_secs(60 * 60);
 
 /// Drop flight files whose invocations nobody compiles any more.
 ///
-/// Run from `mbx gc` beside the store's own collection. Losing a record
+/// Run from `mbx gc` beside the store's own collection: one listing of the
+/// directory per collection, which joining a flight never pays. A flight goes
+/// once none of its files has changed for [`FLIGHT_MAX_AGE`], or for
+/// [`UNPUBLISHED_FLIGHT_MAX_AGE`] when it holds no prediction. Losing a record
 /// costs at most one compilation that would have been a hit; a lock that
 /// cannot be taken belongs to a live compilation and is left alone together
 /// with its record.
@@ -1361,13 +1376,14 @@ pub(crate) fn prune_flights(cache_dir: &Path) {
     let Ok(entries) = std::fs::read_dir(&dir) else {
         return;
     };
-    let stale = |path: &Path| {
+    // A timestamp in the future reads as just now.
+    let age = |path: &Path| {
         std::fs::metadata(path)
             .and_then(|metadata| metadata.modified())
             .ok()
-            .and_then(|modified| modified.elapsed().ok())
-            .is_some_and(|age| age > FLIGHT_MAX_AGE)
+            .map(|modified| modified.elapsed().unwrap_or_default())
     };
+    let older_than = |path: &Path, limit: Duration| age(path).is_some_and(|age| age > limit);
     for entry in entries.flatten() {
         let path = entry.path();
         if path
@@ -1376,13 +1392,22 @@ pub(crate) fn prune_flights(cache_dir: &Path) {
         {
             // Swept with its lock below while the lock exists; on its own it
             // is a leftover from an interrupted sweep.
-            if stale(&path) && !path.with_extension("").exists() {
+            if older_than(&path, FLIGHT_MAX_AGE) && !path.with_extension("").exists() {
                 let _ = crate::store::unlink_pace::remove_file(&path);
             }
             continue;
         }
         let record = record_path(&path);
-        if !stale(&path) || (record.exists() && !stale(&record)) {
+        let attempt = attempt_path(&path);
+        let limit = if record.exists() {
+            FLIGHT_MAX_AGE
+        } else {
+            UNPUBLISHED_FLIGHT_MAX_AGE
+        };
+        let used_within_limit = [&path, &record, &attempt]
+            .into_iter()
+            .any(|file| age(file).is_some_and(|age| age <= limit));
+        if used_within_limit {
             continue;
         }
         let Ok(mut lock) = fslock::LockFile::open(&path) else {
@@ -1390,7 +1415,7 @@ pub(crate) fn prune_flights(cache_dir: &Path) {
         };
         if lock.try_lock().is_ok_and(|taken| taken) {
             let _ = crate::store::unlink_pace::remove_file(&record);
-            let _ = crate::store::unlink_pace::remove_file(&attempt_path(&path));
+            let _ = crate::store::unlink_pace::remove_file(&attempt);
             // Closed before the removal, because Windows will not delete a
             // file that is still open anywhere.
             drop(lock);
@@ -1426,7 +1451,7 @@ pub(crate) fn prune_test_history(cache_dir: &Path) {
             .and_then(|metadata| metadata.modified())
             .ok()
             .and_then(|modified| modified.elapsed().ok())
-            .is_some_and(|age| age > FLIGHT_MAX_AGE);
+            .is_some_and(|age| age > TEST_HISTORY_MAX_AGE);
         if stale {
             let _ = std::fs::remove_file(&path);
         }
