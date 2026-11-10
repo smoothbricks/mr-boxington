@@ -5694,6 +5694,58 @@ fn changed_declared_environment_executes_build_script_again() {
     );
 }
 
+/// `mbx analyze` explains a build-script run's miss the way it explains a
+/// compilation's (docs/analyze.md, "What it compares against"): against the
+/// earlier recording of the same run, naming the part of the key that changed.
+/// Here that is the variable the script declared with `rerun-if-env-changed`.
+#[test]
+fn analyze_names_the_declared_variable_behind_a_build_script_miss() {
+    let store = tempfile::tempdir().unwrap();
+    let reports = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    write_execution_cached_project(project.path(), true);
+    // The script's own link is not under test. With links cached, a host
+    // linker mbx cannot identify (a Nix cc-wrapper in a devenv shell) bypasses
+    // the script's compilation and no launcher is installed, so the run is never
+    // recorded; the execution-only path installs it whatever the linker is.
+    build_with(
+        project.path(),
+        store.path(),
+        &reports.path().join("first.json"),
+        &[("EXECUTION_CACHE_MODE", "first"), ("MBX_CACHE_LINKS", "0")],
+    );
+    build_with(
+        project.path(),
+        store.path(),
+        &reports.path().join("second.json"),
+        &[("EXECUTION_CACHE_MODE", "second"), ("MBX_CACHE_LINKS", "0")],
+    );
+    let output = mbx_command()
+        .current_dir(project.path())
+        .arg("analyze")
+        .env("MBX_CACHE_DIR", store.path())
+        .output()
+        .expect("mbx should run");
+    let report = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "analyze failed ({}): {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let cause = report
+        .split("\n\n")
+        .find(|group| group.contains("execution-cache-fixture build script"))
+        .unwrap_or_else(|| {
+            panic!("the build script's miss should be charged to a cause: {report}")
+        });
+    assert!(
+        cause.contains("environment changed (1)")
+            && cause.contains("changed: EXECUTION_CACHE_MODE (1)"),
+        "the miss should name the declared variable that changed: {report}"
+    );
+}
+
 #[test]
 fn build_script_without_declared_inputs_uses_the_package_tree() {
     let store = tempfile::tempdir().unwrap();
