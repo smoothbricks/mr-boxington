@@ -148,17 +148,7 @@ pub fn iband_go(late1_1: bool, late2_2: bool) -> u64 {
 }
 
 pub fn le(a_3: u64, b_4: u64) -> bool {
-  if a_3 == 0 {
-    return true;
-  } else {
-    let pred_6: u64 = a_3 - 1;
-    if b_4 == 0 {
-      return false;
-    } else {
-      let pred_8: u64 = b_4 - 1;
-      return le(pred_6, pred_8);
-    }
-  }
+  return (a_3 <= b_4);
 }
 
 pub fn b1() -> u64 {
@@ -372,7 +362,8 @@ pub fn tick_lane(b_80: u64, l_81: Lane) -> Lane {
     Lane::Lane(f0__, f1__) => {
       let old_84: Rc<List<E>> = f0__.clone();
       let new_85: Rc<List<E>> = f1__.clone();
-      return Lane::Lane(insall(sm(split(new_85.clone(), b_80)), old_84.clone()), ss(split(new_85.clone(), b_80)));
+      let c0__: Sp = split(new_85.clone(), b_80);
+      return Lane::Lane(insall(sm(c0__.clone()), old_84.clone()), ss(c0__.clone()));
     }
   }
 }
@@ -490,22 +481,7 @@ pub fn Bool_or(a_540: bool, b_541: bool) -> bool {
 }
 
 pub fn same(a_556: u64, b_557: u64) -> bool {
-  if a_556 == 0 {
-    if b_557 == 0 {
-      return true;
-    } else {
-      let pred_559: u64 = b_557 - 1;
-      return false;
-    }
-  } else {
-    let pred_561: u64 = a_556 - 1;
-    if b_557 == 0 {
-      return false;
-    } else {
-      let pred_563: u64 = b_557 - 1;
-      return same(pred_561, pred_563);
-    }
-  }
+  return (a_556 == b_557);
 }
 
 pub fn pmatch(p_552: u64, q_553: u64) -> bool {
@@ -650,7 +626,8 @@ pub fn gwalk(lo_276: bool, lane_277: Rc<List<E>>, free_278: u64, g_279: Rc<List<
           let age_365: u64 = f4__.clone();
           let m_366: u64 = f5__.clone();
           let p_367: u64 = f6__.clone();
-          return W_cons(E::E(id_361, want_362, add(k_363, gg(gneed(lo_276, g_279.clone(), E::E(id_361, want_362, k_363, pred_364, age_365, m_366, p_367), free_278), free_278)), pred_364, age_365, m_366, p_367), gwalk(lo_276, tail_353.clone(), gr(gneed(lo_276, g_279.clone(), E::E(id_361, want_362, k_363, pred_364, age_365, m_366, p_367), free_278), free_278), gnext(gact(lo_276, g_279.clone(), E::E(id_361, want_362, k_363, pred_364, age_365, m_366, p_367), free_278), p_367, g_279.clone())));
+          let c0__: u64 = gneed(lo_276, g_279.clone(), E::E(id_361, want_362, k_363, pred_364, age_365, m_366, p_367), free_278);
+          return W_cons(E::E(id_361, want_362, add(k_363, gg(c0__, free_278)), pred_364, age_365, m_366, p_367), gwalk(lo_276, tail_353.clone(), gr(c0__, free_278), gnext(gact(lo_276, g_279.clone(), E::E(id_361, want_362, k_363, pred_364, age_365, m_366, p_367), free_278), p_367, g_279.clone())));
         }
       }
     }
@@ -689,7 +666,8 @@ pub fn walk(lane_268: Rc<List<E>>, free_269: u64) -> W {
           let age_425: u64 = f4__.clone();
           let m_426: u64 = f5__.clone();
           let p_427: u64 = f6__.clone();
-          return W_cons(E::E(id_421, want_422, add(k_423, gg(need(E::E(id_421, want_422, k_423, pred_424, age_425, m_426, p_427)), free_269)), pred_424, age_425, m_426, p_427), walk(tail_413.clone(), gr(need(E::E(id_421, want_422, k_423, pred_424, age_425, m_426, p_427)), free_269)));
+          let c0__: u64 = need(E::E(id_421, want_422, k_423, pred_424, age_425, m_426, p_427));
+          return W_cons(E::E(id_421, want_422, add(k_423, gg(c0__, free_269)), pred_424, age_425, m_426, p_427), walk(tail_413.clone(), gr(c0__, free_269)));
         }
       }
     }
@@ -710,7 +688,10 @@ pub fn glwalk_if(sk_249: bool, lo_250: bool, o_251: Rc<List<E>>, n_252: Rc<List<
   if sk_249 {
     return LW::LW(free_253, Lane::Lane(o_251.clone(), n_252.clone()));
   } else {
-    return LW::LW(wf(gwalk(lo_250, n_252.clone(), wf(walk(o_251.clone(), free_253)), g_254.clone())), Lane::Lane(wl(walk(o_251.clone(), free_253)), wl(gwalk(lo_250, n_252.clone(), wf(walk(o_251.clone(), free_253)), g_254.clone()))));
+    let c0__: W = walk(o_251.clone(), free_253);
+    let c1__: u64 = wf(c0__.clone());
+    let c2__: W = gwalk(lo_250, n_252.clone(), c1__, g_254.clone());
+    return LW::LW(wf(c2__.clone()), Lane::Lane(wl(c0__.clone()), wl(c2__.clone())));
   }
 }
 
@@ -820,7 +801,12 @@ pub fn gwalks(ls_190: Rc<List<Lane>>, f_191: u64, g_192: Rc<List<u64>>) -> LS {
     List::Con(h__, t__) => {
       let head_210: Lane = h__.clone();
       let tail_211: Rc<List<Lane>> = t__.clone();
-      return LS::LS(lsf(gwalks(tail_211.clone(), lf(glwalk(islow(tail_211.clone()), head_210.clone(), f_191, g_192.clone())), glg(islow(tail_211.clone()), head_210.clone(), f_191, g_192.clone()))), Rc::new(List::Con(ll(glwalk(islow(tail_211.clone()), head_210.clone(), f_191, g_192.clone())), lsl(gwalks(tail_211.clone(), lf(glwalk(islow(tail_211.clone()), head_210.clone(), f_191, g_192.clone())), glg(islow(tail_211.clone()), head_210.clone(), f_191, g_192.clone()))))));
+      let c0__: bool = islow(tail_211.clone());
+      let c1__: LW = glwalk(c0__, head_210.clone(), f_191, g_192.clone());
+      let c2__: u64 = lf(c1__.clone());
+      let c3__: Rc<List<u64>> = glg(c0__, head_210.clone(), f_191, g_192.clone());
+      let c4__: LS = gwalks(tail_211.clone(), c2__, c3__.clone());
+      return LS::LS(lsf(c4__.clone()), Rc::new(List::Con(ll(c1__.clone()), lsl(c4__.clone()))));
     }
   }
 }
@@ -831,7 +817,8 @@ pub fn decide(s_179: St) -> St {
       let free_183: u64 = f0__.clone();
       let bound_184: u64 = f1__.clone();
       let lanes_185: Rc<List<Lane>> = f2__.clone();
-      return St::St(lsf(gwalks(lanes_185.clone(), free_183, Rc::new(List::Nil))), bound_184, lsl(gwalks(lanes_185.clone(), free_183, Rc::new(List::Nil))));
+      let c0__: LS = gwalks(lanes_185.clone(), free_183, Rc::new(List::Nil));
+      return St::St(lsf(c0__.clone()), bound_184, lsl(c0__.clone()));
     }
   }
 }
@@ -981,7 +968,9 @@ pub fn lfin(l_643: Lane, x_644: u64) -> LW {
     Lane::Lane(f0__, f1__) => {
       let old_670: Rc<List<E>> = f0__.clone();
       let new_671: Rc<List<E>> = f1__.clone();
-      return LW::LW(add(wf(fin(old_670.clone(), x_644)), wf(fin(new_671.clone(), x_644))), Lane::Lane(wl(fin(old_670.clone(), x_644)), wl(fin(new_671.clone(), x_644))));
+      let c0__: W = fin(old_670.clone(), x_644);
+      let c1__: W = fin(new_671.clone(), x_644);
+      return LW::LW(add(wf(c0__.clone()), wf(c1__.clone())), Lane::Lane(wl(c0__.clone()), wl(c1__.clone())));
     }
   }
 }
@@ -994,7 +983,9 @@ pub fn fins(ls_616: Rc<List<Lane>>, x_617: u64) -> LS {
     List::Con(h__, t__) => {
       let head_639: Lane = h__.clone();
       let tail_640: Rc<List<Lane>> = t__.clone();
-      return LS::LS(add(lf(lfin(head_639.clone(), x_617)), lsf(fins(tail_640.clone(), x_617))), Rc::new(List::Con(ll(lfin(head_639.clone(), x_617)), lsl(fins(tail_640.clone(), x_617)))));
+      let c0__: LW = lfin(head_639.clone(), x_617);
+      let c1__: LS = fins(tail_640.clone(), x_617);
+      return LS::LS(add(lf(c0__.clone()), lsf(c1__.clone())), Rc::new(List::Con(ll(c0__.clone()), lsl(c1__.clone()))));
     }
   }
 }
@@ -1005,7 +996,8 @@ pub fn finish(x_605: u64, s_606: St) -> St {
       let free_610: u64 = f0__.clone();
       let bound_611: u64 = f1__.clone();
       let lanes_612: Rc<List<Lane>> = f2__.clone();
-      return St::St(add(free_610, lsf(fins(lanes_612.clone(), x_605))), bound_611, lsl(fins(lanes_612.clone(), x_605)));
+      let c0__: LS = fins(lanes_612.clone(), x_605);
+      return St::St(add(free_610, lsf(c0__.clone())), bound_611, lsl(c0__.clone()));
     }
   }
 }

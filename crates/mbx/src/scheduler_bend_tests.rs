@@ -41,9 +41,9 @@
 //!   its scopes, which the model does not have.
 //!
 //! A tick is one second of the pool's clock, and the model's aging bound is
-//! [`AGING_MS`] in ticks. The model compares its naturals in unary, so it is
-//! handed each prediction's rank among the trace's, which orders requests as
-//! the milliseconds mbx is handed do.
+//! [`AGING_MS`] in ticks. The model is handed each prediction's rank among the
+//! trace's, no prediction ranked last, which orders requests as mbx orders the
+//! milliseconds it is handed (`None` after every prediction).
 
 use super::scheduler_bend_model as model;
 use super::*;
