@@ -793,9 +793,13 @@ fn run_sweep_body(config: &Config, retention: &RetentionSettings) -> Sweep {
                 .saturating_add(generated_bytes),
         )
     });
+    #[cfg(test)]
+    stop_after("targets");
     let store_budget = store_budget(retention, config.gc.max_bytes, non_store_bytes);
     crate::scheduler::prune_flights(&config.cache_dir);
     crate::scheduler::prune_test_history(&config.cache_dir);
+    #[cfg(test)]
+    stop_after("flights");
     let selection = store::CompilerSelection {
         max_age: retention.rustc_max_age,
         release: None,
@@ -856,6 +860,20 @@ fn run_sweep_body(config: &Config, retention: &RetentionSettings) -> Sweep {
     }
     warn_if_still_low(config, retention);
     sweep
+}
+
+/// Stop a test collector after `phase`, as a sandbox retiring it would.
+///
+/// With `MBX_TEST_SWEEP_STOP_AFTER` naming the phase, the collector says so
+/// on stderr and parks until the test kills it.
+#[cfg(test)]
+fn stop_after(phase: &str) {
+    if std::env::var_os("MBX_TEST_SWEEP_STOP_AFTER").is_some_and(|stop| stop == phase) {
+        eprintln!("sweep stopped after {phase}");
+        loop {
+            std::thread::park();
+        }
+    }
 }
 
 /// Begin the sweep log again for the collector holding the sweep lock.

@@ -964,9 +964,7 @@ fn automatic_collector_subprocess() {
     let Some(root) = std::env::var_os("MBX_TEST_SWEEP_ROOT") else {
         return;
     };
-    let mut config = super::cargo_tests::managed_target_config(Path::new(&root));
-    config.gc.auto = true;
-    config.gc.interval = Duration::from_secs(3600);
+    let config = automatic_config(Path::new(&root));
     if std::env::var_os("MBX_TEST_SWEEP_ABORT").is_some() {
         let store = config.store_dir();
         std::panic::set_hook(Box::new(move |_| {
@@ -984,6 +982,22 @@ struct TestCollector(std::process::Child);
 
 impl TestCollector {
     fn start(root: &Path, abort: bool) -> Self {
+        let mut command = Self::command(root);
+        command.env("MBX_TEST_SWEEP_BODY", "1");
+        if abort {
+            command.env("MBX_TEST_SWEEP_ABORT", "1");
+        }
+        Self(command.spawn().unwrap())
+    }
+
+    /// A collector that stops after `phase` and waits there to be killed.
+    fn stopping_after(root: &Path, phase: &str) -> Self {
+        let mut command = Self::command(root);
+        command.env("MBX_TEST_SWEEP_STOP_AFTER", phase);
+        Self(command.spawn().unwrap())
+    }
+
+    fn command(root: &Path) -> Command {
         let mut command = Command::new(std::env::current_exe().unwrap());
         command
             .args([
@@ -992,21 +1006,23 @@ impl TestCollector {
                 "--nocapture",
             ])
             .env("MBX_TEST_SWEEP_ROOT", root)
-            .env("MBX_TEST_SWEEP_BODY", "1")
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
-        if abort {
-            command.env("MBX_TEST_SWEEP_ABORT", "1");
-        }
-        Self(command.spawn().unwrap())
+        command
     }
 
     /// Wait, at most a minute, for the collector to reach its sweep body.
-    ///
-    /// Bounded so that a collector which deadlocks before the body fails the
-    /// test instead of hanging the suite.
     fn entered(&mut self) {
+        self.said("sweep body entered");
+    }
+
+    /// Wait, at most a minute, for the collector's first line on stderr, and
+    /// check that it is `expected`.
+    ///
+    /// Bounded so that a collector which deadlocks before saying it fails the
+    /// test instead of hanging the suite.
+    fn said(&mut self, expected: &str) {
         use std::io::BufRead as _;
         let stderr = self.0.stderr.take().unwrap();
         let (sender, receiver) = std::sync::mpsc::channel();
@@ -1017,8 +1033,8 @@ impl TestCollector {
         });
         let line = receiver
             .recv_timeout(Duration::from_secs(60))
-            .expect("the collector should reach its sweep body");
-        assert_eq!(line.trim(), "sweep body entered");
+            .unwrap_or_else(|_| panic!("the collector should say {expected:?}"));
+        assert_eq!(line.trim(), expected);
     }
 
     /// Wait, at most a minute, for the collector to exit.
@@ -1354,4 +1370,106 @@ fn a_short_disk_takes_present_checkouts_targets_oldest_first() {
         newer.exists(),
         "one removal brings the targets within the limit"
     );
+}
+
+/// The configuration the test collector sweeps with: automatic, hourly.
+fn automatic_config(root: &Path) -> Config {
+    let mut config = super::cargo_tests::managed_target_config(root);
+    config.gc.auto = true;
+    config.gc.interval = Duration::from_secs(3600);
+    config
+}
+
+/// A flight lock nobody has touched for two hours and that never published
+/// a prediction: the flights phase removes it.
+fn stale_flight(config: &Config) -> PathBuf {
+    let flight = config.cache_dir.join("scheduler/inflight/abandoned");
+    std::fs::create_dir_all(flight.parent().unwrap()).unwrap();
+    std::fs::File::create(&flight)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - Duration::from_secs(2 * 60 * 60))
+        .unwrap();
+    flight
+}
+
+/// A collector killed after a phase leaves that phase done: the next sweep
+/// within the interval starts at the first phase it did not finish, so what
+/// the killed one walked is not walked again. Garbage planted after the kill
+/// shows which phases the second sweep ran.
+#[test]
+fn a_killed_sweep_resumes_after_the_phases_it_finished() {
+    for (stopped, flights_run) in [("targets", true), ("flights", false)] {
+        let root = tempfile::tempdir().unwrap();
+        let store = stale_sweep_store(root.path());
+        let config = automatic_config(root.path());
+        let first = low_disk_view(&config, root.path(), "first", 1, &[("artifact", 64)], true);
+        let mut collector = TestCollector::stopping_after(root.path(), stopped);
+        collector.said(&format!("sweep stopped after {stopped}"));
+        assert!(
+            !first.exists(),
+            "the killed collector finished its targets phase"
+        );
+        collector.0.kill().unwrap();
+        assert!(!collector.wait().success());
+        assert!(
+            store::sweep_is_due(&store, Duration::from_secs(3600)),
+            "a killed collector records no completion"
+        );
+
+        let second = low_disk_view(&config, root.path(), "second", 1, &[("artifact", 64)], true);
+        let flight = stale_flight(&config);
+        run_automatic(&config, &RetentionSettings::default(), Pace::Foreground).unwrap();
+
+        assert!(
+            second.exists(),
+            "stopped after {stopped}: the next sweep walked the targets again"
+        );
+        assert_eq!(
+            !flight.exists(),
+            flights_run,
+            "stopped after {stopped}: the next sweep runs exactly the phases left"
+        );
+        assert!(
+            !store::sweep_is_due(&store, Duration::from_secs(3600)),
+            "the resumed sweep records its completion"
+        );
+        assert!(
+            !store.join("gc/v1/sweep-progress").exists(),
+            "a completed sweep leaves no progress behind"
+        );
+    }
+}
+
+/// What a killed collector finished counts within its own interval only: a
+/// sweep after the interval has passed walks every phase again.
+#[test]
+fn a_sweep_in_a_later_interval_ignores_an_older_sweeps_progress() {
+    let root = tempfile::tempdir().unwrap();
+    stale_sweep_store(root.path());
+    let mut config = automatic_config(root.path());
+    let mut collector = TestCollector::stopping_after(root.path(), "targets");
+    collector.said("sweep stopped after targets");
+    collector.0.kill().unwrap();
+    assert!(!collector.wait().success());
+
+    let gone = low_disk_view(&config, root.path(), "gone", 1, &[("artifact", 64)], true);
+    config.gc.interval = Duration::ZERO;
+    run_automatic(&config, &RetentionSettings::default(), Pace::Foreground).unwrap();
+
+    assert!(!gone.exists(), "a later interval's sweep walks the targets");
+}
+
+/// Progress a sweep cannot read is no progress: the sweep walks every phase.
+#[test]
+fn unreadable_sweep_progress_is_ignored() {
+    let root = tempfile::tempdir().unwrap();
+    let store = stale_sweep_store(root.path());
+    let config = automatic_config(root.path());
+    std::fs::write(store.join("gc/v1/sweep-progress"), b"{\"started\"").unwrap();
+    let gone = low_disk_view(&config, root.path(), "gone", 1, &[("artifact", 64)], true);
+
+    run_automatic(&config, &RetentionSettings::default(), Pace::Foreground).unwrap();
+
+    assert!(!gone.exists(), "the sweep walks the targets");
+    assert!(!store::sweep_is_due(&store, Duration::from_secs(3600)));
 }
