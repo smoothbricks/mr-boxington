@@ -267,10 +267,11 @@ The usual causes, roughly in the order they show up:
 
   Run [`mbx analyze`](/analyze) to group either outcome by cause, such as a
   changed toolchain or changed compiler arguments. Run `mbx explain --last` to
-  replay the most recent recorded build. For each missed crate, it lists the
-  key details and inputs that changed since this checkout's most recent earlier
-  recording of that compilation. When this checkout has none, it compares with
-  the most recent recording from another checkout of the same project.
+  replay the most recent recorded build. For each missed crate or build-script
+  run, it lists the key details and inputs that changed since this checkout's
+  most recent earlier recording of that compilation or run. When this checkout
+  has none, it compares with the most recent recording from another checkout of
+  the same project.
   [Session history](/tui#recording) stores hashes, not source contents or
   environment values.
 - Build-script output differs. mbx can share Rust compilations that read

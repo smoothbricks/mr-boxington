@@ -85,7 +85,9 @@ type RecordedKeys = BTreeMap<(String, String), ActionDiagnostic>;
 /// identified by its crate name and a digest of its normalized source path and
 /// unit arguments, which every package's `build_script_build` at
 /// `${workspace}/build.rs` answers to -- so without this, an unrelated
-/// repository could be offered as the explanation for a miss. Recordings from
+/// repository could be offered as the explanation for a miss. A build-script
+/// run is identified by its `<package> build script` label and a digest of its
+/// package directory and target (`build_script::run_unit`). Recordings from
 /// before the identity was written carry none, and a missing identity is not a
 /// match.
 #[derive(Default)]

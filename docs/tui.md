@@ -283,6 +283,11 @@ size budget. Deleting finished session files removes their rows from the TUI
 and the history available to `mbx explain --last`, without removing compiled
 artifacts.
 
+A compilation's or build-script run's row also records a hash of each part of
+its key and of each input, never the values themselves. `mbx explain --last`
+and [`mbx analyze`](/analyze#what-it-compares-against) compare them with an
+earlier recording of the same unit to name what changed.
+
 ::: warning Not a stable format
 The session files are an implementation detail of `mbx tui` and may change in
 any release. Scripts should read `MBX_STATS_REPORT`, which is

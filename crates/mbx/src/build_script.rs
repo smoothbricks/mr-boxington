@@ -3,16 +3,16 @@
 use crate::ar::ArDeterminism;
 use crate::materialize::{
     apply_file_mode, denormalize_output_text, file_mode, find_blobs,
-    normalize_output_text_with_aliases, read_canonical_blob, read_verified_blob, record_action_hit,
-    replay_bytes, staging_directory, validate_file_mode,
+    normalize_output_text_with_aliases, read_canonical_blob, read_verified_blob,
+    record_action_hit_with_diagnostic, replay_bytes, staging_directory, validate_file_mode,
 };
 use crate::session;
 use eyre::{Context as _, Result, bail};
 use mbx_cache_core::{
-    ActionPrediction, AgentRequest, AgentResponse, CacheDigest, CacheDirectory, CacheDirectoryNode,
-    CacheFileNode, CacheSymlinkNode, FileDigestCache, FileDigestResolution, FileDigestScope,
-    FileIdentity, NoFileDigestCache, RecordedFileDigest, RemoteActionResult, RestoreStats,
-    canonical_json, digest_file, digest_file_validated,
+    ActionDiagnostic, ActionPrediction, AgentRequest, AgentResponse, CacheDigest, CacheDirectory,
+    CacheDirectoryNode, CacheFileNode, CacheSymlinkNode, FileDigestCache, FileDigestResolution,
+    FileDigestScope, FileIdentity, NoFileDigestCache, RecordedFileDigest, RemoteActionResult,
+    RestoreStats, canonical_json, digest_file, digest_file_validated,
 };
 use mbx_cache_rustc::PathMapping;
 use serde::{Deserialize, Serialize};
@@ -459,25 +459,34 @@ pub(crate) fn run() -> Result<ExitCode> {
         bail!("build-script binary action is not canonical");
     }
     let invocation = invocation_digest(&binary_action, std::env::var("TARGET").ok().as_deref())?;
+    let label = stats_label();
 
     // Whether the run below follows a lookup. The agent counted that lookup,
     // so the run is its miss; without one the run was never consulted.
     let mut looked_up = false;
+    // The key this run is recorded under: the one it looked up, until it
+    // publishes under the one its own declarations name, as rustc's are.
+    let mut diagnostic = None;
     if let Some(prediction) = find_prediction(&invocation)? {
-        let (action_bytes, action) = build_action(&binary_action, &prediction)?;
+        let keyed = build_action(&binary_action, &prediction)?;
         looked_up = true;
         // A result that fails to restore is a miss like any other: running the
         // script republishes it, where bypassing would leave it broken.
-        match restore(&action, &action_bytes) {
+        match restore(&keyed.digest, &keyed.bytes) {
             Ok(Some(restored)) => {
-                record_action_hit(&action, restored.stats, &stats_label());
+                record_action_hit_with_diagnostic(
+                    &keyed.digest,
+                    restored.stats,
+                    &label,
+                    Some(keyed.diagnostic),
+                );
                 replay_bytes(&restored.stdout, &restored.stderr)?;
                 // A grouped export follows this run's receipt rather than the
                 // cumulative manifest. Keep a restored script in that receipt
                 // so the next CI job can look it up too. Recording is only
                 // bookkeeping after its output reached Cargo: a failure must
                 // not run an already-restored script a second time.
-                if let Err(error) = record_prediction(invocation, action, &prediction) {
+                if let Err(error) = record_prediction(invocation, keyed.digest, &prediction) {
                     session::report_shim_warning(&format!(
                         "restored build-script prediction was not recorded: {error:#}"
                     ));
@@ -489,6 +498,7 @@ pub(crate) fn run() -> Result<ExitCode> {
                 "build-script result was not restored: {error:#}"
             )),
         }
+        diagnostic = Some(keyed.diagnostic);
     }
     if !looked_up {
         session::record_unconsulted();
@@ -503,16 +513,39 @@ pub(crate) fn run() -> Result<ExitCode> {
     let output = command
         .output()
         .wrap_err("failed to execute the build script")?;
-    session::record_compiler_invocation(
+    let duration_ns = crate::util::duration_ns(started.elapsed());
+    let replayed = replay_bytes(&output.stdout, &output.stderr);
+    if replayed.is_ok() && output.status.success() {
+        store_run(
+            &binary_action,
+            invocation,
+            &output,
+            started_at,
+            &mut diagnostic,
+        );
+    }
+    session::record_compiler_invocation_with_diagnostic(
         if looked_up { "miss" } else { "unconsulted" },
-        Some(&stats_label()),
-        crate::util::duration_ns(started.elapsed()),
+        Some(&label),
+        duration_ns,
+        diagnostic,
     );
-    replay_bytes(&output.stdout, &output.stderr)?;
+    replayed?;
     if !output.status.success() {
         return Ok(crate::materialize::exit_code(output.status));
     }
+    Ok(ExitCode::SUCCESS)
+}
 
+/// Publish a successful run's result under the key its declarations name, and
+/// record that key's diagnostic in `diagnostic` once it is published.
+fn store_run(
+    binary_action: &CacheDigest,
+    invocation: CacheDigest,
+    output: &std::process::Output,
+    started_at: SystemTime,
+    diagnostic: &mut Option<ActionDiagnostic>,
+) {
     let caching = (|| -> Result<()> {
         let Some(prediction) = parse_prediction(&output.stdout)? else {
             record_bypass("build-script-always-rerun");
@@ -533,9 +566,10 @@ pub(crate) fn run() -> Result<ExitCode> {
             record_bypass("build-script-wrote-its-inputs");
             return Ok(());
         }
-        let (action_bytes, action) = build_action(&binary_action, &prediction)?;
-        publish(&action, &action_bytes, &output.stdout, &output.stderr)?;
-        record_prediction(invocation, action, &prediction)
+        let keyed = build_action(binary_action, &prediction)?;
+        publish(&keyed.digest, &keyed.bytes, &output.stdout, &output.stderr)?;
+        *diagnostic = Some(keyed.diagnostic);
+        record_prediction(invocation, keyed.digest, &prediction)
     })();
     if let Err(error) = caching {
         // The script has already run and its streams have already reached
@@ -543,7 +577,6 @@ pub(crate) fn run() -> Result<ExitCode> {
         // duplicate arbitrary side effects and every emitted directive.
         session::report_shim_warning(&format!("build-script result was not stored: {error:#}"));
     }
-    Ok(ExitCode::SUCCESS)
 }
 
 fn record_bypass(kind: &str) {
@@ -838,10 +871,7 @@ fn parse_prediction_with_mappings(
     }))
 }
 
-fn build_action(
-    binary_action: &CacheDigest,
-    prediction: &Prediction,
-) -> Result<(Vec<u8>, CacheDigest)> {
+fn build_action(binary_action: &CacheDigest, prediction: &Prediction) -> Result<KeyedAction> {
     let working_dir = std::env::current_dir()?;
     let mappings = build_script_mappings();
     let mut inputs = BTreeMap::new();
@@ -889,7 +919,7 @@ fn build_action(
         .then(|| std::env::var("CARGO_MANIFEST_DIR"))
         .transpose()?;
     let archive_timestamps = archive_timestamp_key();
-    let bytes = canonical_json(&Action {
+    let action = Action {
         archive_timestamps: archive_timestamps.as_deref(),
         binary_action,
         cargo_environment: &cargo_environment,
@@ -901,9 +931,92 @@ fn build_action(
         // Results stored before resolved stream roots were normalized may
         // still contain the publishing checkout's canonical target paths.
         version: 5,
-    })?;
+    };
+    let bytes = canonical_json(&action)?;
     let digest = CacheDigest::blake3(&bytes);
-    Ok((bytes, digest))
+    let diagnostic = action_diagnostic(&action, &digest)?;
+    Ok(KeyedAction {
+        bytes,
+        digest,
+        diagnostic,
+    })
+}
+
+/// A build-script run's key: the bytes hashed, their digest, and the same key
+/// in named parts for session history.
+struct KeyedAction {
+    bytes: Vec<u8>,
+    digest: CacheDigest,
+    diagnostic: ActionDiagnostic,
+}
+
+/// The parts of a run's key as session history records them, so `mbx explain
+/// --last` and `mbx analyze` name what changed since the run's last recording
+/// as they do for a compilation (`rustc::action_diagnostic`). Only digests are
+/// kept, never values.
+///
+/// Every field of [`Action`] is destructured, so a field added to the key
+/// cannot be left out of its diagnostic. Cargo's variables and the ones the
+/// script declared are read from one environment, so they share the
+/// `environment` names that `mbx analyze` reports as changed variables.
+fn action_diagnostic(action: &Action, digest: &CacheDigest) -> Result<ActionDiagnostic> {
+    let Action {
+        archive_timestamps,
+        binary_action,
+        cargo_environment,
+        checkout,
+        environment,
+        inputs,
+        kind,
+        out_dir,
+        version,
+    } = action;
+    let mut components = BTreeMap::from([
+        ("compilation unit".to_string(), run_unit()?),
+        ("build script binary".into(), key_part(binary_action)?),
+        ("archive timestamps".into(), key_part(archive_timestamps)?),
+        ("checkout".into(), key_part(checkout)?),
+        ("out dir".into(), key_part(out_dir)?),
+        ("action model".into(), key_part(&(kind, version))?),
+    ]);
+    for (name, value) in cargo_environment.iter().chain(environment.iter()) {
+        components.insert(format!("environment {name}"), key_part(value)?);
+    }
+    let inputs = inputs
+        .iter()
+        .map(|(path, state)| Ok((path.clone(), key_part(state)?)))
+        .collect::<Result<_>>()?;
+    Ok(ActionDiagnostic {
+        action: digest.clone(),
+        components,
+        inputs,
+    })
+}
+
+fn key_part(value: &impl Serialize) -> Result<CacheDigest> {
+    Ok(CacheDigest::blake3(&canonical_json(value)?))
+}
+
+/// Which build-script run this is, across builds and checkouts of one project:
+/// the package directory and the target the script runs for. A changed script
+/// binary, variable, or input then reads as a change to the same run rather
+/// than as a run never seen before. The package directory is spelled as every
+/// checkout spells it; Cargo's own variable in the key is no use here, since it
+/// normalizes to its own placeholder, the same for every package. Nothing here
+/// can fail the run's key: Cargo always names the package directory, and a
+/// diagnostic that lacked it would only compare less precisely.
+fn run_unit() -> Result<CacheDigest> {
+    let manifest = std::env::var("CARGO_MANIFEST_DIR").ok();
+    let mappings = build_script_mappings_with_env(|name| {
+        (!matches!(name, "OUT_DIR" | "CARGO_MANIFEST_DIR"))
+            .then(|| std::env::var_os(name).map(PathBuf::from))
+            .flatten()
+    });
+    key_part(&(
+        ADAPTER,
+        manifest.map(|manifest| normalize_environment_value(&manifest, &mappings)),
+        std::env::var("TARGET").ok(),
+    ))
 }
 
 /// Cargo's build-script declarations also invalidate the package's rustc
