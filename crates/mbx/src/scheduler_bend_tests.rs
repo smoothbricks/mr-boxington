@@ -24,6 +24,21 @@
 //!   carries the seconds its job has run, by which the model's `lane` decays
 //!   an interactive one and from which mbx's record is published through
 //!   [`decayed`], with the job's start that many seconds before the ask.
+//! - **Minimums, where the model binds them.** A reservation may name a
+//!   minimum and a party, its endpoint server. The model's gather (`act`,
+//!   `gwalks`) holds back what its walk of a lane's `new` list reaches after
+//!   the gatherer, and the whole low lane while a gather above it is open;
+//!   it walks every lane's aged `old` list as today. mbx's gather differs in
+//!   two places. Gap 1: mbx also holds back a request that sorts ahead of
+//!   the gatherer but asked after it and gathers toward no minimum of its
+//!   own, when it is of the gatherer's party or `low` (in `new` ahead of it,
+//!   or in a higher lane); the model walks it first. Gap 2: mbx also holds
+//!   back a request of the gatherer's party aged in a lower lane other than
+//!   the low one, which the model walks in its `old` list as today. So the
+//!   traces with minimums bind every decision where neither can arise
+//!   ([`Sides::binds`]); a trace stops at its first decision where one can,
+//!   and is not counted. A minimum is never above the pool: mbx cuts it to
+//!   its scopes, which the model does not have.
 //!
 //! A tick is one second of the pool's clock, and the model's aging bound is
 //! [`AGING_MS`] in ticks. The model compares its naturals in unary, so it is
@@ -59,6 +74,10 @@ enum Op {
         want: u64,
         rank: u64,
         predicted_ms: Option<u64>,
+        /// The fewest cores it starts on before it ages; 0 or 1 is none.
+        min: u64,
+        /// Its endpoint server, by number; 0 is none.
+        party: u64,
     },
     Decide,
     Tick,
@@ -77,6 +96,11 @@ struct Sides {
     /// Decisions taken while an aged request waited: the traces reach the
     /// aging rule.
     aged_decisions: usize,
+    /// Decisions after which a request with a minimum still gathered with
+    /// cores free: the traces reach the gather.
+    gathered: usize,
+    /// The trace stopped at a decision the model does not bind.
+    outside: bool,
 }
 
 fn empty_lane() -> model::Lane {
@@ -91,7 +115,7 @@ fn holdings(state: &model::St) -> BTreeMap<u64, u64> {
     while let model::List::Con(model::Lane::Lane(old, new), rest) = &**lane {
         for list in [old, new] {
             let mut cursor = list;
-            while let model::List::Con(model::E::E(id, _, k, _, _), tail) = &**cursor {
+            while let model::List::Con(model::E::E(id, _, k, _, _, _, _), tail) = &**cursor {
                 held.insert(*id, *k);
                 cursor = tail;
             }
@@ -185,6 +209,8 @@ impl Sides {
             waiting: Vec::new(),
             running: Vec::new(),
             aged_decisions: 0,
+            gathered: 0,
+            outside: false,
         }
     }
 
@@ -201,6 +227,8 @@ impl Sides {
                 elapsed,
                 want,
                 rank,
+                min,
+                party,
                 ..
             } => model::Op::Arrive(
                 model_band(priority),
@@ -208,6 +236,8 @@ impl Sides {
                 want - 1,
                 rank,
                 elapsed,
+                min,
+                party,
             ),
             Op::Decide => model::Op::Decide,
             Op::Tick => model::Op::Tick,
@@ -221,18 +251,24 @@ impl Sides {
                 elapsed,
                 want,
                 predicted_ms,
+                min,
+                party,
                 ..
             } => {
                 self.arrivals += 1;
-                self.waiting.push(record(
-                    self.arrivals,
-                    priority,
-                    elapsed,
-                    want,
-                    predicted_ms,
-                    self.now_ms(),
-                    self.pool,
-                ));
+                self.waiting.push(Waiting {
+                    min: (min > 0).then_some(min),
+                    party: (party > 0).then(|| format!("server-{party}")),
+                    ..record(
+                        self.arrivals,
+                        priority,
+                        elapsed,
+                        want,
+                        predicted_ms,
+                        self.now_ms(),
+                        self.pool,
+                    )
+                });
             }
             Op::Tick => self.ticks += 1,
             Op::Finish(id) => {
@@ -255,6 +291,56 @@ impl Sides {
             }
         }
         Ok(BTreeMap::new())
+    }
+
+    /// Whether the model binds this decision's gathers (the module's
+    /// "Minimums, where the model binds them"): for no request gathering
+    /// toward a minimum is there a waiting request of gap 1 (sorting ahead of
+    /// it in admission_pass's order, asked after it, gathering toward no
+    /// minimum, and `low` or of its party) or of gap 2 (of its party, aged,
+    /// in a band after its own other than `low`).
+    fn binds(&self) -> bool {
+        let now_ms = self.now_ms();
+        let since = |record: &Waiting| record.first_arrival_ms.unwrap_or(now_ms);
+        let aged = |record: &Waiting| now_ms.saturating_sub(since(record)) >= AGING_MS;
+        // admission_pass's order.
+        let order = |record: &Waiting| {
+            let aged = aged(record);
+            (
+                band(&record.priority),
+                !aged,
+                if aged { since(record) } else { 0 },
+                if aged {
+                    0
+                } else {
+                    record.predicted_ms.unwrap_or(u64::MAX)
+                },
+                record.ticket,
+            )
+        };
+        let low = band(SchedulerPriority::Low.as_str());
+        let budget = handoff(self.pool).budget;
+        let gathers = |record: &Waiting| !aged(record) && least_cores(record, budget).is_some();
+        self.waiting
+            .iter()
+            .filter(|gatherer| gathers(gatherer))
+            .all(|gatherer| {
+                self.waiting
+                    .iter()
+                    .filter(|other| other.ticket != gatherer.ticket)
+                    .all(|other| {
+                        let party = gatherer.party.is_some() && other.party == gatherer.party;
+                        let gap1 = order(other) < order(gatherer)
+                            && other.ticket > gatherer.ticket
+                            && !gathers(other)
+                            && (party || band(&other.priority) == low);
+                        let gap2 = party
+                            && aged(other)
+                            && band(&other.priority) > band(&gatherer.priority)
+                            && band(&other.priority) != low;
+                        !gap1 && !gap2
+                    })
+            })
     }
 
     /// One admission pass over everything waiting, its grants held from now.
@@ -295,18 +381,51 @@ impl Sides {
         }
         self.waiting
             .retain(|record| !granted.contains_key(&record.ticket));
+        let held: u64 = self
+            .running
+            .iter()
+            .map(|(_, lease)| lease.resources().cpu)
+            .sum();
+        let budget = handoff(self.pool).budget;
+        if held < self.pool
+            && self.waiting.iter().any(|record| {
+                now_ms.saturating_sub(record.first_arrival_ms.unwrap_or(now_ms)) < AGING_MS
+                    && least_cores(record, budget).is_some()
+            })
+        {
+            self.gathered += 1;
+        }
         granted
     }
 }
 
+/// Both sides fed `ops`: the first decision on which they grant differently,
+/// or the sides once the trace ends or reaches a decision the model does not
+/// bind ([`Sides::binds`]).
 fn run_trace(pool: u64, ops: &[Op]) -> Result<Sides, String> {
     let mut sides = Sides::new(pool);
     for (index, &op) in ops.iter().enumerate() {
+        if matches!(op, Op::Decide) && !sides.binds() {
+            sides.outside = true;
+            return Ok(sides);
+        }
         sides
             .apply(op)
             .map_err(|error| format!("operation {index}: {error}"))?;
     }
     Ok(sides)
+}
+
+/// The sides after `ops`, or a panic naming the seed and the shortest trace
+/// on which they still grant differently.
+fn agreed(seed: u64, pool: u64, ops: Vec<Op>) -> Sides {
+    run_trace(pool, &ops).unwrap_or_else(|error| {
+        let shrunk = shrink(pool, ops);
+        let shrunk_error = run_trace(pool, &shrunk).err().unwrap_or_default();
+        panic!(
+            "seed {seed}, pool {pool}: {error}\nshrunk trace: {shrunk:?}\nwhich fails at {shrunk_error}"
+        )
+    })
 }
 
 /// The shortest trace left by dropping operations one at a time while the
@@ -346,7 +465,11 @@ impl Random {
 /// A pool of 1 to 18 cores and up to 60 operations, its asks at every
 /// priority and up to [`ELAPSED`] seconds into their jobs. Each trace weighs
 /// its ticks differently, so some reach the aging bound within their length.
-fn random_trace(seed: u64) -> (u64, Vec<Op>) {
+/// With `minimums`, every ask names one of two endpoint servers or none, and
+/// about half of those of two cores or more a minimum of two up to its ask,
+/// never above the pool; without, the same seed draws the same trace with
+/// none.
+fn random_trace(seed: u64, minimums: bool) -> (u64, Vec<Op>) {
     let mut random = Random(seed);
     let pool = 1 + random.below(18);
     let ticks = 1 + random.below(40);
@@ -357,12 +480,28 @@ fn random_trace(seed: u64) -> (u64, Vec<Op>) {
             0..=2 => {
                 arrivals += 1;
                 let seconds = 1 + random.below(600);
+                let priority = PRIORITIES[usize::try_from(random.below(3)).unwrap()];
+                let elapsed = random.below(ELAPSED);
+                let want = 1 + random.below(4);
+                let (min, party) = if minimums {
+                    let party = random.below(3);
+                    let min = if want > 1 && random.below(2) == 0 {
+                        (2 + random.below(want - 1)).min(pool)
+                    } else {
+                        0
+                    };
+                    (min, party)
+                } else {
+                    (0, 0)
+                };
                 Op::Arrive {
-                    priority: PRIORITIES[usize::try_from(random.below(3)).unwrap()],
-                    elapsed: random.below(ELAPSED),
-                    want: 1 + random.below(4),
+                    priority,
+                    elapsed,
+                    want,
                     rank: seconds,
                     predicted_ms: Some(seconds * TICK_MS),
+                    min,
+                    party,
                 }
             }
             3 | 4 => Op::Decide,
@@ -410,7 +549,7 @@ fn admission_pass_grants_what_the_proven_model_grants_on_random_traces() {
         let mut aged = 0;
         let mut asked = std::collections::BTreeSet::new();
         for seed in 0..TRACES {
-            let (pool, ops) = random_trace(seed);
+            let (pool, ops) = random_trace(seed, false);
             for op in &ops {
                 if let Op::Arrive {
                     priority, elapsed, ..
@@ -420,16 +559,7 @@ fn admission_pass_grants_what_the_proven_model_grants_on_random_traces() {
                     asked.insert((priority.as_str(), published));
                 }
             }
-            match run_trace(pool, &ops) {
-                Ok(sides) => aged += sides.aged_decisions,
-                Err(error) => {
-                    let shrunk = shrink(pool, ops);
-                    let shrunk_error = run_trace(pool, &shrunk).err().unwrap_or_default();
-                    panic!(
-                        "seed {seed}, pool {pool}: {error}\nshrunk trace: {shrunk:?}\nwhich fails at {shrunk_error}"
-                    );
-                }
-            }
+            aged += agreed(seed, pool, ops).aged_decisions;
         }
         assert!(aged > 0, "no trace reached the aging bound");
         let asked: Vec<(&str, &str)> = asked
@@ -450,6 +580,36 @@ fn admission_pass_grants_what_the_proven_model_grants_on_random_traces() {
     });
 }
 
+#[test]
+fn admission_pass_gathers_a_minimum_as_the_proven_model_does_on_random_traces() {
+    on_a_deep_stack(|| {
+        let (mut bound, mut outside, mut gathered) = (0, 0, 0);
+        for seed in 0..TRACES {
+            let (pool, ops) = random_trace(seed, true);
+            if !ops
+                .iter()
+                .any(|op| matches!(op, Op::Arrive { min, .. } if *min > 1))
+            {
+                continue;
+            }
+            let sides = agreed(seed, pool, ops);
+            if sides.outside {
+                outside += 1;
+            } else {
+                bound += 1;
+            }
+            gathered += sides.gathered;
+        }
+        assert!(
+            gathered > 0,
+            "no request gathered toward its minimum with cores free: {bound} traces bound, {outside} stopped outside the model"
+        );
+        assert!(
+            bound > outside,
+            "{bound} traces with minimums bound end to end, {outside} stopped outside the model"
+        );
+    });
+}
 const RECORDED: &str = include_str!("scheduler_bend_replay_20261109.txt");
 
 struct Recorded {
@@ -521,6 +681,8 @@ fn admission_pass_grants_what_the_proven_model_grants_on_the_recorded_gate_windo
                         want: request.cpu,
                         rank: rank(request.predicted_ms),
                         predicted_ms: request.predicted_ms,
+                        min: 0,
+                        party: 0,
                     })
                     .unwrap();
                 next += 1;
