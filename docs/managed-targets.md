@@ -409,10 +409,15 @@ that warning to the next build's report. Instead it writes it to
 that log afresh.
 
 Removing a target directory never removes cached compilations from the store.
-When the store itself must shrink, compilations no live checkout uses go
-first. A live checkout's compilations go only when that is not enough to bring
-the store within its budget or relieve a short cache disk, and losing one
-costs a recompile.
+When the store itself must shrink, compilations stored or used since the last
+sweep finished go last, whichever checkout built them: another checkout of the
+same task rebuilding an invocation leaves the earlier build named by no
+checkout, and a result stored minutes ago is the likeliest to be asked for
+again. Of the older compilations, those no live checkout uses go first, and a
+live checkout's go only when that is not enough to bring the store within its
+budget or relieve a short cache disk. Each group goes least recently used
+first, a hit counting as a use of the whole result, and losing one costs a
+recompile.
 
 Collecting the target directory of a checkout that still exists leaves its
 `target` link in place, naming a directory that is gone. The next build in the

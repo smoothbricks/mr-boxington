@@ -2058,13 +2058,21 @@ fn checkout_record_path(store: &Path, identity: &str, workspace_root: &Path) -> 
 
 /// Evict objects until the store fits within `max_bytes`.
 ///
-/// Objects no live checkout can reach are evicted first, so deleting a worktree
-/// releases what only that worktree needed. Within each class eviction is
-/// least-recently-used by access time, falling back to modification time. The
-/// cache agent writes the access time of every object a build stores or uses
+/// What was stored or used since the last sweep finished goes last, least
+/// recently used first, whether a live checkout roots it or not: a checkout's
+/// task manifest names only the latest build of each invocation, so another
+/// checkout of the same task building it again leaves a result stored minutes
+/// ago rooted by nothing. Older objects no live checkout can reach go first,
+/// so deleting a worktree releases what only that worktree needed, then older
+/// rooted ones; each class goes least recently used first.
+///
+/// Use is the access time, falling back to modification time. The cache agent
+/// writes the access time of every object a build stores or uses
 /// (`record_use`), so the order holds on a `noatime` mount and for a blob
 /// published by cloning a file with an old access time; it is still coarse.
-/// Evicting a live object costs a recompile, never correctness.
+/// A result's descriptor blob ranks by the result's use as well, because a hit
+/// reads the result and never the descriptor it is named after. Evicting a
+/// live object costs a recompile, never correctness.
 pub fn gc(store: &Path, max_bytes: u64) -> Result<GcOutcome> {
     gc_with_mode(store, max_bytes, false, HashSet::new())
 }
@@ -2146,10 +2154,6 @@ fn gc_with_mode(
             store,
             grouped_receipt_actions(store)?,
         ));
-        // `false` sorts first, so unrooted objects go before rooted ones and
-        // each class goes oldest-first. A store with no records at all roots
-        // nothing and this is exactly the LRU it was before.
-        objects.sort_by_cached_key(|entry| (rooted.contains(&entry.path), entry.used));
         let dependents = results
             .iter()
             .filter_map(|entry| {
@@ -2157,6 +2161,28 @@ fn gc_with_mode(
                 Some((cas.path_for(&action).ok()?, entry))
             })
             .collect::<HashMap<_, _>>();
+        // A hit refreshes its result and the blobs a restore reads, never the
+        // descriptor blob the result is named after, and the result goes with
+        // that blob; so the descriptor was last used when its result was.
+        let last_use = |entry: &Entry| {
+            dependents
+                .get(&entry.path)
+                .map_or(entry.used, |result| entry.used.max(result.used))
+        };
+        let last_sweep = last_sweep(store);
+        let recent = |entry: &Entry| last_sweep.is_some_and(|swept| last_use(entry) >= swept);
+        // Rootedness orders only the objects nobody used since the last sweep,
+        // so only those can stop `evict_objects` at the protection boundary.
+        for entry in objects.iter().filter(|entry| recent(entry)) {
+            rooted.remove(&entry.path);
+        }
+        // `false` sorts first: older objects before recent ones, and among
+        // older ones unrooted before rooted, each class oldest-first. A store
+        // never swept has no recent objects and one with no records roots
+        // nothing; with neither this is exactly the LRU it was before.
+        objects.sort_by_cached_key(|entry| {
+            (recent(entry), rooted.contains(&entry.path), last_use(entry))
+        });
         let evicted = evict_objects(
             &objects,
             &rooted,
@@ -2773,6 +2799,18 @@ fn sweep_stamp_is_fresh(stamp: &Path, interval: Duration) -> bool {
         .ok()
         .and_then(|modified| modified.elapsed().ok())
         .is_some_and(|since| since < interval)
+}
+
+/// When the last sweep finished, if one ever has.
+///
+/// A collector records completion only after its body returns, so during a
+/// sweep this is the end of the previous one, and everything stored or used
+/// after it is what that sweep never saw. [`claim_sweep`] records before it
+/// collects, so under [`sweep_if_due`] nothing counts as recent.
+fn last_sweep(store: &Path) -> Option<SystemTime> {
+    std::fs::metadata(store.join(SWEEP_STAMP))
+        .and_then(|metadata| metadata.modified())
+        .ok()
 }
 
 /// What the checkout registry says about the identities in this store.
