@@ -6,9 +6,10 @@ use crate::config::{Config, MinFree, RetentionSettings};
 use crate::{store, target};
 use bytesize::ByteSize;
 use eyre::{Context, Result};
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 /// Where the collector a build started leaves what it freed, for the next
 /// build to say. Claimed by rename, so two builds finishing together cannot
@@ -25,6 +26,9 @@ const SWEEP_LOG: &str = "gc/v1/sweep.log";
 /// half; an automatic collector that finds it held has nothing left to do, and
 /// an explicit `mbx gc` waits its turn.
 const COLLECTOR_LOCK: &str = "gc/v1/collector.lock";
+
+/// How far the automatic sweep under way has got; see [`SweepProgress`].
+const SWEEP_PROGRESS: &str = "gc/v1/sweep-progress";
 
 /// The longest a build waits between sweeps while a disk is short of
 /// `gc.min_free_size`. Several builds at once can fill a disk well inside the
@@ -749,26 +753,167 @@ pub(super) struct Sweep {
 /// is already over, and its exit status is the build's answer, not the
 /// collector's. What it freed is returned so the lifetime totals can count it.
 /// The caller holds the collector lock across the due check, body, and stamp.
-/// Only a returning body records completion: a collector killed when a
-/// sandboxed build exits leaves the next build free to retry.
+/// Only a returning body records completion. A collector killed partway
+/// leaves the sweep due and its finished phases recorded, so the next
+/// collector within the interval resumes at the first unfinished phase
+/// instead of walking the store from the top again.
 pub(super) fn sweep_store(config: &Config, retention: &RetentionSettings) -> Sweep {
     if !config.gc.auto {
         return Sweep::default();
     }
     let store = config.store_dir();
-    if !store::sweep_is_due(&store, sweep_interval(config, retention)) {
+    let interval = sweep_interval(config, retention);
+    if !store::sweep_is_due(&store, interval) {
         return Sweep::default();
     }
     start_sweep_log(&store);
-    let sweep = run_sweep_body(config, retention);
+    let sweep = run_sweep_body(config, retention, SweepProgress::resumed(&store, interval));
     if let Err(error) = store::record_sweep(&store) {
         log::warn!("failed to record the completed sweep: {error}");
     }
+    SweepProgress::clear(&store);
     sweep
 }
 
-/// Run every collection belonging to one automatic sweep.
-fn run_sweep_body(config: &Config, retention: &RetentionSettings) -> Sweep {
+/// The phases of an automatic sweep, in the order it walks them. Each
+/// carries what the phases after it need from the ones before.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "phase", rename_all = "kebab-case")]
+enum Finished {
+    Nothing,
+    /// Managed targets, learned incremental state and generated source
+    /// trees, and the bytes they hold afterwards (`None` when unmeasured).
+    Targets {
+        non_store_bytes: Option<u64>,
+    },
+    /// Scheduler flights and test history.
+    Flights {
+        non_store_bytes: Option<u64>,
+    },
+    /// Stale compilers and the store's budget, and the bytes the store
+    /// holds afterwards.
+    Store {
+        non_store_bytes: Option<u64>,
+        store_bytes: u64,
+    },
+    /// The low-disk loop, and the bytes it freed.
+    LowDisk {
+        non_store_bytes: Option<u64>,
+        store_bytes: u64,
+        low_disk_freed: u64,
+    },
+}
+
+impl Finished {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Nothing => "nothing",
+            Self::Targets { .. } => "targets",
+            Self::Flights { .. } => "flights",
+            Self::Store { .. } => "store",
+            Self::LowDisk { .. } => "low-disk",
+        }
+    }
+}
+
+/// How far one automatic sweep has got, recorded after every phase.
+///
+/// A collector inside a sandboxed build is killed when that build ends, and
+/// the whole sweep takes minutes on a large store. Without this its successor
+/// walked every phase again; with it, the successor starts at the first phase
+/// the killed one did not finish.
+///
+/// A phase is recorded only after it has returned, by an atomic rename of a
+/// synced file, so a reader sees one whole record and never a phase that did
+/// not finish. A removal that a power cut loses leaves garbage for the next
+/// interval, never a live file removed. The record is keyed to the time the
+/// sweep started: a collector resumes it only within one interval of that,
+/// so a record an older sweep left behind is never taken up.
+#[derive(Debug, Serialize, Deserialize)]
+struct SweepProgress {
+    started: SystemTime,
+    finished: Finished,
+    freed_target_bytes: u64,
+    freed_store_bytes: u64,
+    /// The report lines of the finished phases, said with the rest when the
+    /// sweep completes.
+    lines: Vec<String>,
+}
+
+impl SweepProgress {
+    /// The progress of the sweep this interval began, or a sweep starting now.
+    fn resumed(store: &Path, interval: Duration) -> Self {
+        let path = store.join(SWEEP_PROGRESS);
+        let recorded = match std::fs::read(&path) {
+            Ok(bytes) => serde_json::from_slice::<Self>(&bytes)
+                .inspect_err(|error| {
+                    log::warn!("ignoring unreadable {}: {error}", path.display());
+                })
+                .ok(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                log::warn!("ignoring unreadable {}: {error}", path.display());
+                None
+            }
+        };
+        match recorded {
+            Some(progress)
+                if progress
+                    .started
+                    .elapsed()
+                    .is_ok_and(|since| since < interval) =>
+            {
+                log::debug!(
+                    "resuming the sweep started at {:?} after its {} phase",
+                    progress.started,
+                    progress.finished.name()
+                );
+                progress
+            }
+            _ => Self {
+                started: SystemTime::now(),
+                finished: Finished::Nothing,
+                freed_target_bytes: 0,
+                freed_store_bytes: 0,
+                lines: Vec::new(),
+            },
+        }
+    }
+
+    /// Record the phases finished so far. A record that cannot be written
+    /// only costs a killed collector's successor this phase again.
+    fn record(&self, store: &Path) {
+        let written = serde_json::to_vec(self)
+            .map_err(eyre::Report::from)
+            .and_then(|bytes| crate::util::write_atomic(&store.join(SWEEP_PROGRESS), &bytes));
+        match written {
+            Ok(()) => log::debug!("the sweep finished its {} phase", self.finished.name()),
+            Err(error) => log::warn!(
+                "the sweep's {} phase was not recorded: {error:#}",
+                self.finished.name()
+            ),
+        }
+    }
+
+    /// Drop the record of a completed sweep. One left behind is ignored once
+    /// the interval it belongs to has passed.
+    fn clear(store: &Path) {
+        let path = store.join(SWEEP_PROGRESS);
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => log::warn!("failed to remove {}: {error}", path.display()),
+        }
+    }
+}
+
+/// Run every collection belonging to one automatic sweep, from the first
+/// phase `progress` has not finished, recording each phase as it finishes.
+fn run_sweep_body(
+    config: &Config,
+    retention: &RetentionSettings,
+    mut progress: SweepProgress,
+) -> Sweep {
     #[cfg(test)]
     if std::env::var_os("MBX_TEST_SWEEP_BODY").is_some() {
         eprintln!("sweep body entered");
@@ -776,103 +921,128 @@ fn run_sweep_body(config: &Config, retention: &RetentionSettings) -> Sweep {
         std::io::stdin().read_line(&mut command).unwrap();
         assert_ne!(command.trim(), "panic", "test collector panic");
     }
-    let mut sweep = Sweep::default();
-    let pruned = prune_targets(config, retention, config.gc.max_bytes);
-    sweep.delta.freed_target_bytes = pruned.freed_bytes;
-    sweep.lines.extend(pruned.removals);
-    let non_store_bytes = pruned.remaining_bytes.or_else(|| {
-        let target_bytes = target::stats(&config.target.root).ok()?.bytes;
-        let incremental_bytes = crate::incremental::stats(&config.cache_dir.join("incremental"))
-            .ok()?
-            .bytes;
-        let generated_bytes =
-            crate::out_dir::stats(&config.cache_dir.join(crate::out_dir::ROOT))?.remaining_bytes;
-        Some(
-            target_bytes
-                .saturating_add(incremental_bytes)
-                .saturating_add(generated_bytes),
-        )
-    });
-    #[cfg(test)]
-    stop_after("targets");
-    let store_budget = store_budget(retention, config.gc.max_bytes, non_store_bytes);
-    crate::scheduler::prune_flights(&config.cache_dir);
-    crate::scheduler::prune_test_history(&config.cache_dir);
-    #[cfg(test)]
-    stop_after("flights");
-    let selection = store::CompilerSelection {
-        max_age: retention.rustc_max_age,
-        release: None,
-    };
-    let stale = stale_compilers(&config.store_dir(), &selection, false);
-    let outcome = match store::gc(&config.store_dir(), store_budget) {
-        Ok(outcome) => with_stale_compilers(stale, outcome),
-        Err(error) => {
-            log::warn!("the store was not swept: {error}");
-            // The budget sweep did not measure the store, so measure it here
-            // rather than report the empty default as what remains.
-            let remaining =
-                store::stats(&config.store_dir()).map_or(0, |stats| stats.total_bytes());
-            with_stale_compilers(
-                stale,
-                store::GcOutcome {
-                    remaining_bytes: remaining,
-                    ..store::GcOutcome::default()
-                },
-            )
-        }
-    };
-    sweep.delta.freed_store_bytes = outcome.removed_bytes;
-    if outcome.removed_bytes > 0 {
-        sweep.lines.push(evictions(&outcome));
+    let store = config.store_dir();
+    loop {
+        progress.finished = match progress.finished {
+            Finished::Nothing => {
+                let pruned = prune_targets(config, retention, config.gc.max_bytes);
+                progress.freed_target_bytes = progress
+                    .freed_target_bytes
+                    .saturating_add(pruned.freed_bytes);
+                progress.lines.extend(pruned.removals);
+                Finished::Targets {
+                    non_store_bytes: pruned
+                        .remaining_bytes
+                        .or_else(|| current_non_store_bytes(config)),
+                }
+            }
+            Finished::Targets { non_store_bytes } => {
+                crate::scheduler::prune_flights(&config.cache_dir);
+                crate::scheduler::prune_test_history(&config.cache_dir);
+                Finished::Flights { non_store_bytes }
+            }
+            Finished::Flights { non_store_bytes } => {
+                let store_budget = store_budget(retention, config.gc.max_bytes, non_store_bytes);
+                let selection = store::CompilerSelection {
+                    max_age: retention.rustc_max_age,
+                    release: None,
+                };
+                let stale = stale_compilers(&store, &selection, false);
+                let outcome = match store::gc(&store, store_budget) {
+                    Ok(outcome) => with_stale_compilers(stale, outcome),
+                    Err(error) => {
+                        log::warn!("the store was not swept: {error}");
+                        // The budget sweep did not measure the store, so measure it here
+                        // rather than report the empty default as what remains.
+                        let remaining = store::stats(&store).map_or(0, |stats| stats.total_bytes());
+                        with_stale_compilers(
+                            stale,
+                            store::GcOutcome {
+                                remaining_bytes: remaining,
+                                ..store::GcOutcome::default()
+                            },
+                        )
+                    }
+                };
+                progress.freed_store_bytes = progress
+                    .freed_store_bytes
+                    .saturating_add(outcome.removed_bytes);
+                if outcome.removed_bytes > 0 {
+                    progress.lines.push(evictions(&outcome));
+                }
+                Finished::Store {
+                    non_store_bytes,
+                    store_bytes: outcome.remaining_bytes,
+                }
+            }
+            Finished::Store {
+                non_store_bytes,
+                store_bytes,
+            } => {
+                // Budget-driven collection above is only an estimate of physical relief.
+                // The loop measures the disk after every logical pass and reaches the
+                // shared store only after private state and targets stop freeing bytes.
+                let low_disk = collect_low_disk(config, retention);
+                let low_disk_freed = low_disk.freed_bytes();
+                let (store_bytes, low_store_freed) =
+                    low_disk.store.as_ref().map_or((store_bytes, 0), |outcome| {
+                        (outcome.remaining_bytes, outcome.removed_bytes)
+                    });
+                progress.freed_target_bytes = progress
+                    .freed_target_bytes
+                    .saturating_add(low_disk.freed_target_bytes);
+                progress.freed_store_bytes =
+                    progress.freed_store_bytes.saturating_add(low_store_freed);
+                progress.lines.extend(low_disk.lines);
+                Finished::LowDisk {
+                    non_store_bytes,
+                    store_bytes,
+                    low_disk_freed,
+                }
+            }
+            Finished::LowDisk {
+                non_store_bytes,
+                store_bytes,
+                low_disk_freed,
+            } => {
+                let non_store_bytes =
+                    remeasured_non_store_bytes(config, retention, non_store_bytes, low_disk_freed);
+                let warning_remaining =
+                    non_store_bytes.map(|bytes| store_bytes.saturating_add(bytes));
+                if let Some(warning) = total_budget_warning(retention, warning_remaining, false) {
+                    log::warn!("{warning}");
+                    progress.lines.push(warning);
+                }
+                warn_if_still_low(config, retention);
+                return Sweep {
+                    delta: crate::savings::Delta {
+                        freed_target_bytes: progress.freed_target_bytes,
+                        freed_store_bytes: progress.freed_store_bytes,
+                        ..crate::savings::Delta::default()
+                    },
+                    lines: progress.lines,
+                };
+            }
+        };
+        progress.record(&store);
+        #[cfg(test)]
+        stop_after(progress.finished.name());
     }
-
-    // Budget-driven collection above is only an estimate of physical relief.
-    // The loop measures the disk after every logical pass and reaches the
-    // shared store only after private state and targets stop freeing bytes.
-    let low_disk = collect_low_disk(config, retention);
-    let low_disk_freed = low_disk.freed_bytes();
-    let low_store_freed = low_disk
-        .store
-        .as_ref()
-        .map_or(0, |outcome| outcome.removed_bytes);
-    let mut report_outcome = outcome;
-    if let Some(low_store) = low_disk.store {
-        add_gc_outcome(&mut report_outcome, low_store);
-    }
-    sweep.delta.freed_target_bytes = sweep
-        .delta
-        .freed_target_bytes
-        .saturating_add(low_disk.freed_target_bytes);
-    sweep.delta.freed_store_bytes = sweep
-        .delta
-        .freed_store_bytes
-        .saturating_add(low_store_freed);
-    sweep.lines.extend(low_disk.lines);
-
-    let non_store_bytes =
-        remeasured_non_store_bytes(config, retention, non_store_bytes, low_disk_freed);
-    let warning_remaining =
-        non_store_bytes.map(|bytes| report_outcome.remaining_bytes.saturating_add(bytes));
-    if let Some(warning) = total_budget_warning(retention, warning_remaining, false) {
-        log::warn!("{warning}");
-        sweep.lines.push(warning);
-    }
-    warn_if_still_low(config, retention);
-    sweep
 }
 
-/// Stop a test collector after `phase`, as a sandbox retiring it would.
+/// Stop a test collector after `phase` is recorded, as a sandbox retiring it
+/// would.
 ///
 /// With `MBX_TEST_SWEEP_STOP_AFTER` naming the phase, the collector says so
-/// on stderr and parks until the test kills it.
+/// on stderr and blocks reading stdin, which the test holds open until it
+/// kills the collector.
 #[cfg(test)]
 fn stop_after(phase: &str) {
     if std::env::var_os("MBX_TEST_SWEEP_STOP_AFTER").is_some_and(|stop| stop == phase) {
         eprintln!("sweep stopped after {phase}");
-        loop {
-            std::thread::park();
-        }
+        let mut line = String::new();
+        let _ = std::io::stdin().read_line(&mut line);
+        panic!("the test kills a stopped collector rather than release it");
     }
 }
 
@@ -1079,7 +1249,7 @@ pub(super) fn paced(
 /// Records the throttle stamp after the sweep returns, counts what it freed
 /// toward the lifetime totals, and leaves the description for the next build.
 /// A panic hook also records the stamp before an abort, so crashes wait their
-/// turn while collectors killed by a sandbox exiting can retry on the next
+/// turn while collectors killed by a sandbox exiting resume on the next
 /// build. Its own stderr is the sweep log. A background collector keeps its
 /// unlinks to a pace; see [`Pace`].
 pub(super) fn run_automatic(
