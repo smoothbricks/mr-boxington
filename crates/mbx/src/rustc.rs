@@ -2160,9 +2160,10 @@ fn mbx_incremental_unsafe_reason(arguments: &[OsString]) -> Option<&'static str>
 /// A `staticlib`, `cdylib`, or `dylib` bypasses the cache before any learned
 /// plan exists, and mbx has already told Cargo not to compile incrementally,
 /// so such a crate would otherwise recompile from scratch on every edit. It
-/// never restores from the store, so settled sources have nothing to lose by
-/// keeping state, and the churn streak that gates cacheable crates has
-/// nothing to decide here.
+/// never restores from the store, and the churn streak that gates cacheable
+/// crates has nothing to decide here. Settled sources keep state only when no
+/// dependent keys on the library's rlib
+/// ([`bypassed_library_state_spares_dependents`]).
 ///
 /// Keyed on the whole argument list, which names the unit's output directory
 /// and metadata, so another profile, target, or feature set gets its own
@@ -2204,6 +2205,13 @@ pub(crate) fn bypassed_library_incremental_flag(arguments: &[OsString]) -> Optio
     if !in_workspace {
         return None;
     }
+    // An rlib beside the native library is an input of every crate that links
+    // it, keyed by its bytes, and private state names its object members per
+    // session: no dependent key would ever repeat in another checkout. Settled
+    // sources compile alike everywhere; only an uncommitted edit keeps state.
+    if !bypassed_library_state_spares_dependents(arguments, crate_has_uncommitted_changes) {
+        return None;
+    }
     let mut identity = Vec::new();
     for argument in arguments {
         identity.extend_from_slice(argument.as_encoded_bytes());
@@ -2214,6 +2222,16 @@ pub(crate) fn bypassed_library_incremental_flag(arguments: &[OsString]) -> Optio
         return None;
     }
     Some(private_incremental_flag(&directory))
+}
+
+/// Whether a bypassed library may keep private incremental state without
+/// costing its dependents the shared cache: it emits no rlib that they link and
+/// key on, or its package holds an uncommitted edit, the loop that state serves.
+fn bypassed_library_state_spares_dependents(
+    arguments: &[OsString],
+    has_uncommitted_changes: impl FnOnce() -> bool,
+) -> bool {
+    !session::compiles_an_rlib(arguments) || has_uncommitted_changes()
 }
 
 /// Oversized learned state takes the shared compilation path this time.

@@ -3860,6 +3860,63 @@ fn a_staticlib_the_cache_bypasses_still_compiles_incrementally() {
     );
 }
 
+/// A library mbx bypasses for a native crate type can still emit an rlib that
+/// its dependents link, and their keys digest that rlib's bytes. Settled sources
+/// must compile it to the same bytes in every target directory, so the
+/// dependent one build published restores in the next. Private incremental
+/// state names the rlib's object members per session, so its bytes, and every
+/// dependent key above it, differed in each build and never hit: AxE's mgperf
+/// builds the one shared minigraf checkout (`["cdylib", "rlib"]`) into a
+/// target directory per checkout, and missed mgperf in every one (2026-11-10).
+#[test]
+fn a_settled_bypassed_library_keeps_its_dependents_shared_across_target_directories() {
+    let store = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let targets = tempfile::tempdir().unwrap();
+    let reports = tempfile::tempdir().unwrap();
+    write_dependent_project(project.path());
+    let manifest = project.path().join("base/Cargo.toml");
+    let mut text = std::fs::read_to_string(&manifest).unwrap();
+    text.push_str("\n[lib]\ncrate-type = [\"cdylib\", \"rlib\"]\n");
+    std::fs::write(&manifest, text).unwrap();
+    generate_lockfile(project.path());
+    std::fs::write(project.path().join(".gitignore"), "target\n").unwrap();
+    fixture_git(project.path(), &["init", "-q", "-b", "main"]);
+    fixture_git(project.path(), &["add", "-A"]);
+    fixture_git(project.path(), &["commit", "-q", "-m", "initial"]);
+    let build_into = |name: &str| {
+        let target = targets.path().join(name);
+        let target_text = target.to_str().unwrap();
+        let (stats, _) = cargo_with(
+            project.path(),
+            store.path(),
+            &reports.path().join(format!("{name}.json")),
+            &["build", "--offline", "--target-dir", target_text],
+            &[],
+        );
+        // A cdylib beside the rlib makes Cargo name both without a metadata
+        // suffix; the uplifted copy in the profile directory is the same file.
+        let rlibs = find_files(&target, |path| {
+            file_name_is(path, |name| name == "libbase.rlib")
+        });
+        assert!(!rlibs.is_empty(), "the build should write libbase.rlib");
+        (stats, std::fs::read(&rlibs[0]).unwrap())
+    };
+
+    let (first, first_rlib) = build_into("first");
+    assert_eq!(count(&first, "hits"), 0, "{first}");
+    let (second, second_rlib) = build_into("second");
+    assert!(
+        first_rlib == second_rlib,
+        "settled sources should compile the bypassed library to the same rlib"
+    );
+    assert_eq!(
+        (count(&second, "hits"), count(&second, "misses")),
+        (1, 0),
+        "the dependent the first build published should restore: {second}"
+    );
+}
+
 #[test]
 fn learned_incremental_can_be_turned_off() {
     let store = tempfile::tempdir().unwrap();

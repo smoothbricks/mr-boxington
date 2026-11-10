@@ -2329,30 +2329,8 @@ pub(crate) fn is_cargo_build_script(crate_name: &str) -> bool {
         && std::env::var_os("CARGO_BIN_NAME").is_none()
 }
 
-/// Whether every `--crate-type` rustc was given is `bin`, as Cargo gives a
-/// build script. A library can share a build script's crate name, but never
-/// its crate type.
-pub(crate) fn compiles_only_a_binary(arguments: &[OsString]) -> bool {
-    let mut types = Vec::new();
-    let mut arguments = arguments.iter();
-    while let Some(argument) = arguments.next() {
-        let value = if argument == "--crate-type" {
-            arguments.next().and_then(|value| value.to_str())
-        } else {
-            argument
-                .to_str()
-                .and_then(|argument| argument.strip_prefix("--crate-type="))
-        };
-        if let Some(value) = value {
-            types.extend(value.split(','));
-        }
-    }
-    !types.is_empty() && types.iter().all(|kind| *kind == "bin")
-}
-
-/// Whether rustc is asked for a native library output that mbx cannot cache:
-/// a `staticlib`, `cdylib`, or `dylib`, possibly beside an `rlib`.
-pub(crate) fn compiles_an_uncacheable_library(arguments: &[OsString]) -> bool {
+/// Every `--crate-type` rustc was given, in order.
+fn crate_types(arguments: &[OsString]) -> Vec<&str> {
     let mut types = Vec::new();
     let mut arguments = arguments.iter();
     while let Some(argument) = arguments.next() {
@@ -2368,11 +2346,34 @@ pub(crate) fn compiles_an_uncacheable_library(arguments: &[OsString]) -> bool {
         }
     }
     types
+}
+
+/// Whether every `--crate-type` rustc was given is `bin`, as Cargo gives a
+/// build script. A library can share a build script's crate name, but never
+/// its crate type.
+pub(crate) fn compiles_only_a_binary(arguments: &[OsString]) -> bool {
+    let types = crate_types(arguments);
+    !types.is_empty() && types.iter().all(|kind| *kind == "bin")
+}
+
+/// Whether rustc is asked for a native library output that mbx cannot cache:
+/// a `staticlib`, `cdylib`, or `dylib`, possibly beside an `rlib`.
+pub(crate) fn compiles_an_uncacheable_library(arguments: &[OsString]) -> bool {
+    let types = crate_types(arguments);
+    types
         .iter()
         .all(|kind| matches!(*kind, "lib" | "rlib" | "staticlib" | "cdylib" | "dylib"))
         && types
             .iter()
             .any(|kind| matches!(*kind, "staticlib" | "cdylib" | "dylib"))
+}
+
+/// Whether rustc is asked for an rlib, the artifact every crate linking this
+/// one reads: `rlib`, or `lib`, which rustc emits as an rlib.
+pub(crate) fn compiles_an_rlib(arguments: &[OsString]) -> bool {
+    crate_types(arguments)
+        .iter()
+        .any(|kind| matches!(*kind, "lib" | "rlib"))
 }
 
 /// Whether the shim should verify cached results against a real compilation.

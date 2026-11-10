@@ -3394,6 +3394,40 @@ fn bypassed_library_incremental_gate_keeps_safe_and_rejects_optimized_invocation
     assert!(!bypassed_library_incremental_is_enabled(&safe, true, true));
 }
 
+/// A cdylib or staticlib alone has no dependent keyed on its bytes, so its
+/// state is free; beside an rlib, only an uncommitted edit keeps it, and
+/// settled sources compile reproducibly for the dependents.
+#[test]
+fn a_bypassed_library_keeps_private_state_only_where_no_dependent_keys_its_rlib() {
+    let arguments = |types: &[&str]| {
+        types
+            .iter()
+            .flat_map(|kind| ["--crate-type", kind])
+            .chain(["--crate-name", "library"])
+            .map(OsString::from)
+            .collect::<Vec<_>>()
+    };
+    let unasked = || -> bool { panic!("a library without an rlib needs no git status") };
+    assert!(bypassed_library_state_spares_dependents(
+        &arguments(&["cdylib"]),
+        unasked
+    ));
+    assert!(bypassed_library_state_spares_dependents(
+        &arguments(&["staticlib"]),
+        unasked
+    ));
+    assert!(!bypassed_library_state_spares_dependents(
+        &arguments(&["cdylib", "rlib"]),
+        || false
+    ));
+    assert!(bypassed_library_state_spares_dependents(
+        &arguments(&["cdylib", "rlib"]),
+        || true
+    ));
+    let joined = [OsString::from("--crate-type=staticlib,lib")];
+    assert!(!bypassed_library_state_spares_dependents(&joined, || false));
+}
+
 /// A quote in a root is escaped in JSON diagnostics; it must still normalize to
 /// the placeholder, and restore as the receiving checkout's escaped spelling.
 #[test]

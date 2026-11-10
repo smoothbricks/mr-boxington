@@ -146,7 +146,11 @@ A workspace library with a `staticlib`, a `dylib`, or several crate types
 including `staticlib`, `cdylib`, or `dylib` (such as Tauri's
 `["staticlib", "cdylib", "rlib"]`) is never cached. mbx
 compiles it with its own incremental state, as it does a workspace crate that
-keeps changing, so an edit recompiles only what changed. Setting
+keeps changing, so an edit recompiles only what changed. When it also emits an
+`rlib`, its dependents link that rlib and their keys digest its bytes, which
+private state makes differ in every checkout; so only an edit still
+uncommitted in its package keeps that state, and settled sources compile alike
+everywhere, leaving its dependents restorable from the cache. Setting
 [`learned_incremental`](/incremental) (`MBX_LEARNED_INCREMENTAL=0`)
 to `false` turns that off.
 
