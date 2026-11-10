@@ -13,10 +13,13 @@
 //!   with an optional `"memory":BYTES`, an optional `"name":"<class>"`, the
 //!   class the pool predicts its run time by, and an optional
 //!   `"job_started_ms":MS`, when the job an `interactive` request runs for
-//!   started, which it decays by. It asks for at most `C` cores. The reply is
-//!   `{"type":"granted","id":N,"cpus":K}` once the pool admits it, `K` being
-//!   the cores it holds: as many of `C` as were free, at least one. A request
-//!   the pool refuses is answered `{"type":"refused","id":N,"error":"..."}`.
+//!   started, which it decays by, and an optional `"min":M`, the fewest of its
+//!   cores it starts on before it has waited the pool's aging bound. It asks
+//!   for at most `C` cores. The reply is `{"type":"granted","id":N,"cpus":K}`
+//!   once the pool admits it, `K` being the cores it holds: as many of `C` as
+//!   were free, at least `M` (or one) until it ages, at least one after. A
+//!   request the pool refuses, among them a `min` of 0 or above `C`, is
+//!   answered `{"type":"refused","id":N,"error":"..."}`.
 //! - `{"type":"release","id":N}` gives grant `N` back, or withdraws it while it
 //!   still waits. It has no reply.
 //!
@@ -75,6 +78,10 @@ pub(super) enum Request {
         /// milliseconds since the Unix epoch.
         #[serde(default)]
         job_started_ms: Option<u64>,
+        /// The fewest of its cores it starts on before it has waited the
+        /// pool's aging bound; at least 1 and at most `cpus`.
+        #[serde(default)]
+        min: Option<u64>,
     },
     /// Give grant `id` back, or withdraw it while it waits.
     Release { id: u64 },
@@ -102,11 +109,15 @@ pub(super) struct Pools {
 }
 
 impl Pools {
+    /// One server's pools. Every request they publish belongs to one party,
+    /// the server's (one Nx run): a request of it gathering toward its
+    /// minimum is not passed by the server's later requests.
     pub(super) fn new(interactive: Pool, normal: Pool, low: Pool) -> Self {
+        let party = crate::util::random_string(12);
         Self {
-            interactive: Arc::new(interactive),
-            normal: Arc::new(normal),
-            low: Arc::new(low),
+            interactive: Arc::new(interactive.with_party(party.clone())),
+            normal: Arc::new(normal.with_party(party.clone())),
+            low: Arc::new(low.with_party(party)),
         }
     }
 
@@ -325,7 +336,8 @@ impl Connection {
                 memory,
                 name,
                 job_started_ms,
-            }) => self.reserve(id, cpus, priority, memory, name, job_started_ms),
+                min,
+            }) => self.reserve(id, cpus, priority, memory, name, job_started_ms, min),
             Ok(Request::Release { id }) => match self.slots.remove(&id) {
                 Some(_) => Step::Quiet,
                 None => Step::Close(format!("no reservation {id} on this connection to release")),
@@ -334,6 +346,7 @@ impl Connection {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn reserve(
         &mut self,
         id: u64,
@@ -342,6 +355,7 @@ impl Connection {
         memory: Option<u64>,
         name: Option<String>,
         job_started_ms: Option<u64>,
+        min: Option<u64>,
     ) -> Step {
         if self.slots.contains_key(&id) {
             return Step::Close(format!(
@@ -362,6 +376,7 @@ impl Connection {
                 let outcome = pool.reserve_observed(
                     Some(cpus),
                     memory,
+                    min,
                     name.as_deref(),
                     job_started_ms,
                     &waiting,
