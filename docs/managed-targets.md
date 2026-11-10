@@ -319,11 +319,22 @@ target never holds up the build that came due. The next build reports what it
 removed. If mbx cannot start the background collector, the build collects in
 the foreground instead.
 
-The automatic collection interval starts when a sweep finishes. If a sandbox
-kills the background collector when its build exits, the next build can retry
-immediately. A collector that panics still counts as a finished sweep, so the
-next one waits the usual interval: `gc.interval`, or at most five minutes while
+The automatic collection interval starts when a sweep finishes. A sweep records
+each phase as it finishes it: managed targets and other private state,
+scheduler flights, the store, then any low-disk passes. If a sandbox kills the
+background collector when its build exits, the sweep stays due, and the next
+build's collector resumes at the first phase the killed one did not finish
+instead of walking every target and the whole store again. Only phases from a
+sweep that started within the current interval are skipped; an older sweep's
+record is ignored and the walk starts from the top. A collector that panics
+still counts as a finished sweep, so the next one waits the usual interval:
+`gc.interval`, or at most five minutes while
 [the disk runs low](#when-the-disk-runs-low).
+
+Under cowshed, collection runs on the host rather than inside a build. Every
+shed session sets `MBX_GC_AUTO=0`, so its builds never start a collector, and
+the cowshed gateway runs `mbx gc --automatic` on a timer of its own, outside
+any build, so a build ending never ends a sweep.
 
 The background collector keeps its deletions to 1,000 files a second after
 the first second's worth. Each deleted file is an event for every filesystem
