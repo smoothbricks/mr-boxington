@@ -101,6 +101,7 @@ fn a_request_is_exactly_one_of_the_protocol_lines() {
                 memory: None,
                 name: None,
                 job_started_ms: None,
+                min: None,
             }),
         ),
         (
@@ -112,6 +113,7 @@ fn a_request_is_exactly_one_of_the_protocol_lines() {
                 memory: Some(1024),
                 name: None,
                 job_started_ms: None,
+                min: None,
             }),
         ),
         (
@@ -123,6 +125,7 @@ fn a_request_is_exactly_one_of_the_protocol_lines() {
                 memory: None,
                 name: Some("nx:ws:build".into()),
                 job_started_ms: None,
+                min: None,
             }),
         ),
         (
@@ -138,6 +141,7 @@ fn a_request_is_exactly_one_of_the_protocol_lines() {
                 memory: None,
                 name: None,
                 job_started_ms: Some(1_700_000_000_000),
+                min: None,
             }),
         ),
         // Absent or null is no job start: the request does not decay.
@@ -150,6 +154,19 @@ fn a_request_is_exactly_one_of_the_protocol_lines() {
                 memory: None,
                 name: None,
                 job_started_ms: None,
+                min: None,
+            }),
+        ),
+        (
+            r#"{"type":"reserve","id":3,"cpus":18,"priority":"normal","min":4}"#,
+            Some(Request::Reserve {
+                id: 3,
+                cpus: 18,
+                priority: SchedulerPriority::Normal,
+                memory: None,
+                name: None,
+                job_started_ms: None,
+                min: Some(4),
             }),
         ),
         // A priority is named, never defaulted: the pool's order depends on it.
@@ -265,6 +282,60 @@ async fn a_refused_request_leaves_its_connection_serving() {
     client.send(reserve(1, 2, "low")).await;
     assert_eq!(client.reply().await, granted(1, 2));
     client.close().await;
+}
+
+#[tokio::test]
+async fn a_minimum_of_none_or_above_its_cpus_is_refused_by_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let pools = pools(dir.path(), 4);
+    let mut client = Client::connect(&pools);
+    for (id, min) in [(1, 0), (2, 5)] {
+        client
+            .send(json!({"type": "reserve", "id": id, "cpus": 4, "priority": "normal", "min": min}))
+            .await;
+        let refused = client.reply().await.unwrap();
+        assert_eq!(refused["type"], "refused", "{refused}");
+        assert_eq!(refused["id"], id, "{refused}");
+        assert!(
+            refused["error"]
+                .as_str()
+                .is_some_and(|error| error.starts_with(&format!("min {min} "))),
+            "{refused}"
+        );
+    }
+    // The connection serves on.
+    client
+        .send(json!({"type": "reserve", "id": 1, "cpus": 4, "priority": "normal", "min": 4}))
+        .await;
+    assert_eq!(client.reply().await, granted(1, 4));
+    client.close().await;
+}
+
+#[tokio::test]
+async fn a_reservation_gathers_its_minimum_from_what_its_own_run_frees() {
+    let dir = tempfile::tempdir().unwrap();
+    let pools = pools(dir.path(), 18);
+    // The run's short leaves hold 17 of the 18 cores.
+    let mut leaves = Client::connect(&pools);
+    for id in 1..=17 {
+        leaves.send(reserve(id, 1, "normal")).await;
+        assert_eq!(leaves.reply().await, granted(id, 1));
+    }
+    // The whole suite, at least four: one core is free, too few to start on.
+    let mut suite = Client::connect(&pools);
+    suite
+        .send(json!({"type": "reserve", "id": 1, "cpus": 18, "priority": "normal", "min": 4}))
+        .await;
+    let early = tokio::time::timeout(std::time::Duration::from_millis(500), suite.reply()).await;
+    assert!(early.is_err(), "started short of its minimum: {early:?}");
+    queued(dir.path(), 1).await;
+    // Three leaves end: with the one free, four.
+    for id in 1..=3 {
+        leaves.send(release(id)).await;
+    }
+    assert_eq!(suite.reply().await, granted(1, 4));
+    suite.close().await;
+    leaves.close().await;
 }
 
 #[tokio::test]

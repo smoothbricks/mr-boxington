@@ -45,9 +45,16 @@ fn optional_build<'de, D: serde::Deserializer<'de>>(
 pub(super) struct Trace {
     overtook_total: usize,
     overtook: Vec<Overtake>,
+    /// It started on fewer cores than its `min`.
+    short_of_min: bool,
 }
 
 impl Trace {
+    /// What the grant of `cores` to `request` says of its minimum.
+    pub(super) fn started_on(&mut self, request: &Waiting, cores: u64) {
+        self.short_of_min = request.min.is_some_and(|min| cores < min);
+    }
+
     pub(super) fn initialize(&mut self, older: &[&Waiting], live: &[Lease], request: &Waiting) {
         self.overtook_total = older.len();
         let mut older = older.to_vec();
@@ -138,6 +145,13 @@ pub(super) struct Event {
     /// in when it asked.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     decayed: Option<Decayed>,
+    /// The fewest cores the request asked to start on before it aged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    min: Option<u64>,
+    /// An admission that started on fewer cores than its `min`: it aged, or
+    /// no scope it is charged in holds that many.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    short_of_min: bool,
     waited_ms: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     reason: Option<String>,
@@ -185,6 +199,8 @@ impl Event {
             first_arrival_ms: record.first_arrival_ms,
             predicted_ms: record.predicted_ms,
             decayed: record.decayed.clone(),
+            min: record.min,
+            short_of_min: false,
             waited_ms: record
                 .first_arrival_ms
                 .map_or(0, |first| now.saturating_sub(first)),
@@ -277,6 +293,7 @@ impl Pool {
         }
         let mut event = Event::new(self, "admitted", request);
         event.granted_by = granted_by;
+        event.short_of_min = trace.short_of_min;
         event.rule = Some(
             match decision {
                 AdmissionDecision::Ordered => "ordered",
@@ -803,6 +820,49 @@ mod tests {
         assert!(json["overtook"][0].get("domain").is_none());
         assert!(json["overtook"][0].get("build").is_none());
         assert!(json["overtook"][0].get("priority").is_none());
+    }
+
+    #[test]
+    fn an_admission_names_its_minimum_and_says_when_it_started_short_of_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = pool(dir.path(), 120);
+        let mut request = record(10, 18);
+        request.min = Some(4);
+        for (cores, short) in [(18, false), (4, false), (1, true)] {
+            let mut trace = Trace::default();
+            trace.started_on(&request, cores);
+            let mut pending = Vec::new();
+            pool.admitted_event(
+                &request,
+                &[],
+                AdmissionDecision::Ordered,
+                trace,
+                None,
+                &mut pending,
+            );
+            pool.write_decisions(pending);
+            let row = serde_json::to_value(events(dir.path()).pop().unwrap()).unwrap();
+            assert_eq!(row["min"], 4, "{row}");
+            assert_eq!(row.get("short_of_min").is_some(), short, "{row}");
+            if short {
+                assert_eq!(row["short_of_min"], true, "{row}");
+            }
+        }
+        // A request without a minimum names none.
+        let mut pending = Vec::new();
+        let plain = record(11, 1);
+        pool.admitted_event(
+            &plain,
+            &[],
+            AdmissionDecision::Ordered,
+            Trace::default(),
+            None,
+            &mut pending,
+        );
+        pool.write_decisions(pending);
+        let row = serde_json::to_value(events(dir.path()).pop().unwrap()).unwrap();
+        assert!(row.get("min").is_none(), "{row}");
+        assert!(row.get("short_of_min").is_none(), "{row}");
     }
 
     #[test]

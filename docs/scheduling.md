@@ -309,7 +309,8 @@ reads it as `low`.
 A compiler or test process runs as many threads as it was charged for, so its
 request starts only when all of its cores fit. An
 [`mbx reserve`](#reserve-capacity-for-external-work) may start on fewer: as soon
-as one core is free, it gets as many of the cores it asked for as are free.
+as one core is free, or as many as its minimum names (below), it gets as many
+of the cores it asked for as are free.
 Memory is charged whole either way, since a process's predicted peak does not
 shrink with its cores. A request that cannot start is passed by the requests
 behind it that can, so a large compilation never leaves cores idle that smaller
@@ -324,6 +325,25 @@ once the pool has drained enough for it, however many small requests keep
 arriving. Cancelling a waiter or killing its process releases its queue
 position.
 
+A reservation may name a minimum: `mbx reserve --min N`, or `min` on a
+[served reservation](#serve-reservations-to-many-commands). Until it has
+waited 30 seconds, it starts only once that many of its cores are free, and
+then at once on as many of the cores it asked for as are free: `--cpus` stays
+a ceiling, not a target, and a grant never grows after it starts or is taken
+back. The minimum is cut to the cores of the smallest scope the reservation is
+charged in, so it never waits for cores no scope has, and a minimum of one is
+no minimum. While it gathers, it keeps its place in its band, and no request
+that asked after it or comes after it in the order starts if it is `low` or
+belongs to the reservation's party: the other reservations of the same
+`mbx reservations` server, which serves one Nx run, or, for an `mbx reserve`
+run inside an mbx Cargo build, that build's compiles, links and tests. Every
+other request passes it as it passes any request that cannot start. A Cargo
+build's compiles, links and tests carry that build's own id and nothing that
+names the server, so a served reservation holds back only its server's
+reservations and `low` work. At 30 seconds it starts on what is free, as a
+reservation without a minimum does. Its decision rows carry `min`, and an
+admission that started on fewer cores than its minimum carries
+`short_of_min: true`.
 Each admission attempt serves the whole queue. Whichever process takes the
 pool's lock admits, in that order, every waiting request these rules admit,
 not only its own. On macOS and Linux, waiters block on lease-directory changes:
@@ -421,7 +441,8 @@ memory but does not run through mbx, such as a build in a VM or container:
 mbx reserve --memory 6GiB --cpus 4 -- ./run-windows-build-in-vm.sh
 ```
 
-`--cpus` is a maximum. The command starts as soon as one core is free, on as
+`--cpus` is a maximum. The command starts as soon as one core is free (or its
+`--min` until it has waited 30 seconds), on as
 many of the cores it asked for as are free then, and the reservation holds
 those. The command reads that count from `MBX_RESERVE_CPUS` and should size its
 own parallelism from it. Memory is reserved exactly, and the command waits
@@ -447,7 +468,9 @@ supervisor when the reservation gets its capacity; see
 `--name nx:<workspace>:<task>` names the reservation's class: the pool records
 its run time under that name and orders it by the class's history. Without
 `--name`, a reservation is named `mbx reserve` and predicted by the median of
-the named classes.
+the named classes. `--min N` names the fewest of its `--cpus` it starts on
+before it has waited 30 seconds; see
+[Machine-wide compile scheduling](#machine-wide-compile-scheduling).
 
 ### Serve reservations to many commands
 
@@ -475,11 +498,14 @@ A client connects and writes one JSON object per line:
 
 `reserve` asks for at most `cpus` cores at a `priority`, with an optional
 `memory` in bytes, an optional `name`, the class its run time is predicted
-by, and an optional `job_started_ms`, and is admitted exactly as
-`mbx reserve --cpus --priority --memory --name --job-started`
-is: the same pool, the same order, and as many of its cores as are
-free once one is. The answer is `granted` with the cores the request holds, or
-`refused` with the pool's error, after which the connection keeps serving.
+by, an optional `job_started_ms`, and an optional `min`, the fewest of its
+cores it starts on before it has waited 30 seconds, and is admitted exactly as
+`mbx reserve --cpus --priority --memory --name --job-started --min`
+is: the same pool, the same order, and as many of its cores as are free once
+one is, or once its `min` are. Every reservation one server serves belongs to
+that server's party. The answer is `granted` with the cores the request
+holds, or `refused` with the pool's error, among them a `min` of 0, a `min`
+above `cpus`, after which the connection keeps serving.
 `release` gives a grant back, or withdraws a request that still waits; it has
 no answer. One connection may hold many grants under distinct ids, answered in
 the order the pool grants them, and an id is free again once released. Closing
