@@ -337,13 +337,16 @@ that asked after it or comes after it in the order starts if it is `low` or
 belongs to the reservation's party: the other reservations of the same
 `mbx reservations` server, which serves one Nx run, or, for an `mbx reserve`
 run inside an mbx Cargo build, that build's compiles, links and tests. Every
-other request passes it as it passes any request that cannot start. A Cargo
-build's compiles, links and tests carry that build's own id and nothing that
-names the server, so a served reservation holds back only its server's
-reservations and `low` work. At 30 seconds it starts on what is free, as a
-reservation without a minimum does. Its decision rows carry `min`, and an
-admission that started on fewer cores than its minimum carries
-`short_of_min: true`.
+other request passes it as it passes any request that cannot start, and so
+does a request that asked after it but sorts ahead of it and gathers toward a
+minimum of its own: two gathering reservations wait for each other only in
+the order, never both for each other. A Cargo build's compiles, links and
+tests carry that build's own id and nothing that names the server, so a
+served reservation holds back only its server's reservations and `low` work.
+At 30 seconds it starts on what is free, as a reservation without a minimum
+does. Its decision rows carry `min`, and an admission that started on fewer
+cores than its minimum carries `short_of_min: true`.
+
 Each admission attempt serves the whole queue. Whichever process takes the
 pool's lock admits, in that order, every waiting request these rules admit,
 not only its own. On macOS and Linux, waiters block on lease-directory changes:

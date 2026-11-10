@@ -922,9 +922,11 @@ fn decayed(
 /// - **Gather.** A moldable request that names a minimum ([`least_cores`])
 ///   and has not aged starts only once that many of its cores are free, then
 ///   on as many as are free; it holds its place meanwhile. While it waits, no
-///   request of its party or of the `low` band that asked after it, or comes
-///   after it in this order, starts; other requests pass it as before. At the
-///   aging bound it starts on what is free, as a request without one does.
+///   request of its party or of the `low` band that comes after it in this
+///   order starts, nor one that asked after it unless it gathers too; other
+///   requests pass it as before. Two gatherers so wait only in this order,
+///   and none holds back one that holds it back. At the aging bound it starts
+///   on what is free, as a request without one does.
 ///
 /// A queued request is admitted as soon as any participant sees room for it,
 /// not when its own process next wins the registrar. One from another memory
@@ -1019,6 +1021,9 @@ fn admission_pass(
         if held.iter().any(|scope| scope.covers(record)) {
             continue;
         }
+        // Asking later holds back only a request that does not gather itself:
+        // two gatherers wait in order, so neither holds the other back.
+        let gathers_too = gatherers.iter().any(|&(_, gatherer)| gatherer == grantee);
         let passes_a_gatherer = gatherers.iter().any(|&(at, gatherer)| {
             let still_waiting = match gatherer {
                 Grantee::Queued(index) => waiting[index],
@@ -1027,7 +1032,7 @@ fn admission_pass(
             let gathering = record_of(gatherer);
             gatherer != grantee
                 && still_waiting
-                && (at < place || gathering.ticket < record.ticket)
+                && (at < place || (!gathers_too && gathering.ticket < record.ticket))
                 && (band(&record.priority) == band(SchedulerPriority::Low.as_str())
                     || gathering
                         .party()

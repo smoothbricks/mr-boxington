@@ -5214,12 +5214,14 @@ fn a_reservation_gathers_its_minimum_before_it_starts() {
         min: Some(4),
         ..reservation(ticket, 18, "gate")
     };
-    // A short leaf of a run, asked later: one core, predicted at a second.
-    let leaf = |ticket, party| Waiting {
+    // A short leaf of a run, asked later: `cpu` cores, predicted at a second.
+    let leaf_of = |ticket, cpu, party| Waiting {
         predicted_ms: Some(1_000),
         first_arrival_ms: Some(1_000),
-        ..reservation(ticket, 1, party)
+        ..reservation(ticket, cpu, party)
     };
+    // One of one core.
+    let leaf = |ticket, party| leaf_of(ticket, 1, party);
     // A later low request, rigid, of a Cargo build no run names.
     let low = |ticket| Waiting {
         first_arrival_ms: Some(1_000),
@@ -5329,6 +5331,19 @@ fn a_reservation_gathers_its_minimum_before_it_starts() {
             request: low(NEW),
             context: gathering,
             granted: vec![(1, false, 2), (NEW, true, 1)],
+        },
+        PassCase {
+            // Each would hold the other: the leaf asked after the suite, the
+            // suite comes after the leaf. The one ahead in the order goes.
+            name: "two gatherers of one run never hold each other back",
+            live: vec![(1, 0); 14],
+            queue: vec![suite(1)],
+            request: Waiting {
+                min: Some(2),
+                ..leaf_of(NEW, 2, "gate")
+            },
+            context: gathering,
+            granted: vec![(NEW, true, 2)],
         },
         PassCase {
             name: "a minimum of one is no minimum",
