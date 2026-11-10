@@ -1777,6 +1777,10 @@ fn evicting_a_results_descriptor_frees_the_result_with_it() {
     for digest in new_objects {
         age(store, digest, Duration::from_secs(60));
     }
+    // A descriptor ranks by its result's use too, so the records are aged with
+    // their objects: neither result has been hit since it was stored.
+    age_result(store, &old, Duration::from_secs(2 * 60 * 60));
+    age_result(store, &new, Duration::from_secs(60));
     let total = stats(store).unwrap().total_bytes();
     let old_bytes = old_objects
         .iter()
