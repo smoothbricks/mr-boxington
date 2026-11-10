@@ -440,7 +440,13 @@ fn original_reserve_arguments(arguments: &[std::ffi::OsString]) -> Result<Vec<St
     while let Some(first) = rest.first().and_then(|argument| argument.to_str()) {
         if matches!(
             first,
-            "--cpus" | "--memory" | "--priority" | "--grant-fd" | "--name" | "--job-started"
+            "--cpus"
+                | "--memory"
+                | "--priority"
+                | "--grant-fd"
+                | "--name"
+                | "--job-started"
+                | "--min"
         ) {
             rest = rest.get(2..).unwrap_or_default();
         } else if first.starts_with("--cpus=")
@@ -449,6 +455,7 @@ fn original_reserve_arguments(arguments: &[std::ffi::OsString]) -> Result<Vec<St
             || first.starts_with("--grant-fd=")
             || first.starts_with("--name=")
             || first.starts_with("--job-started=")
+            || first.starts_with("--min=")
         {
             rest = &rest[1..];
         } else {

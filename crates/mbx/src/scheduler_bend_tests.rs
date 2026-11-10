@@ -160,6 +160,8 @@ fn record(
         handoff: Some(handoff(pool)),
         shape: Some(Shape::Moldable),
         decayed,
+        min: None,
+        party: None,
     }
 }
 

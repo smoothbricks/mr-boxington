@@ -16,10 +16,18 @@ const WORKER_ENV: &str = "MBX_RESERVE_WORKER";
 #[derive(usage_rs::Args)]
 pub(super) struct ReserveArgs {
     /// Most CPU cores to hold while the command runs. The pool may grant
-    /// fewer, at least one, as soon as one is free; the command reads the
-    /// count it was granted from `MBX_RESERVE_CPUS`.
+    /// fewer, at least one, as soon as one is free (or `--min` are); the
+    /// command reads the count it was granted from `MBX_RESERVE_CPUS`.
     #[usage(long, value_name = "N")]
     cpus: Option<u64>,
+    /// Fewest of its `--cpus` the command starts on, at least 1. Until the
+    /// reservation has waited 30 seconds it waits for this many to be free,
+    /// and no later `low` request starts ahead of it, nor, run inside an mbx
+    /// Cargo build, a later compile, link or test of that build. Once it has
+    /// waited 30 seconds it starts on what is free, as one without `--min`
+    /// does.
+    #[usage(long, value_name = "N")]
+    pub(super) min: Option<u64>,
     /// Memory to hold from the configured scheduler budget.
     #[usage(long, value_name = "SIZE")]
     memory: Option<ByteSize>,
@@ -100,6 +108,9 @@ fn spawn_worker(args: &ReserveArgs, grant: Option<Descriptor>) -> Result<ExitCod
     if let Some(memory) = args.memory {
         worker.args(["--memory", &format!("{}B", memory.as_u64())]);
     }
+    if let Some(min) = args.min {
+        worker.args(["--min", &min.to_string()]);
+    }
     // The worker inherits the descriptor and announces on it.
     if let Some(fd) = args.grant_fd {
         worker.args(["--grant-fd", &fd.to_string()]);
@@ -131,6 +142,7 @@ fn run_direct(config: &Config, args: &ReserveArgs, grant: Option<Descriptor>) ->
     let Some((mut permit, admission)) = pool.reserve_observed(
         args.cpus,
         args.memory.map(|memory| memory.as_u64()),
+        args.min,
         args.name.as_deref(),
         args.job_started,
         &AtomicBool::new(false),
@@ -171,7 +183,11 @@ fn run_enclosed(
     let (program, arguments, pool) = reservation(config, args)?;
     // The refusals of a reservation of its own: nesting never turns a
     // malformed request into a silently accepted one.
-    pool.reservation_weight(args.cpus, args.memory.map(|memory| memory.as_u64()))?;
+    pool.reservation_weight(
+        args.cpus,
+        args.memory.map(|memory| memory.as_u64()),
+        args.min,
+    )?;
     log::debug!("an enclosing reservation covers {program}; it runs under that grant");
     // That grant covers the command already, so --grant-fd hears of it now,
     // and of its release once the command has run.

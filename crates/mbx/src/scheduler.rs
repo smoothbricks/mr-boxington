@@ -503,6 +503,17 @@ struct Waiting {
     /// when that age put it in a band below the declared one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     decayed: Option<Decayed>,
+    /// The fewest cores a moldable request starts on before it has waited
+    /// [`AGING_MS`]: until then it gathers freed cores toward it. Absent, it
+    /// starts on one, as a request did before minimums.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    min: Option<u64>,
+    /// Who asked, when that is more than this one process: the
+    /// `mbx reservations` server (one Nx run) a reservation was served by, or
+    /// the Cargo build an `mbx reserve` runs in. A request gathering toward
+    /// its minimum is not passed by a later request of its party.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    party: Option<String>,
 }
 
 /// What any registrar holder needs to admit a queued request on its holder's
@@ -589,6 +600,8 @@ struct AdmissionState {
     /// The band below its declared one its job's age put it in when it
     /// asked, decided once: a request keeps the band it asked with.
     decayed: Option<Decayed>,
+    /// The fewest cores it starts on before it ages, when it names one.
+    min: Option<u64>,
 }
 
 impl AdmissionState {
@@ -604,6 +617,7 @@ impl AdmissionState {
             periodic: false,
             predicted_ms: None,
             decayed: None,
+            min: None,
         }
     }
 }
@@ -653,6 +667,13 @@ impl Lease {
 }
 
 impl Waiting {
+    /// The party a request belongs to: the one it names, or else its Cargo
+    /// build, whose compiles, links and tests carry its id.
+    fn party(&self) -> Option<&str> {
+        self.party
+            .as_deref()
+            .or_else(|| self.build.as_ref().map(|(id, _)| id.as_str()))
+    }
     fn resources(&self) -> Resources {
         record_resources(
             self.cpu,
@@ -898,6 +919,12 @@ fn decayed(
 ///   behind it in each scope it is short of, which bounds its wait: every
 ///   request when it is short of the global pool, only those of its domain or
 ///   its build when it is short of only that ceiling.
+/// - **Gather.** A moldable request that names a minimum ([`least_cores`])
+///   and has not aged starts only once that many of its cores are free, then
+///   on as many as are free; it holds its place meanwhile. While it waits, no
+///   request of its party or of the `low` band that asked after it, or comes
+///   after it in this order, starts; other requests pass it as before. At the
+///   aging bound it starts on what is free, as a request without one does.
 ///
 /// A queued request is admitted as soon as any participant sees room for it,
 /// not when its own process next wins the registrar. One from another memory
@@ -944,6 +971,11 @@ fn admission_pass(
     };
     let since = |record: &Waiting| record.first_arrival_ms.unwrap_or(context.now_ms);
     let aged = |record: &Waiting| context.now_ms.saturating_sub(since(record)) >= AGING_MS;
+    let gathers = |record: &Waiting| {
+        (!aged(record))
+            .then(|| least_cores(record, handoff.budget))
+            .flatten()
+    };
     let mut order: Vec<Grantee> = std::iter::once(Grantee::Request)
         .chain(
             (0..queue.len())
@@ -966,18 +998,42 @@ fn admission_pass(
             record.ticket,
         )
     });
+    // The requests gathering toward a minimum, each with its place in the order.
+    let gatherers: Vec<(usize, Grantee)> = order
+        .iter()
+        .enumerate()
+        .filter(|&(_, &grantee)| gathers(record_of(grantee)).is_some())
+        .map(|(place, &grantee)| (place, grantee))
+        .collect();
     let mut live = live;
     // What this pass leaves to the requests it may not grant.
     let mut left: Vec<Lease> = Vec::new();
     // The scopes aged requests that could not start hold back.
     let mut held: Vec<Scope<'_>> = Vec::new();
     let mut grants = Vec::new();
-    for grantee in order {
+    for (place, grantee) in order.into_iter().enumerate() {
         if context.single && !grants.is_empty() {
             break;
         }
         let record = record_of(grantee);
         if held.iter().any(|scope| scope.covers(record)) {
+            continue;
+        }
+        let passes_a_gatherer = gatherers.iter().any(|&(at, gatherer)| {
+            let still_waiting = match gatherer {
+                Grantee::Queued(index) => waiting[index],
+                Grantee::Request => request_waiting,
+            };
+            let gathering = record_of(gatherer);
+            gatherer != grantee
+                && still_waiting
+                && (at < place || gathering.ticket < record.ticket)
+                && (band(&record.priority) == band(SchedulerPriority::Low.as_str())
+                    || gathering
+                        .party()
+                        .is_some_and(|party| record.party() == Some(party)))
+        });
+        if passes_a_gatherer {
             continue;
         }
         let grantable = grantee == Grantee::Request
@@ -1005,11 +1061,14 @@ fn admission_pass(
         let want = record.resources();
         let shape = record.shape.unwrap_or_default();
         let scopes = scopes(record, live.iter().chain(&left), handoff.budget);
+        // One gathering toward a minimum starts only on at least that many.
+        let least = gathers(record);
         let Some(charge) = grant(
             want,
             shape,
             scopes.clone().map(|(_, budget, used)| (budget, used)),
-        ) else {
+        )
+        .filter(|charge| least.is_none_or(|least| charge.cpu >= least)) else {
             if aged(record) {
                 held.extend(
                     scopes
@@ -1039,6 +1098,7 @@ fn admission_pass(
             let older: Vec<&Waiting> = older.collect();
             let mut trace = decisions::Trace::default();
             trace.initialize(&older, &live, record);
+            trace.started_on(record, charge.cpu);
             trace
         });
         grants.push(PassGrant {
@@ -1171,6 +1231,24 @@ fn grant(
         Shape::Moldable => want.cpu.min(1),
     };
     (cpu >= least).then_some(Resources { cpu, ..want })
+}
+
+/// The cores a moldable `record` that names a minimum gathers before it
+/// starts, while it has not aged: its `min`, cut to what it asks for and to
+/// what each scope it is charged in holds, so it never waits for cores no
+/// scope has. `None` when that is one core or none: it starts as soon as one
+/// is free, as a request without a minimum does. `fallback` is the global
+/// budget of a record that names none.
+fn least_cores(record: &Waiting, fallback: Resources) -> Option<u64> {
+    let min = record.min?;
+    if record.shape != Some(Shape::Moldable) {
+        return None;
+    }
+    let most = scopes(record, std::iter::empty(), fallback)
+        .fold(record.resources().cpu, |cpu, (_, budget, _)| {
+            cpu.min(budget.cpu.max(1))
+        });
+    Some(min.min(most)).filter(|&least| least > 1)
 }
 
 /// The lease a grant of `charge` to `record` holds: the one its record asks
@@ -1819,6 +1897,8 @@ pub(crate) struct Pool {
     clock: fn() -> u64,
     /// Source of the counter in lease names, injectable for tests.
     lease_nonce: fn() -> u64,
+    /// The party its requests publish (`Waiting::party`).
+    party: Option<String>,
 }
 
 /// The pool this process schedules against, or `None` when scheduling is off.
@@ -1851,6 +1931,11 @@ pub(crate) fn reservation_pool(config: &Config, priority: SchedulerPriority) -> 
         pool.set_memory_capacity(scheduler.memory_bytes.unwrap_or(0));
         pool.events = config.events;
         pool.pressure = scheduler.pressure;
+        // An `mbx reserve` run inside an mbx Cargo build belongs to that
+        // build: the build's own compiles carry the same id.
+        pool.party = std::env::var(SCHED_BUILD_ID_ENV)
+            .ok()
+            .filter(|id| !id.is_empty());
         pool
     })
 }
@@ -2137,7 +2222,14 @@ impl Pool {
             pressure_domain: crate::pressure::domain(),
             clock: crate::pressure::now_ms,
             lease_nonce: next_lease_nonce,
+            party: None,
         }
+    }
+
+    /// This pool with every request it publishes belonging to `party`.
+    pub(crate) fn with_party(mut self, party: String) -> Self {
+        self.party = Some(party);
+        self
     }
 
     /// A pool of `capacity` cores under `dir` that reads none of the host's
@@ -2266,12 +2358,25 @@ impl Pool {
         }
     }
 
-    /// The permits a reservation of `cpus` and `memory_bytes` holds.
+    /// The permits a reservation of `cpus` and `memory_bytes` holds, once its
+    /// `min`, when it names one, is a core count it may ask for.
     pub(crate) fn reservation_weight(
         &self,
         cpus: Option<u64>,
         memory_bytes: Option<u64>,
+        min: Option<u64>,
     ) -> Result<u64> {
+        if let Some(min) = min {
+            let Some(cpus) = cpus else {
+                eyre::bail!("min {min} needs cpus: a minimum counts cores")
+            };
+            if min == 0 {
+                eyre::bail!("min 0 is no minimum: a reservation starts on at least one core")
+            }
+            if min > cpus {
+                eyre::bail!("min {min} is more than the {cpus} cpus it asks for")
+            }
+        }
         let cpu_weight = cpus.unwrap_or(0);
         let memory_weight = match memory_bytes {
             Some(_) if self.bytes_per_permit == 0 => {
@@ -2303,11 +2408,12 @@ impl Pool {
         &self,
         cpus: Option<u64>,
         memory_bytes: Option<u64>,
+        min: Option<u64>,
         name: Option<&str>,
         job_started_ms: Option<u64>,
         withdrawn: &AtomicBool,
     ) -> Result<Option<Permit>> {
-        let weight = self.reservation_weight(cpus, memory_bytes)?;
+        let weight = self.reservation_weight(cpus, memory_bytes, min)?;
 
         let started = Instant::now();
         // A named reservation's records carry its class, as a compile's carry
@@ -2317,6 +2423,7 @@ impl Pool {
         let mut state = AdmissionState {
             predicted_ms: self.predicted_run_ms(RunKind::Reservation, name),
             decayed: decayed(self.priority, job_started_ms, now_ms),
+            min,
             ..AdmissionState::new(now_ms, Shape::Moldable)
         };
         let mut wake: Option<wait::Wait> = None;
@@ -2647,6 +2754,7 @@ impl Pool {
         let shape = state.shape;
         let predicted_ms = state.predicted_ms;
         let decayed = state.decayed.clone();
+        let min = state.min;
         // Broken sensing disables only this advisory gate, never CPU scheduling.
         let pressure_state = (self.pressure && self.bytes_per_permit > 0)
             .then(|| crate::pressure::domain_state(&self.dir, self.pressure_domain));
@@ -2666,6 +2774,7 @@ impl Pool {
                     shape,
                     predicted_ms,
                     decayed.as_ref(),
+                    min,
                     u64::MAX,
                 )
             });
@@ -2689,6 +2798,7 @@ impl Pool {
                     shape,
                     predicted_ms,
                     decayed.as_ref(),
+                    min,
                     u64::MAX,
                 )
             });
@@ -2718,6 +2828,7 @@ impl Pool {
                     shape,
                     predicted_ms,
                     decayed.as_ref(),
+                    min,
                     u64::MAX,
                 )
             });
@@ -2740,6 +2851,7 @@ impl Pool {
                 shape,
                 predicted_ms,
                 decayed.as_ref(),
+                min,
                 ticket,
             ),
             Handoff {
@@ -2844,6 +2956,7 @@ impl Pool {
         shape: Shape,
         predicted_ms: Option<u64>,
         decayed: Option<&Decayed>,
+        min: Option<u64>,
         ticket: u64,
     ) -> Waiting {
         Waiting {
@@ -2875,6 +2988,8 @@ impl Pool {
             shape: Some(shape),
             predicted_ms,
             decayed: decayed.cloned(),
+            min,
+            party: self.party.clone(),
         }
     }
 

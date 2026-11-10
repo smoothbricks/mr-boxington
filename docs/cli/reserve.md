@@ -13,7 +13,8 @@ This is for work such as a VM, Docker build, or another compiler that consumes t
 - **`<COMMAND>…`** — Command and arguments to run while capacity is reserved.
 
 ## Flags
-- **`--cpus <N>`** — Most CPU cores to hold while the command runs. The pool may grant fewer, at least one, as soon as one is free; the command reads the count it was granted from `MBX_RESERVE_CPUS`.
+- **`--cpus <N>`** — Most CPU cores to hold while the command runs. The pool may grant fewer, at least one, as soon as one is free (or `--min` are); the command reads the count it was granted from `MBX_RESERVE_CPUS`.
+- **`--min <N>`** — Fewest of its `--cpus` the command starts on, at least 1. Until the reservation has waited 30 seconds it waits for this many to be free, and no later `low` request starts ahead of it, nor, run inside an mbx Cargo build, a later compile, link or test of that build. Once it has waited 30 seconds it starts on what is free, as one without `--min` does.
 - **`--memory <SIZE>`** — Memory to hold from the configured scheduler budget.
 - **`--priority <PRIORITY>`** — Priority in the machine-wide pool: waiting `interactive` work goes first, then `normal` (the land gate), then `low`.
 

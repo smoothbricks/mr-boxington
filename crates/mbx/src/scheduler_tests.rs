@@ -187,7 +187,14 @@ fn a_reservation_charges_cpu_and_memory_separately() {
     let pool = pool_at(directory.path(), 4, 1024);
 
     let reservation = pool
-        .reserve(Some(1), Some(3 * 1024), None, None, &AtomicBool::default())
+        .reserve(
+            Some(1),
+            Some(3 * 1024),
+            None,
+            None,
+            None,
+            &AtomicBool::default(),
+        )
         .unwrap()
         .unwrap();
     let cpu_only =
@@ -207,7 +214,7 @@ fn a_reservation_requires_a_requested_resource() {
     let pool = pool_at(directory.path(), 4, 1024);
 
     assert!(
-        pool.reserve(None, None, None, None, &AtomicBool::default())
+        pool.reserve(None, None, None, None, None, &AtomicBool::default())
             .is_err()
     );
 }
@@ -218,7 +225,7 @@ fn a_memory_reservation_needs_a_memory_budget() {
     let pool = pool_at(directory.path(), 4, 0);
 
     assert!(
-        pool.reserve(None, Some(1024), None, None, &AtomicBool::default())
+        pool.reserve(None, Some(1024), None, None, None, &AtomicBool::default())
             .is_err()
     );
 }
@@ -242,7 +249,7 @@ fn blocked_reservations_sleep_and_wake_in_fifo_order() {
                 crate::pressure::now_ms()
             };
             let permit = pool
-                .reserve(Some(1), None, None, None, &AtomicBool::default())
+                .reserve(Some(1), None, None, None, None, &AtomicBool::default())
                 .unwrap()
                 .unwrap();
             admitted.send((index, permit)).unwrap();
@@ -304,7 +311,7 @@ fn a_waiting_reservation_recovers_a_silently_unlocked_lease() {
         admitted
             .send(
                 pool_at(&dir, 1, 0)
-                    .reserve(Some(1), None, None, None, &AtomicBool::default())
+                    .reserve(Some(1), None, None, None, None, &AtomicBool::default())
                     .unwrap()
                     .unwrap(),
             )
@@ -2539,6 +2546,7 @@ fn scheduler_stats_rank_live_waiters_by_ticket_and_exclude_grants() {
             Shape::Rigid,
             None,
             None,
+            None,
             ticket,
         );
         record.pid = Some(pid);
@@ -2564,6 +2572,7 @@ fn scheduler_stats_rank_live_waiters_by_ticket_and_exclude_grants() {
         None,
         0,
         Shape::Rigid,
+        None,
         None,
         None,
         5,
@@ -3058,6 +3067,8 @@ fn waiter(ticket: u64, weight: u64, domain: (&str, u64), build: Option<(&str, u6
         predicted_ms: None,
         decayed: None,
         handoff: None,
+        min: None,
+        party: None,
     }
 }
 fn vector_attempt(pool: &Pool, cpu: u64, memory_bytes: u64) -> Option<Permit> {
@@ -3183,6 +3194,7 @@ fn reservation_vector_and_legacy_charge_are_both_preserved() {
             Some(5 * GIB + 1),
             None,
             None,
+            None,
             &AtomicBool::default(),
         )
         .unwrap()
@@ -3199,7 +3211,7 @@ fn reservation_vector_and_legacy_charge_are_both_preserved() {
     assert_eq!(record.bytes_per_permit, GIB);
     drop(lease);
     let lease = pool
-        .reserve(Some(2), None, None, None, &AtomicBool::default())
+        .reserve(Some(2), None, None, None, None, &AtomicBool::default())
         .unwrap()
         .unwrap();
     let record: Lease = serde_json::from_slice(&std::fs::read(&lease.path).unwrap()).unwrap();
@@ -3212,7 +3224,7 @@ fn reservation_vector_and_legacy_charge_are_both_preserved() {
     );
     drop(lease);
     let lease = pool
-        .reserve(None, Some(GIB), None, None, &AtomicBool::default())
+        .reserve(None, Some(GIB), None, None, None, &AtomicBool::default())
         .unwrap()
         .unwrap();
     let record: Lease = serde_json::from_slice(&std::fs::read(&lease.path).unwrap()).unwrap();
@@ -3701,7 +3713,7 @@ fn legacy_lease_and_waiter_schema_is_preserved_across_estimator_demands_and_limi
             let memory = (unit > 0).then_some(3 * unit + 1);
             let reservation_weight = 2.max(memory.map_or(0, |bytes| bytes.div_ceil(unit)));
             assert_eq!(
-                pool.reservation_weight(Some(2), memory).unwrap(),
+                pool.reservation_weight(Some(2), memory, None).unwrap(),
                 reservation_weight
             );
             assert_legacy_record_fields(
@@ -5177,6 +5189,174 @@ fn an_admission_pass_grants_what_the_pool_rule_admits() {
     }
 }
 
+#[test]
+fn a_reservation_gathers_its_minimum_before_it_starts() {
+    let gathering = PassContext {
+        now_ms: 1_000,
+        available_memory: None,
+        single: false,
+    };
+    let at = |now_ms| PassContext {
+        now_ms,
+        ..gathering
+    };
+    // A `normal` reservation of one run's endpoint (`party`), asked at 0.
+    let reservation = |ticket, cpu, party: &str| Waiting {
+        shape: Some(Shape::Moldable),
+        priority: "normal".into(),
+        first_arrival_ms: Some(0),
+        party: Some(party.into()),
+        ..pass_record(ticket, cpu, 0, true)
+    };
+    // cargo-test-host: the whole pool asked, four cores its least, no
+    // prediction, so the run's short leaves sort before it.
+    let suite = |ticket| Waiting {
+        min: Some(4),
+        ..reservation(ticket, 18, "gate")
+    };
+    // A short leaf of a run, asked later: one core, predicted at a second.
+    let leaf = |ticket, party| Waiting {
+        predicted_ms: Some(1_000),
+        first_arrival_ms: Some(1_000),
+        ..reservation(ticket, 1, party)
+    };
+    // A later low request, rigid, of a Cargo build no run names.
+    let low = |ticket| Waiting {
+        first_arrival_ms: Some(1_000),
+        ..pass_record(ticket, 1, 0, true)
+    };
+    let cases = [
+        PassCase {
+            name: "short of its minimum, it gathers rather than start on the one core free",
+            live: vec![(1, 0); 17],
+            queue: vec![],
+            request: suite(NEW),
+            context: gathering,
+            granted: vec![],
+        },
+        PassCase {
+            name: "with three more freed, it starts on the four, ahead of a later leaf of its run",
+            live: vec![(1, 0); 14],
+            queue: vec![suite(1)],
+            request: leaf(NEW, "gate"),
+            context: gathering,
+            granted: vec![(1, false, 4)],
+        },
+        PassCase {
+            name: "while it gathers, a later low request waits",
+            live: vec![(1, 0); 17],
+            queue: vec![suite(1)],
+            request: low(NEW),
+            context: gathering,
+            granted: vec![],
+        },
+        PassCase {
+            name: "and so does a later leaf of its own run",
+            live: vec![(1, 0); 17],
+            queue: vec![suite(1)],
+            request: leaf(NEW, "gate"),
+            context: gathering,
+            granted: vec![],
+        },
+        PassCase {
+            name: "but a leaf of another run is admitted",
+            live: vec![(1, 0); 17],
+            queue: vec![suite(1)],
+            request: leaf(NEW, "other"),
+            context: gathering,
+            granted: vec![(NEW, true, 1)],
+        },
+        PassCase {
+            name: "an earlier leaf of its own run is not held",
+            live: vec![(1, 0); 16],
+            queue: vec![
+                Waiting {
+                    first_arrival_ms: Some(0),
+                    ..leaf(1, "gate")
+                },
+                suite(2),
+            ],
+            request: low(NEW),
+            context: gathering,
+            granted: vec![(1, false, 1)],
+        },
+        PassCase {
+            name: "a reservation in a Cargo build is not passed by that build's later compiles",
+            live: vec![(1, 0); 17],
+            queue: vec![Waiting {
+                party: Some("run".into()),
+                ..suite(1)
+            }],
+            request: Waiting {
+                priority: "normal".into(),
+                predicted_ms: Some(1_000),
+                ..low(NEW)
+            },
+            context: gathering,
+            granted: vec![],
+        },
+        PassCase {
+            name: "a millisecond short of the aging bound it still gathers",
+            live: vec![(1, 0); 17],
+            queue: vec![suite(1)],
+            request: low(NEW),
+            context: at(AGING_MS - 1),
+            granted: vec![],
+        },
+        PassCase {
+            name: "at the aging bound it starts on what is free",
+            live: vec![(1, 0); 17],
+            queue: vec![suite(1)],
+            request: low(NEW),
+            context: at(AGING_MS),
+            granted: vec![(1, false, 1)],
+        },
+        PassCase {
+            name: "with its minimum free it starts at once on all that is free, its ask a ceiling",
+            live: vec![(1, 0); 8],
+            queue: vec![suite(1)],
+            request: low(NEW),
+            context: gathering,
+            granted: vec![(1, false, 10)],
+        },
+        PassCase {
+            name: "a minimum above its build's ceiling waits only for that ceiling",
+            live: vec![],
+            queue: vec![Waiting {
+                build: Some(("suite".into(), 2)),
+                ..suite(1)
+            }],
+            request: low(NEW),
+            context: gathering,
+            granted: vec![(1, false, 2), (NEW, true, 1)],
+        },
+        PassCase {
+            name: "a minimum of one is no minimum",
+            live: vec![(1, 0); 17],
+            queue: vec![Waiting {
+                min: Some(1),
+                ..suite(1)
+            }],
+            request: low(NEW),
+            context: gathering,
+            granted: vec![(1, false, 1)],
+        },
+    ];
+    let failed: Vec<String> = cases
+        .iter()
+        .filter_map(|case| {
+            let granted = pass_grants(case);
+            (granted != case.granted).then(|| {
+                format!(
+                    "{}: granted {granted:?}, expected {:?}",
+                    case.name, case.granted
+                )
+            })
+        })
+        .collect();
+    assert!(failed.is_empty(), "{failed:#?}");
+}
+
 /// The `predicted_ms` of each admission in `dir`'s decision log, by name.
 fn admitted_predictions(dir: &Path) -> Vec<(String, Option<u64>)> {
     std::fs::read_to_string(dir.join("decisions.jsonl"))
@@ -5253,6 +5433,7 @@ fn an_interactive_request_decays_by_its_jobs_age_when_it_asks() {
     drop(
         pool.reserve(
             Some(1),
+            None,
             None,
             Some("reservation"),
             Some(NOW - NORMAL_UNTIL_MS),
