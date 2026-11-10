@@ -2004,6 +2004,129 @@ fn evicts_objects_no_live_checkout_needs_before_older_rooted_ones() {
     );
 }
 
+/// Backdate a result and every object it names, as if it was stored `ago`
+/// and nothing has used it since.
+fn age_stored_result(store: &Path, action: &CacheDigest, ago: Duration) {
+    let cas = LocalCas::new(store);
+    let results = LocalActionCache::new(store);
+    let root = results.find(action).unwrap().unwrap().output_root.unwrap();
+    let tree: CacheDirectory =
+        serde_json::from_slice(&std::fs::read(cas.path_for(&root).unwrap()).unwrap()).unwrap();
+    let outputs = tree.files.into_iter().map(|file| file.digest);
+    for digest in [action.clone(), root].into_iter().chain(outputs) {
+        age(store, &digest, ago);
+    }
+    age_result(store, action, ago);
+}
+
+/// Record that the last sweep finished `ago`.
+fn stamp_last_sweep(store: &Path, ago: Duration) {
+    record_sweep(store).unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(store.join(SWEEP_STAMP))
+        .unwrap()
+        .set_modified(SystemTime::now() - ago)
+        .unwrap();
+}
+
+/// The bytes a result and the objects it names hold in the store.
+fn result_bytes(store: &Path, action: &CacheDigest) -> u64 {
+    let cas = LocalCas::new(store);
+    let results = LocalActionCache::new(store);
+    let size = |path: PathBuf| std::fs::metadata(path).unwrap().len();
+    let root = results.find(action).unwrap().unwrap().output_root.unwrap();
+    let tree: CacheDirectory =
+        serde_json::from_slice(&std::fs::read(cas.path_for(&root).unwrap()).unwrap()).unwrap();
+    [action.clone(), root]
+        .into_iter()
+        .chain(tree.files.into_iter().map(|file| file.digest))
+        .map(|digest| size(cas.path_for(&digest).unwrap()))
+        .sum::<u64>()
+        + size(results.path_for(action).unwrap())
+}
+
+/// A result stored since the last sweep outlives an older rooted one.
+///
+/// Two live checkouts of one task build the same invocation, and the later
+/// build's prediction replaces the earlier one in the task's manifest, so the
+/// earlier result is rooted by nothing. On 2026-11-10 a sweep evicted the
+/// `containium` binary (216.6 MB) 35 minutes after a build stored it, and
+/// the next gate built it again: every unrooted object went before any
+/// rooted one, whatever its age.
+#[test]
+fn a_result_stored_since_the_last_sweep_outlives_an_older_rooted_one() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = directory.path().join("store");
+    let [owner, first, second] = ["owner", "first", "second"].map(|name| {
+        let checkout = directory.path().join(name);
+        std::fs::create_dir_all(&checkout).unwrap();
+        checkout
+    });
+    let old_output = store_object(&store, b"old output bytes");
+    let old = store_result(&store, "old action", std::slice::from_ref(&old_output));
+    record_build(&store, &"c".repeat(64), &owner, std::slice::from_ref(&old));
+    age_stored_result(&store, &old, Duration::from_secs(3 * 60 * 60));
+    stamp_last_sweep(&store, Duration::from_secs(50 * 60));
+
+    let task = "d".repeat(64);
+    let fresh_output = store_object(&store, b"new output bytes");
+    let fresh = store_result(&store, "new action", std::slice::from_ref(&fresh_output));
+    record_build(&store, &task, &first, std::slice::from_ref(&fresh));
+    age_stored_result(&store, &fresh, Duration::from_secs(35 * 60));
+    let later = store_result(&store, "later action", &[]);
+    record_build(&store, &task, &second, std::slice::from_ref(&later));
+    assert_eq!(result_bytes(&store, &old), result_bytes(&store, &fresh));
+
+    let total = stats(&store).unwrap().total_bytes();
+    gc(&store, total - result_bytes(&store, &old)).unwrap();
+
+    let results = LocalActionCache::new(&store);
+    assert!(
+        results.find(&fresh).unwrap().is_some(),
+        "the result stored since the last sweep is kept"
+    );
+    assert!(
+        LocalCas::new(&store).find(&fresh_output).unwrap().is_some(),
+        "and so is its output"
+    );
+    assert!(
+        results.find(&old).unwrap().is_none(),
+        "the rooted result nobody used since the last sweep goes instead"
+    );
+}
+
+/// A hit refreshes its result and the blobs its restore reads, but nothing
+/// reads the descriptor blob the result is named after, and the result goes
+/// with that blob. Ranked by its own use the descriptor of a result hit a
+/// minute ago looked as old as its first store, and the sweep took it first.
+#[test]
+fn a_result_hit_a_minute_ago_keeps_its_descriptor() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = directory.path();
+    let hit_output = store_object(store, b"hit output bytes");
+    let hit = store_result(store, "hit action", std::slice::from_ref(&hit_output));
+    age_stored_result(store, &hit, Duration::from_secs(60));
+    age(store, &hit, Duration::from_secs(3 * 60 * 60));
+    let cold_output = store_object(store, b"old output bytes");
+    let cold = store_result(store, "old action", std::slice::from_ref(&cold_output));
+    age_stored_result(store, &cold, Duration::from_secs(2 * 60 * 60));
+    assert_eq!(result_bytes(store, &hit), result_bytes(store, &cold));
+
+    let total = stats(store).unwrap().total_bytes();
+    gc(store, total - result_bytes(store, &cold)).unwrap();
+
+    let results = LocalActionCache::new(store);
+    assert!(
+        results.find(&hit).unwrap().is_some(),
+        "the result hit a minute ago is kept"
+    );
+    assert!(
+        results.find(&cold).unwrap().is_none(),
+        "the result nobody used for two hours goes instead"
+    );
+}
+
 #[test]
 fn keeps_rooting_when_a_sibling_worktree_survives() {
     let directory = tempfile::tempdir().unwrap();
