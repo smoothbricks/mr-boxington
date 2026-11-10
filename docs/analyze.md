@@ -108,6 +108,16 @@ most 256 of them; [`gc.events_max_age`](/configuration#gc-events-max-age) and
 [`gc.events_max_sessions`](/configuration#gc-events-max-sessions) change those
 limits.
 
+A build-script run is compared the same way. Its unit is its package directory
+and the target it runs for, and its recorded key details are the compiled
+script (`build script binary`), every variable Cargo sets for it or it declared
+with `rerun-if-env-changed` (`environment <NAME>`, counted under
+`environment changed`), every path it declared with `rerun-if-changed` (its
+package directory when it declared none), and what keeps its result to one
+checkout (`out dir`, `checkout`) or archive policy (`archive timestamps`). An
+edited `build.rs` or build dependency reads as `other key details changed`
+with `changed: build script binary`.
+
 ## Critical path
 
 After the causes, the report lists the chain of units the build waited on. A
