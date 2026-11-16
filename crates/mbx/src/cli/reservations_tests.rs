@@ -89,6 +89,20 @@ async fn queued(dir: &Path, requests: usize) {
     }
 }
 
+#[tokio::test]
+async fn a_client_learns_that_this_mbx_gates_tests() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut client = Client::connect(&pools(dir.path(), 2));
+    client.send(json!({"type": "capabilities"})).await;
+    assert_eq!(
+        client.reply().await,
+        Some(json!({"type": "capabilities", "test_gate": true}))
+    );
+    // The connection keeps serving.
+    client.send(reserve(1, 1, "low")).await;
+    assert_eq!(client.reply().await, granted(1, 1));
+    client.close().await;
+}
 #[test]
 fn a_request_is_exactly_one_of_the_protocol_lines() {
     for (line, request) in [
