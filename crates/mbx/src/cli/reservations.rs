@@ -22,6 +22,9 @@
 //!   answered `{"type":"refused","id":N,"error":"..."}`.
 //! - `{"type":"release","id":N}` gives grant `N` back, or withdraws it while it
 //!   still waits. It has no reply.
+//! - `{"type":"capabilities"}` is answered
+//!   `{"type":"capabilities","test_gate":true}`: this mbx's test shim asks the
+//!   gate `MBX_TEST_GATE` names before it starts a nextest test.
 //!
 //! A connection holds any number of grants at once, each under the id its
 //! client chose; an id is free again once released. Replies come in the order
@@ -85,6 +88,8 @@ pub(super) enum Request {
     },
     /// Give grant `id` back, or withdraw it while it waits.
     Release { id: u64 },
+    /// What this server's mbx does that a client may rely on.
+    Capabilities,
 }
 
 /// One line the server answers.
@@ -97,6 +102,9 @@ pub(super) enum Reply {
     Refused { id: u64, error: String },
     /// The client broke the protocol; the connection closes after this line.
     Error { error: String },
+    /// This mbx's test shim asks `MBX_TEST_GATE` before it starts a nextest
+    /// test (`cli/test_runner.rs`).
+    Capabilities { test_gate: bool },
 }
 
 /// The pool at each priority a request may name: the same pools
@@ -342,6 +350,7 @@ impl Connection {
                 Some(_) => Step::Quiet,
                 None => Step::Close(format!("no reservation {id} on this connection to release")),
             },
+            Ok(Request::Capabilities) => Step::Say(Reply::Capabilities { test_gate: true }),
             Err(error) => Step::Close(format!("not a reservation request: {error}")),
         }
     }

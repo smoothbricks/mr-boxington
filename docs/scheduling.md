@@ -546,6 +546,11 @@ request, a second live request under one id, or a release of an id the
 connection does not hold is answered `{"type":"error","error":"..."}`, and the
 connection is closed with the same effect.
 
+`{"type":"capabilities"}` is answered
+`{"type":"capabilities","test_gate":true}` by an mbx whose test runner asks a
+[test gate](#schedule-test-binaries) before it starts a nextest test; an mbx
+that does not know the request answers an error and closes the connection.
+
 A served reservation runs no command, so mbx sets no `MBX_RESERVE_CPUS` and
 announces nothing on a grant descriptor: the client hands the granted count to
 the work it starts, as `mbx reserve` hands its command `MBX_RESERVE_CPUS`, and
@@ -627,6 +632,19 @@ sets `terminate-after`, leave room in it for queueing, or lower nextest's
 such as one that stops a test run making no progress, can tell queued tests
 from running ones with a
 [grant descriptor](#tell-a-supervisor-when-work-holds-capacity).
+
+A supervisor that holds a reservation for a whole nextest run can admit its
+tests itself. With `MBX_TEST_GATE=<unix socket>` in the run's environment,
+mbx's runner connects to that socket before it starts each nextest test,
+after the pool has admitted the test where the pool admits tests, writes one
+line, `{"binary":"<NEXTEST_BINARY_ID>","test":"<NEXTEST_TEST_NAME>"}`, starts
+the test when the line `go` answers, and keeps the connection open until the
+test has exited, so the gate reads a test's end, or its death, as the
+connection's end. A gate that cannot be reached, that closes before it
+answers, or that answers anything else fails the test, naming the gate, and
+the test does not start. The test's own processes do not inherit the
+variable. The wait counts toward nextest's `slow-timeout` as a wait for
+permits does. Cargo test binaries, listings and doctests ask no gate.
 
 Builds a test starts, such as trybuild or compile-fail suites, are charged to
 the test's permits and run without taking permits of their own.

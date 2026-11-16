@@ -228,7 +228,9 @@ pub fn dispatch() -> Option<ExitCode> {
             .env(crate::scheduler::SCHED_DIR_ENV, "")
             .env("MBX_SCHEDULER", "0")
             .env("MBX_CONTROL_CHILD", "1")
-            .env_remove(RUNNERS);
+            .env_remove(RUNNERS)
+            // The gate is this test's own: what the test starts asks nothing.
+            .env_remove(TEST_GATE);
         for (key, value) in &overlay.restore {
             match value {
                 Some(value) => command.env(key, value),
@@ -275,11 +277,24 @@ pub fn dispatch() -> Option<ExitCode> {
                 }?;
                 Some((demand, permit))
             });
+        // A supervisor's gate, when one is named: the test starts once it says
+        // so. Asked after admission, so a test holds no place at the gate
+        // while it waits for permits.
+        let gate = match (std::env::var_os(TEST_GATE), &nextest_identity) {
+            (Some(socket), Some(_)) if !socket.is_empty() => Some(pass_gate(
+                Path::new(&socket),
+                std::env::var("NEXTEST_BINARY_ID").ok().as_deref(),
+                std::env::var("NEXTEST_TEST_NAME").ok().as_deref(),
+            )?),
+            _ => None,
+        };
         let started = std::time::Instant::now();
         let status = command
             .status()
             .wrap_err_with(|| format!("failed to run {}", Path::new(&executable).display()))?;
         let wall = started.elapsed();
+        // The gate's connection ends here, with the test: its end is the test's.
+        drop(gate);
         if let Some((demand, permit)) = permit {
             // A run that exited on its own, failing tests included, ran the
             // whole suite; one a signal stopped, or one narrowed to some of
@@ -479,6 +494,58 @@ const WAIT_NOTICE: std::time::Duration = std::time::Duration::from_secs(1);
 /// while it was still queued says so instead of looking like it hung. The
 /// notice is printed while the wait is still going, because the kill
 /// arrives before admission would have returned.
+/// A supervisor's gate for nextest tests: a Unix socket the shim asks before
+/// it starts each test.
+const TEST_GATE: &str = "MBX_TEST_GATE";
+/// The line that starts a test.
+const GATE_GO: &str = "go";
+
+/// Ask the gate at `socket` to start nextest's test `test` of `binary`, and
+/// return the connection once it says to: its holder keeps it until the test
+/// has exited, so the gate reads the test's end as the connection's.
+///
+/// A gate that cannot be reached, that closes before it answers, or that
+/// answers anything else fails the test and starts nothing: a runner whose
+/// supervisor counts on the gate never runs a test the gate did not start.
+/// The wait itself has no bound of the shim's: the gate answers when its
+/// supervisor has capacity for the test, as the pool's admission does.
+#[cfg(unix)]
+fn pass_gate(
+    socket: &Path,
+    binary: Option<&str>,
+    test: Option<&str>,
+) -> Result<std::os::unix::net::UnixStream> {
+    use std::io::{BufRead as _, Write as _};
+    let (Some(binary), Some(test)) = (binary, test) else {
+        eyre::bail!(
+            "{TEST_GATE} names a gate, and nextest named no NEXTEST_BINARY_ID and NEXTEST_TEST_NAME to ask it with"
+        );
+    };
+    let mut stream = std::os::unix::net::UnixStream::connect(socket)
+        .wrap_err_with(|| format!("could not reach the test gate {}", socket.display()))?;
+    let line = serde_json::json!({ "binary": binary, "test": test });
+    writeln!(stream, "{line}")
+        .wrap_err_with(|| format!("could not ask the test gate {}", socket.display()))?;
+    let mut answer = String::new();
+    std::io::BufReader::new(&stream)
+        .read_line(&mut answer)
+        .wrap_err_with(|| format!("could not read the test gate {}", socket.display()))?;
+    if answer.trim_end() != GATE_GO {
+        eyre::bail!(
+            "the test gate {} did not start {binary} {test}: it answered {answer:?}",
+            socket.display()
+        );
+    }
+    Ok(stream)
+}
+
+#[cfg(not(unix))]
+fn pass_gate(socket: &Path, _binary: Option<&str>, _test: Option<&str>) -> Result<()> {
+    eyre::bail!(
+        "{TEST_GATE} names the gate {}, a Unix socket, which this platform does not have",
+        socket.display()
+    )
+}
 fn admit_nextest(
     pool: &crate::scheduler::Pool,
     demand: &crate::scheduler::Demand,
@@ -518,6 +585,76 @@ mod tests {
         values.iter().map(OsString::from).collect()
     }
 
+    /// A gate that reads one line and answers `answer`, or closes unanswered.
+    #[cfg(unix)]
+    fn gate(
+        answer: Option<&'static str>,
+    ) -> (
+        tempfile::TempDir,
+        PathBuf,
+        std::thread::JoinHandle<(String, bool)>,
+    ) {
+        use std::io::{BufRead as _, Read as _, Write as _};
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("g.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let served = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            std::io::BufReader::new(&stream)
+                .read_line(&mut line)
+                .unwrap();
+            let Some(answer) = answer else {
+                return (line, false);
+            };
+            writeln!(stream, "{answer}").unwrap();
+            // The shim's end of the connection is the test's end.
+            let ended = stream.read(&mut [0; 1]).unwrap() == 0;
+            (line, ended)
+        });
+        (dir, socket, served)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_gated_test_starts_once_its_gate_says_so_and_holds_the_connection_until_it_ends() {
+        let (_dir, socket, served) = gate(Some("go"));
+        let held = pass_gate(&socket, Some("pkg::bin"), Some("mod::case")).unwrap();
+        drop(held);
+        let (line, ended) = served.join().unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&line).unwrap(),
+            serde_json::json!({"binary": "pkg::bin", "test": "mod::case"})
+        );
+        assert!(ended);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_gate_that_is_gone_closes_unanswered_or_answers_otherwise_fails_the_test_by_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let absent = pass_gate(&dir.path().join("absent.sock"), Some("b"), Some("t")).unwrap_err();
+        assert!(format!("{absent:#}").contains("could not reach the test gate"));
+
+        let (_dir, socket, served) = gate(None);
+        let closed = pass_gate(&socket, Some("b"), Some("t")).unwrap_err();
+        assert!(
+            format!("{closed:#}").contains("did not start b t"),
+            "{closed:#}"
+        );
+        served.join().unwrap();
+
+        let (_dir, socket, served) = gate(Some("wait"));
+        let other = pass_gate(&socket, Some("b"), Some("t")).unwrap_err();
+        assert!(
+            format!("{other:#}").contains("it answered \"wait\\n\""),
+            "{other:#}"
+        );
+        served.join().unwrap();
+
+        let unnamed = pass_gate(&socket, None, Some("t")).unwrap_err();
+        assert!(format!("{unnamed:#}").contains("NEXTEST_BINARY_ID"));
+    }
     #[test]
     fn cargo_test_and_nextest_commands_are_wrapped() {
         assert!(wraps(&strings(&["test"])));
