@@ -1607,18 +1607,16 @@ fn collect_with(
     // Cargo's locks and the process scan keep one in use, as for any other.
     for (record_path, directory) in untracked_views(root)? {
         total_views += 1;
-        let files = ledger.measure(&directory, &HashSet::new());
-        // Only a limit looks at it, so a collection with none does not walk
-        // the tree a second time.
-        let (changed, seen) = if max_bytes.is_some() || max_age.is_some() {
-            // An age that could not be read is no age: kept from the budget
-            // as well, where ranking it newest would still let it go.
-            let Some(secs) = newest_modification(&directory) else {
+
+        let (files, changed, seen) = if max_bytes.is_some() || max_age.is_some() {
+            let (files, age) = ledger.measure_with_age(&directory);
+            // An unreadable age still contributes measured bytes, but cannot select a target.
+            let Some(secs) = age else {
                 continue;
             };
-            (secs.min(now), secs)
+            (files, secs.min(now), secs)
         } else {
-            (now, now)
+            (ledger.measure(&directory, &HashSet::new()), now, now)
         };
         entries.push((
             record_path,
@@ -2116,7 +2114,7 @@ fn newest_modification(directory: &Path) -> Option<u64> {
             .and_then(|metadata| metadata.modified())
             .ok()?;
         newest = newest.max(Some(modified));
-        for entry in std::fs::read_dir(&current).ok()? {
+        for entry in crate::disk_usage::read_tree_dir(&current).ok()? {
             let entry = entry.ok()?;
             if entry.file_type().ok()?.is_dir() {
                 pending.push(entry.path());

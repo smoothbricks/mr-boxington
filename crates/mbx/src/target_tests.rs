@@ -1771,6 +1771,114 @@ fn a_dry_run_weighs_shared_files_like_a_real_one() {
     assert!(first.join("own").exists());
 }
 
+#[test]
+fn untracked_target_size_and_age_use_one_initial_directory_walk() {
+    let root = tempfile::tempdir().unwrap();
+    let config = test_config(root.path(), true);
+    let view = view_with(root.path(), &config, "untracked", 1, &[]);
+    std::fs::remove_file(view.with_extension("json")).unwrap();
+    let nested = view.join("debug/deps");
+    std::fs::create_dir_all(&nested).unwrap();
+    std::fs::write(nested.join("artifact"), b"held").unwrap();
+
+    let before = crate::disk_usage::directory_listings();
+    let outcome = collect(&config.target.root, Some(4), None, true).unwrap();
+    let listings = crate::disk_usage::directory_listings() - before;
+    assert_eq!(outcome.remaining_bytes, 4);
+    assert_eq!(outcome.removed_views, 0);
+    assert_eq!(
+        listings, 3,
+        "the view, debug and deps each need one listing"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn an_untracked_target_with_no_representable_age_counts_toward_the_budget_but_stays() {
+    let root = tempfile::tempdir().unwrap();
+    let config = test_config(root.path(), true);
+    let view = view_with(root.path(), &config, "untracked", 1, &[("artifact", 4)]);
+    std::fs::remove_file(view.with_extension("json")).unwrap();
+    // The existing policy only ranks times representable as seconds since the epoch.
+    for path in [view.join("artifact"), view.clone()] {
+        filetime::set_file_mtime(path, filetime::FileTime::from_unix_time(-1, 0)).unwrap();
+    }
+
+    let outcome = collect_short(&config.target.root, Some(0), true);
+    assert_eq!(outcome.remaining_bytes, 4);
+    assert_eq!(outcome.removed_views, 0);
+    assert!(view.join("artifact").exists());
+}
+
+#[test]
+fn a_nested_untracked_target_edit_under_reservation_prevents_collection() {
+    let root = tempfile::tempdir().unwrap();
+    let config = test_config(root.path(), true);
+    let view = view_with(root.path(), &config, "untracked", 1, &[]);
+    std::fs::remove_file(view.with_extension("json")).unwrap();
+    let nested = view.join("debug/deps");
+    std::fs::create_dir_all(&nested).unwrap();
+    let artifact = nested.join("artifact");
+    std::fs::write(&artifact, b"held").unwrap();
+    let now = now_secs();
+    let outcome = collect_with(
+        &config.target.root,
+        Some(0),
+        None,
+        &Precedence::default(),
+        Urgency::ShortDisk,
+        false,
+        now,
+        || {},
+        |reserved| {
+            assert_eq!(reserved, view);
+            let edited = std::fs::File::options()
+                .write(true)
+                .open(&artifact)
+                .unwrap();
+            std::io::Write::write_all(&mut &edited, b"edit").unwrap();
+            edited
+                .set_modified(UNIX_EPOCH + Duration::from_secs(now + 5))
+                .unwrap();
+        },
+        || {},
+    )
+    .unwrap();
+    assert_eq!(outcome.kept_active_views, 1);
+    assert_eq!(outcome.removed_views, 0);
+    assert_eq!(std::fs::read(artifact).unwrap(), b"edit");
+}
+
+#[cfg(unix)]
+#[test]
+fn short_disk_removes_untracked_target_bytes_without_releasing_the_kept_link() {
+    let root = tempfile::tempdir().unwrap();
+    let config = test_config(root.path(), true);
+    let kept = view_with(root.path(), &config, "kept", 1, &[("shared", 100)]);
+    let untracked = view_with(root.path(), &config, "untracked", 2, &[("own", 7)]);
+    std::fs::remove_file(untracked.with_extension("json")).unwrap();
+    std::fs::hard_link(kept.join("shared"), untracked.join("shared")).unwrap();
+    let precedence = Precedence {
+        keep: vec![PathBuf::from("kept")],
+        ..Precedence::default()
+    };
+    let outcome = collect_by(
+        &config.target.root,
+        Some(100),
+        None,
+        &precedence,
+        Urgency::ShortDisk,
+        false,
+    )
+    .unwrap();
+    assert_eq!(outcome.removed_untracked_views, 1);
+    assert_eq!(outcome.removed_bytes, 7);
+    assert_eq!(outcome.released_bytes, 7);
+    assert_eq!(outcome.remaining_bytes, 100);
+    assert!(!untracked.exists());
+    assert!(kept.join("shared").exists());
+}
+
 /// A size budget keeps every view of a checkout that is present and takes
 /// those of checkouts out of reach, least recently used first.
 #[cfg(unix)]

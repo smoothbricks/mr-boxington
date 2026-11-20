@@ -426,6 +426,13 @@ that warning to the next build's report. Instead it writes it to
 `gc/v1/sweep.log` in the directory `mbx cache dir` prints, and each sweep starts
 that log afresh.
 
+A managed target directory whose record is missing is ranked by the newest
+modification time in its tree. Collection measures its size and age in one
+pass. If part of it cannot be read, the observed bytes still count toward the
+budget, but the unknown age is not a reason to remove it. Before removing a
+selected untracked directory, collection rechecks that it has not changed and
+that no checkout has claimed it.
+
 Removing a target directory never removes cached compilations from the store.
 When the store itself must shrink, compilations stored or used since the last
 sweep finished go last, whichever checkout built them: another checkout of the

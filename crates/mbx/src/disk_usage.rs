@@ -17,6 +17,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::time::UNIX_EPOCH;
 
 /// One file, however many paths reach it.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -169,42 +170,85 @@ impl Ledger {
     /// link's target is either inside a measured tree and counted there, or
     /// outside it and not ours to count.
     pub(crate) fn measure(&mut self, root: &Path, excluded: &HashSet<PathBuf>) -> Measured {
+        self.measure_tree::<false>(root, excluded).0
+    }
+
+    /// Measure a directory and find the latest mtime of any entry in the same walk.
+    /// Unreadable entries leave the age unknown but do not discard measured bytes.
+    pub(crate) fn measure_with_age(&mut self, root: &Path) -> (Measured, Option<u64>) {
+        self.measure_tree::<true>(root, &HashSet::new())
+    }
+
+    fn measure_tree<const AGE: bool>(
+        &mut self,
+        root: &Path,
+        excluded: &HashSet<PathBuf>,
+    ) -> (Measured, Option<u64>) {
         let mut measured = Measured::default();
         if excluded.contains(root) {
-            return measured;
+            return (measured, None);
         }
         let Ok(metadata) = std::fs::symlink_metadata(root) else {
-            return measured;
+            return (measured, None);
         };
         if metadata.is_file() {
             self.add(&mut measured, || root.to_path_buf(), &metadata);
-            return measured;
         }
         if !metadata.is_dir() {
-            return measured;
+            return (measured, None);
         }
+        let mut newest = if AGE { metadata.modified().ok() } else { None };
         let mut pending = vec![root.to_path_buf()];
         while let Some(directory) = pending.pop() {
-            for entry in entries(&directory, warn_walk_error) {
+            let listing = match read_tree_dir(&directory) {
+                Ok(listing) => listing,
+                Err(error) => {
+                    warn_walk_error(&directory, &error);
+                    newest = None;
+                    continue;
+                }
+            };
+            for entry in listing {
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(error) => {
+                        warn_walk_error(&directory, &error);
+                        newest = None;
+                        continue;
+                    }
+                };
                 let Ok(kind) = entry.file_type() else {
+                    newest = None;
                     continue;
                 };
                 if kind.is_dir() {
                     let path = entry.path();
-                    if !excluded.contains(&path) {
-                        pending.push(path);
-                    }
-                } else if kind.is_file() {
-                    if !excluded.is_empty() && excluded.contains(&entry.path()) {
+                    if excluded.contains(&path) {
                         continue;
                     }
-                    if let Ok(metadata) = entry.metadata() {
+                    pending.push(path);
+                } else if kind.is_file() && !excluded.is_empty() && excluded.contains(&entry.path())
+                {
+                    continue;
+                }
+                if kind.is_file() || (AGE && newest.is_some()) {
+                    let Ok(metadata) = entry.metadata() else {
+                        newest = None;
+                        continue;
+                    };
+                    if AGE {
+                        newest = newest.zip(metadata.modified().ok()).map(|(a, b)| a.max(b));
+                    }
+                    if kind.is_file() {
                         self.add(&mut measured, || entry.path(), &metadata);
                     }
                 }
             }
         }
-        measured
+        let age = newest
+            .and_then(|mtime| mtime.duration_since(UNIX_EPOCH).ok())
+            .map(|since| since.as_secs());
+        (measured, age)
     }
 
     fn add(
@@ -611,12 +655,29 @@ fn entries_of(directory: &Path) -> Vec<std::fs::DirEntry> {
     entries(directory, warn_walk_error)
 }
 
+#[cfg(test)]
+thread_local! {
+    static DIRECTORY_LISTINGS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn directory_listings() -> usize {
+    DIRECTORY_LISTINGS.get()
+}
+
+/// Open one directory for a tree walk; tests count these opens.
+pub(crate) fn read_tree_dir(directory: &Path) -> std::io::Result<std::fs::ReadDir> {
+    #[cfg(test)]
+    DIRECTORY_LISTINGS.with(|counter| counter.set(counter.get() + 1));
+    std::fs::read_dir(directory)
+}
+
 /// The entries of `directory`, telling `warn` about any it cannot read.
 pub(crate) fn entries(
     directory: &Path,
     warn: impl Fn(&Path, &std::io::Error),
 ) -> Vec<std::fs::DirEntry> {
-    match std::fs::read_dir(directory) {
+    match read_tree_dir(directory) {
         Ok(listing) => listing
             .filter_map(|entry| match entry {
                 Ok(entry) => Some(entry),
