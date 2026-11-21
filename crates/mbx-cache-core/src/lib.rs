@@ -56,8 +56,8 @@ pub use agent::{
     FileDigestCache, FileDigestResolution, FileDigestScope, FileIdentity, FileObjectIdentity,
     FileSnapshot, IncrementalState, NoFileDigestCache, PinnedFile, PinnedState, RecordedFileDigest,
     RestoreStats, TaskManifestOverflow, ValidatedFileDigest, WrapperSpan, WrapperTiming,
-    digest_file,
-    digest_file_validated, is_task_identity, merge_task_action_predictions, task_manifest_actions,
+    digest_file, digest_file_validated, is_task_identity, merge_task_action_predictions,
+    task_manifest_actions,
 };
 pub use client::BlockingAgentClient;
 pub use imds::{InstanceRoleCredentials, TemporaryCredentials};

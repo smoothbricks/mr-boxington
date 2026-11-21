@@ -7487,7 +7487,7 @@ mod target_views {
         );
 
         // Once that final use expires, the lease must no longer prevent collection.
-        std::fs::write(&record, serde_json::to_vec(&fields).unwrap()).unwrap();
+        age_view_record(&view);
         backdate_runs(&view);
         let (gc_stdout, gc_stderr) = gc_expired_targets(store);
         assert!(
