@@ -1574,7 +1574,58 @@ const UNPUBLISHED_FLIGHT_MAX_AGE: Duration = Duration::from_secs(60 * 60);
 /// cannot be taken belongs to a live compilation and is left alone together
 /// with its record. A paced collector removes these files at
 /// [`FLIGHT_UNLINKS_PER_SECOND`](crate::store::unlink_pace::FLIGHT_UNLINKS_PER_SECOND).
+///
+/// A flight is judged from its lock's entry alone, and a flight in use by one
+/// lookup of that lock: a shared cache holds a quarter of a million of these
+/// files, nearly all of them in use. Nothing listed decides a removal; what
+/// goes is what [`unused_flight`] reads once the lock is held.
 pub(crate) fn prune_flights(cache_dir: &Path) {
+    prune_flights_with(cache_dir, |_| {});
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The flight files a sweep on this thread looked up.
+    static FLIGHT_LOOKUPS: std::cell::RefCell<std::collections::BTreeSet<PathBuf>> =
+        const { std::cell::RefCell::new(std::collections::BTreeSet::new()) };
+}
+
+/// How long ago a flight file last changed, `None` when it is not there. A
+/// timestamp in the future reads as just now.
+fn flight_file_age(path: &Path) -> Option<Duration> {
+    #[cfg(test)]
+    FLIGHT_LOOKUPS.with(|lookups| lookups.borrow_mut().insert(path.to_path_buf()));
+    std::fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .map(|modified| modified.elapsed().unwrap_or_default())
+}
+
+/// The ages of a flight's lock, prediction and attempt, when none of them
+/// has changed within the flight's limit; `None` for a flight still in use,
+/// decided by the first file that says so. A lock changed within the shorter
+/// limit keeps the flight under either.
+fn unused_flight(lock: &Path, record: &Path, attempt: &Path) -> Option<[Option<Duration>; 3]> {
+    let lock_age = flight_file_age(lock)?;
+    if lock_age <= UNPUBLISHED_FLIGHT_MAX_AGE {
+        return None;
+    }
+    let record_age = flight_file_age(record);
+    let limit = if record_age.is_some() {
+        FLIGHT_MAX_AGE
+    } else {
+        UNPUBLISHED_FLIGHT_MAX_AGE
+    };
+    let used = |age: Option<Duration>| age.is_some_and(|age| age <= limit);
+    if used(Some(lock_age)) || used(record_age) {
+        return None;
+    }
+    let attempt_age = flight_file_age(attempt);
+    (!used(attempt_age)).then_some([Some(lock_age), record_age, attempt_age])
+}
+
+/// [`prune_flights`], telling `locked` each flight whose lock it took.
+fn prune_flights_with(cache_dir: &Path, mut locked: impl FnMut(&Path)) {
     let dir = cache_dir.join(SCHEDULER_DIR).join(INFLIGHT_DIR);
     let unlink = |path: &Path| {
         use crate::store::unlink_pace::{FLIGHT_UNLINKS_PER_SECOND, remove_file_at};
@@ -1583,51 +1634,50 @@ pub(crate) fn prune_flights(cache_dir: &Path) {
     let Ok(entries) = std::fs::read_dir(&dir) else {
         return;
     };
-    // A timestamp in the future reads as just now.
-    let age = |path: &Path| {
-        std::fs::metadata(path)
-            .and_then(|metadata| metadata.modified())
-            .ok()
-            .map(|modified| modified.elapsed().unwrap_or_default())
-    };
-    let older_than = |path: &Path, limit: Duration| age(path).is_some_and(|age| age > limit);
     for entry in entries.flatten() {
         let path = entry.path();
         if path
             .extension()
             .is_some_and(|extension| extension == "prediction" || extension == "attempt")
         {
-            // Swept with its lock below while the lock exists; on its own it
+            // Judged with its lock below while the lock exists; on its own it
             // is a leftover from an interrupted sweep.
-            if older_than(&path, FLIGHT_MAX_AGE) && !path.with_extension("").exists() {
+            if flight_file_age(&path.with_extension("")).is_none()
+                && flight_file_age(&path).is_some_and(|age| age > FLIGHT_MAX_AGE)
+            {
                 unlink(&path);
             }
             continue;
         }
         let record = record_path(&path);
         let attempt = attempt_path(&path);
-        let limit = if record.exists() {
-            FLIGHT_MAX_AGE
-        } else {
-            UNPUBLISHED_FLIGHT_MAX_AGE
-        };
-        let used_within_limit = [&path, &record, &attempt]
-            .into_iter()
-            .any(|file| age(file).is_some_and(|age| age <= limit));
-        if used_within_limit {
+        if unused_flight(&path, &record, &attempt).is_none() {
             continue;
         }
         let Ok(mut lock) = fslock::LockFile::open(&path) else {
             continue;
         };
-        if lock.try_lock().is_ok_and(|taken| taken) {
-            unlink(&record);
-            unlink(&attempt);
-            // Closed before the removal, because Windows will not delete a
-            // file that is still open anywhere.
-            drop(lock);
-            unlink(&path);
+        if !lock.try_lock().is_ok_and(|taken| taken) {
+            continue;
         }
+        locked(&path);
+        // Read again now the lock is held. A compilation that released it
+        // after an unusable handoff publishes without it, and one may have
+        // joined, compiled and left since the ages above were read.
+        let Some([_, record_age, attempt_age]) = unused_flight(&path, &record, &attempt) else {
+            continue;
+        };
+        // A file that is not there takes no turn at the pace.
+        if record_age.is_some() {
+            unlink(&record);
+        }
+        if attempt_age.is_some() {
+            unlink(&attempt);
+        }
+        // Closed before the removal, because Windows will not delete a
+        // file that is still open anywhere.
+        drop(lock);
+        unlink(&path);
     }
 }
 

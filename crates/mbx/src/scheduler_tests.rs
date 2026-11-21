@@ -1190,6 +1190,118 @@ fn a_paced_flight_sweep_keeps_to_two_hundred_unlinks_a_second() {
     );
 }
 
+/// A flight's lock, prediction and attempt, each last changed that long ago;
+/// `None` leaves the file out.
+fn flight_files(cache: &Path, name: &str, ages: [Option<Duration>; 3]) -> [PathBuf; 3] {
+    let inflight = cache.join(SCHEDULER_DIR).join(INFLIGHT_DIR);
+    std::fs::create_dir_all(&inflight).unwrap();
+    let lock = inflight.join(name);
+    let files = [lock.clone(), record_path(&lock), attempt_path(&lock)];
+    for (path, age) in files.iter().zip(ages) {
+        if let Some(age) = age {
+            std::fs::write(path, b"").unwrap();
+            backdate(path, std::time::SystemTime::now() - age);
+        }
+    }
+    files
+}
+
+/// The flight files `sweep` looked up.
+fn flight_lookups(sweep: impl FnOnce()) -> std::collections::BTreeSet<PathBuf> {
+    FLIGHT_LOOKUPS.with(|lookups| lookups.borrow_mut().clear());
+    sweep();
+    FLIGHT_LOOKUPS.with(|lookups| std::mem::take(&mut *lookups.borrow_mut()))
+}
+
+const MINUTE: Duration = Duration::from_secs(60);
+
+#[test]
+fn the_sweep_keeps_a_flight_used_within_the_hour_by_its_lock_alone() {
+    let cache = tempfile::tempdir().unwrap();
+    let flights = (0..50)
+        .map(|index| flight_files(cache.path(), &format!("rustc-{index}"), [Some(MINUTE); 3]))
+        .collect::<Vec<_>>();
+
+    let looked_up = flight_lookups(|| prune_flights(cache.path()));
+
+    let locks = flights.iter().map(|[lock, ..]| lock.clone()).collect();
+    assert_eq!(looked_up, locks, "one lookup decides a flight in use");
+    assert!(flights.iter().flatten().all(|file| file.exists()));
+}
+
+#[test]
+fn the_sweep_keeps_a_published_flight_idle_for_days_by_its_lock_and_prediction() {
+    let cache = tempfile::tempdir().unwrap();
+    let day = Some(Duration::from_secs(24 * 60 * 60));
+    let files = flight_files(cache.path(), "rustc-idle", [day; 3]);
+
+    let looked_up = flight_lookups(|| prune_flights(cache.path()));
+
+    assert_eq!(looked_up, files[..2].iter().cloned().collect());
+    assert!(files.iter().all(|file| file.exists()));
+}
+
+#[test]
+fn the_sweep_takes_a_flight_only_past_its_limit() {
+    let week = FLIGHT_MAX_AGE;
+    let hour = UNPUBLISHED_FLIGHT_MAX_AGE;
+    let within = |limit: Duration| Some(limit - MINUTE);
+    let past = |limit: Duration| Some(limit + MINUTE);
+    // The lock, the prediction and the attempt; whether the flight stays.
+    let cases = [
+        ([within(week), within(week), within(week)], true),
+        ([past(week), past(week), past(week)], false),
+        ([past(week), within(week), past(week)], true),
+        ([past(week), past(week), within(week)], true),
+        ([past(week), past(week), None], false),
+        ([within(hour), None, within(hour)], true),
+        ([past(hour), None, past(hour)], false),
+        ([past(hour), None, within(hour)], true),
+        ([within(hour), None, None], true),
+        ([past(hour), None, None], false),
+        // Left by an interrupted sweep, with no lock.
+        ([None, past(week), past(week)], false),
+        ([None, within(week), within(week)], true),
+        ([None, past(hour), past(hour)], true),
+    ];
+    for (ages, stays) in cases {
+        let cache = tempfile::tempdir().unwrap();
+        let files = flight_files(cache.path(), "rustc-flight", ages);
+        prune_flights(cache.path());
+        for (file, age) in files.iter().zip(ages) {
+            assert_eq!(file.exists(), stays && age.is_some(), "{ages:?} {file:?}");
+        }
+    }
+}
+
+#[test]
+fn a_flight_used_while_the_sweep_takes_its_lock_stays() {
+    let stale = Some(FLIGHT_MAX_AGE + MINUTE);
+    let idle = Some(UNPUBLISHED_FLIGHT_MAX_AGE + MINUTE);
+    // What the sweep listed, and the sidecar a compilation that released the
+    // lock early then writes: its prediction, or its next attempt.
+    let cases = [
+        ([stale, stale, stale], 1),
+        ([stale, stale, stale], 2),
+        ([idle, None, idle], 1),
+        ([idle, None, idle], 2),
+        ([idle, None, None], 1),
+    ];
+    for (ages, written) in cases {
+        let cache = tempfile::tempdir().unwrap();
+        let files = flight_files(cache.path(), "rustc-raced", ages);
+        prune_flights_with(cache.path(), |lock| {
+            assert_eq!(lock, files[0]);
+            std::fs::write(&files[written], b"fresh").unwrap();
+        });
+        assert!(files[0].exists(), "{ages:?}: the flight was just used");
+        assert_eq!(std::fs::read(&files[written]).unwrap(), b"fresh");
+        for (file, age) in files.iter().zip(ages) {
+            assert!(file.exists() || age.is_none(), "{ages:?} {file:?}");
+        }
+    }
+}
+
 #[test]
 fn an_oversized_payload_is_not_left_behind() {
     let directory = tempfile::tempdir().unwrap();
