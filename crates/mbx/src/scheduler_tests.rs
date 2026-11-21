@@ -4653,8 +4653,19 @@ fn a_waiting_compile_refreshes_its_plan_before_admission() {
         .unwrap();
     let held = pool.try_admit(9, None).unwrap().unwrap();
     let ledger_path = pool.ledger_path();
+    thread_local! {
+        static QUEUED: std::cell::Cell<Option<std::sync::mpsc::Sender<()>>> = const { std::cell::Cell::new(None) };
+    }
+    let (queued, published) = std::sync::mpsc::channel();
     let (send, receive) = std::sync::mpsc::channel();
     let worker = std::thread::spawn(move || {
+        QUEUED.set(Some(queued));
+        RECORD_AFTER_WRITE.set(Some(|path| {
+            if path.parent().and_then(Path::file_name) == Some(WAITERS_DIR.as_ref()) {
+                RECORD_AFTER_WRITE.set(None);
+                QUEUED.take().unwrap().send(()).unwrap();
+            }
+        }));
         let _permit = pool.admit(&demand).unwrap();
         let admission = demand.observation.get().unwrap();
         send.send((
@@ -4663,9 +4674,9 @@ fn a_waiting_compile_refreshes_its_plan_before_admission() {
         ))
         .unwrap();
     });
-    wait_until("the compile to queue", || {
-        scan_waiters(&directory.path().join(WAITERS_DIR)).is_ok_and(|waiters| !waiters.is_empty())
-    });
+    published
+        .recv_timeout(Duration::from_secs(30))
+        .expect("the compile published its waiter");
     ledger.memory_windows.insert(key, vec![10; 4]);
     // Windows refuses to replace a file the waiting compile has open while it
     // rereads history; production drops such a write, the test retries it.
