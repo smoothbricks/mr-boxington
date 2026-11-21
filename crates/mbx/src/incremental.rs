@@ -4,7 +4,7 @@ use crate::retired::{self, RetiredTree};
 use eyre::{Context, Result};
 use mbx_cache_core::CacheDigest;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -28,6 +28,8 @@ const LOCKS_DIR: &str = ".locks";
 const REGISTRAR_FILE: &str = "registrar.lock";
 const EPOCH_FILE: &str = "epoch";
 const COPY_STATE_EPOCH: u64 = 1;
+/// The record censuses real sweeps carry over, beside the checkouts.
+const CENSUS_FILE: &str = "records.json";
 
 #[derive(Serialize, Deserialize)]
 struct StateEpoch {
@@ -349,7 +351,15 @@ fn collect_with_retire_and_unlink(
     let Snapshot {
         entries,
         mut inodes,
+        censuses,
     } = entries(root, !dry_run)?;
+    if !dry_run
+        && let Some(censuses) = censuses
+        && let Err(error) = write_censuses(root, censuses)
+    {
+        // Nothing is lost but the next sweep's shortcut.
+        log::debug!("could not record the incremental record censuses: {error:#}");
+    }
     let mut remaining = entries
         .iter()
         .map(|entry| entry.units.len())
@@ -587,6 +597,15 @@ fn collect_with_retire_and_unlink(
         {
             continue;
         }
+        // A removal credits each file by its own last link, so a checkout
+        // counted by a census is measured before it goes.
+        let measured;
+        let files = if entry.carried > 0 {
+            measured = inodes.measure_carried(index, entry);
+            &measured
+        } else {
+            &entry.files
+        };
         let tree = if dry_run {
             None
         } else {
@@ -615,7 +634,7 @@ fn collect_with_retire_and_unlink(
         };
         drop(guard);
         let removed = if dry_run {
-            inodes.release(&entry.files);
+            inodes.release(files);
             true
         } else {
             tree.as_ref()
@@ -807,11 +826,15 @@ fn warn_walk_error(path: &Path, error: &std::io::Error) {
     }
 }
 
-/// A checkout's units, and the last-use stamps whose unit is gone.
-fn units(directory: &Path, inodes: &mut Inodes) -> (Vec<Unit>, Vec<(PathBuf, Vec<FileKey>)>) {
+/// A checkout's units, and the last-use stamps whose unit is gone, from one
+/// listing of its `blake3` directory.
+fn units(
+    listing: &[std::fs::DirEntry],
+    inodes: &mut Inodes,
+) -> (Vec<Unit>, Vec<(PathBuf, Vec<FileKey>)>) {
     let mut units = Vec::new();
     let mut orphans = Vec::new();
-    for entry in nested_entries(&directory.join("blake3")) {
+    for entry in listing {
         if retired::is_retired_name(&entry.file_name()) {
             continue;
         }
@@ -1338,24 +1361,228 @@ struct Entry {
     units: Vec<Unit>,
     orphan_stamps: Vec<(PathBuf, Vec<FileKey>)>,
     files: Vec<FileKey>,
+    /// The bytes of churn records a [`Census`] counts in place of `files`.
+    carried: u64,
     workspace_root: Option<PathBuf>,
+}
+
+impl Entry {
+    /// What the checkout's own measure leaves to its units, their records,
+    /// its orphan stamps and the retired sweep.
+    fn excluded(&self, retired: impl IntoIterator<Item = PathBuf>) -> HashSet<PathBuf> {
+        let mut excluded = self
+            .units
+            .iter()
+            .map(|unit| unit.directory.clone())
+            .collect::<HashSet<_>>();
+        excluded.extend(
+            self.units
+                .iter()
+                .flat_map(|unit| unit.records.iter().cloned()),
+        );
+        excluded.extend(self.orphan_stamps.iter().map(|(stamp, _)| stamp.clone()));
+        excluded.extend(retired);
+        excluded
+    }
+}
+
+/// A listing changed this recently can change again under the same
+/// timestamp, on a filesystem that keeps whole seconds or FAT's two, so it
+/// is measured rather than carried over.
+const CENSUS_SETTLE_SECS: u64 = 5;
+const CENSUS_VERSION: u8 = 1;
+
+/// What one listing of a unit-less checkout's `blake3` directory showed: the
+/// directory's own identity and modification time, read before the listing,
+/// and a digest of each churn record's name and inode.
+///
+/// A churn record is only ever published by renaming a finished temporary
+/// file over its name (`write_churn_state`), so the file a name and inode
+/// identify never changes length, and a record that is replaced, added or
+/// removed changes the digest. The time covers a filesystem that hands a
+/// replacement the inode number of the file it replaced.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct Witness {
+    directory: u64,
+    modified_secs: u64,
+    modified_nanos: u32,
+    listing: String,
+}
+
+/// The summed length of the churn records a [`Witness`] names, as a sweep
+/// measured them, each reached by no other measured path.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct Census {
+    #[serde(flatten)]
+    witness: Witness,
+    bytes: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+struct Censuses {
+    version: u8,
+    checkouts: BTreeMap<String, Census>,
+}
+
+/// A file this version cannot read is no census: every checkout is measured.
+fn read_censuses(root: &Path) -> BTreeMap<String, Census> {
+    std::fs::read(root.join(CENSUS_FILE))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Censuses>(&bytes).ok())
+        .filter(|censuses| censuses.version == CENSUS_VERSION)
+        .map(|censuses| censuses.checkouts)
+        .unwrap_or_default()
+}
+
+/// Published whole by rename, so sweeps and `mbx cache stats` running beside
+/// this one read the earlier censuses or these. Each is checked against its
+/// own listing before use, whichever sweep wrote it.
+fn write_censuses(root: &Path, checkouts: BTreeMap<String, Census>) -> Result<()> {
+    let censuses = Censuses {
+        version: CENSUS_VERSION,
+        checkouts,
+    };
+    crate::util::write_advisory(&root.join(CENSUS_FILE), &serde_json::to_vec(&censuses)?)
+}
+
+/// The inode a directory listing names for an entry, without looking the
+/// entry up.
+#[cfg(unix)]
+fn listed_inode(entry: &std::fs::DirEntry) -> Option<u64> {
+    use std::os::unix::fs::DirEntryExt as _;
+    Some(entry.ino())
+}
+
+#[cfg(not(unix))]
+fn listed_inode(_entry: &std::fs::DirEntry) -> Option<u64> {
+    None
+}
+
+/// The device and inode of a directory, which key the files a listing of it
+/// names.
+#[cfg(unix)]
+fn directory_identity(metadata: &std::fs::Metadata) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt as _;
+    Some((metadata.dev(), metadata.ino()))
+}
+
+#[cfg(not(unix))]
+fn directory_identity(_metadata: &std::fs::Metadata) -> Option<(u64, u64)> {
+    None
+}
+
+/// The churn records directly inside a unit-less checkout's `blake3`
+/// directory, as one listing names them.
+struct Records {
+    witness: Witness,
+    /// Each record's key, from the listing alone.
+    keys: Vec<FileKey>,
+    /// The directory's other entries, which are always measured.
+    strays: Vec<PathBuf>,
+}
+
+impl Records {
+    /// `None` where a listing does not name inodes, for a directory that
+    /// holds a unit or any other directory, and for one with no record.
+    fn list(directory: &std::fs::Metadata, listing: &[std::fs::DirEntry]) -> Option<Self> {
+        let (device, inode) = directory_identity(directory)?;
+        let modified = directory.modified().ok()?.duration_since(UNIX_EPOCH).ok()?;
+        let mut records = Vec::new();
+        let mut strays = Vec::new();
+        for entry in listing {
+            let name = entry.file_name();
+            if retired::is_retired_name(&name) {
+                continue;
+            }
+            let kind = entry.file_type().ok()?;
+            if kind.is_dir() {
+                return None;
+            }
+            if kind.is_file()
+                && Path::new(&name)
+                    .extension()
+                    .is_some_and(|kind| kind == "json")
+            {
+                records.push((name, listed_inode(entry)?));
+            } else {
+                strays.push(entry.path());
+            }
+        }
+        if records.is_empty() {
+            return None;
+        }
+        records.sort();
+        let mut listed = Vec::new();
+        for (name, inode) in &records {
+            listed.extend_from_slice(&inode.to_le_bytes());
+            listed.extend_from_slice(name.as_encoded_bytes());
+            listed.push(0);
+        }
+        Some(Self {
+            witness: Witness {
+                directory: inode,
+                modified_secs: modified.as_secs(),
+                modified_nanos: modified.subsec_nanos(),
+                listing: CacheDigest::blake3(&listed).hash,
+            },
+            keys: records
+                .iter()
+                .map(|(_, inode)| FileKey::Object(device, *inode))
+                .collect(),
+            strays,
+        })
+    }
+
+    /// The records' summed length when `files`, this checkout's fresh
+    /// measure, reached every one of them and no other measured path did,
+    /// and the listing has been still long enough to be told from a later one.
+    fn census(&self, files: &[FileKey], inodes: &Inodes, now: u64) -> Option<Census> {
+        if now.saturating_sub(self.witness.modified_secs) <= CENSUS_SETTLE_SECS {
+            return None;
+        }
+        let measured = files.iter().collect::<HashSet<_>>();
+        let mut distinct = HashSet::new();
+        let mut bytes = 0u64;
+        for key in &self.keys {
+            if !measured.contains(key) || !distinct.insert(key) {
+                return None;
+            }
+            let (length, references) = inodes.files.get(key)?;
+            if *references != 1 {
+                return None;
+            }
+            bytes = bytes.saturating_add(*length);
+        }
+        Some(Census {
+            witness: self.witness.clone(),
+            bytes,
+        })
+    }
 }
 
 struct Snapshot {
     entries: Vec<Entry>,
     inodes: Inodes,
+    /// The censuses this snapshot holds, when they differ from the stored
+    /// ones.
+    censuses: Option<BTreeMap<String, Census>>,
 }
 
 fn entries(root: &Path, include_retired: bool) -> Result<Snapshot> {
     let mut snapshot = Snapshot {
         entries: Vec::new(),
         inodes: Inodes::default(),
+        censuses: None,
     };
     let listing = match std::fs::read_dir(root) {
         Ok(listing) => listing,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(snapshot),
         Err(error) => return Err(error.into()),
     };
+    let stored = read_censuses(root);
+    let mut censuses = BTreeMap::new();
+    let mut retired_trees = Vec::new();
+    let now = now_secs();
     for entry in listing {
         let entry = match entry {
             Ok(entry) => entry,
@@ -1364,43 +1591,96 @@ fn entries(root: &Path, include_retired: bool) -> Result<Snapshot> {
                 continue;
             }
         };
-        if !entry.file_type().is_ok_and(|kind| kind.is_dir())
-            || entry.file_name() == LOCKS_DIR
-            || retired::is_retired_name(&entry.file_name())
-        {
+        let name = entry.file_name();
+        if retired::is_retired_name(&name) {
+            retired_trees.push(entry.path());
+            continue;
+        }
+        if !entry.file_type().is_ok_and(|kind| kind.is_dir()) || name == LOCKS_DIR {
             continue;
         }
         let directory = entry.path();
+        let key = name.to_string_lossy().into_owned();
         let record = read_record(&directory.join(RECORD_FILE));
-        let (units, orphan_stamps) = units(&directory, &mut snapshot.inodes);
-        let mut excluded = units
+        let blake3 = directory.join("blake3");
+        // Read before the listing: an entry the listing misses moves the
+        // directory's time past this one.
+        let listed = std::fs::symlink_metadata(&blake3).ok();
+        // One listing serves the units, the retired trees and the records.
+        let listing = nested_entries(&blake3);
+        let (units, orphan_stamps) = units(&listing, &mut snapshot.inodes);
+        let retired = listing
             .iter()
-            .map(|unit| unit.directory.clone())
-            .collect::<HashSet<_>>();
-        excluded.extend(units.iter().flat_map(|unit| unit.records.iter().cloned()));
-        excluded.extend(orphan_stamps.iter().map(|(stamp, _)| stamp.clone()));
-        excluded.extend(
-            nested_entries(&directory.join("blake3"))
-                .into_iter()
-                .filter(|entry| retired::is_retired_name(&entry.file_name()))
-                .map(|entry| entry.path()),
-        );
-        let files = snapshot.inodes.measure(&directory, &excluded);
-        snapshot.entries.push(Entry {
-            key: entry.file_name().to_string_lossy().into_owned(),
+            .filter(|entry| retired::is_retired_name(&entry.file_name()))
+            .map(|entry| entry.path())
+            .collect::<Vec<_>>();
+        let records = listed
+            .as_ref()
+            .filter(|_| units.is_empty())
+            .and_then(|listed| Records::list(listed, &listing));
+        let index = snapshot.entries.len();
+        let mut entry = Entry {
+            key,
             workspace_root: record.map(|record| record.workspace_root),
-            files,
+            files: Vec::new(),
+            carried: 0,
             units,
             orphan_stamps,
             directory,
+        };
+        let known = records.as_ref().and_then(|records| {
+            stored
+                .get(&entry.key)
+                .filter(|census| census.witness == records.witness)
+                .filter(|census| snapshot.inodes.carry(index, &records.keys, census.bytes))
+                .map(|census| (records, census))
         });
+        if let Some((records, census)) = known {
+            // Everything but the records is measured as ever.
+            let mut roots = vec![entry.directory.clone()];
+            let orphans = &entry.orphan_stamps;
+            roots.extend(
+                records
+                    .strays
+                    .iter()
+                    .filter(|stray| orphans.iter().all(|(stamp, _)| stamp != *stray))
+                    .cloned(),
+            );
+            entry.files = snapshot.inodes.measure_all(roots, &HashSet::from([blake3]));
+            entry.carried = census.bytes;
+            censuses.insert(entry.key.clone(), census.clone());
+        } else {
+            entry.files = snapshot
+                .inodes
+                .measure(&entry.directory, &entry.excluded(retired.iter().cloned()));
+            if let Some(census) =
+                records.and_then(|records| records.census(&entry.files, &snapshot.inodes, now))
+            {
+                censuses.insert(entry.key.clone(), census);
+            }
+        }
+        retired_trees.extend(retired);
+        snapshot.entries.push(entry);
     }
     if include_retired {
         // Retired state occupies space without being a usable checkout or
         // unit. Use the live ledger to count cross-boundary hard links once.
-        for tree in retired_trees(root) {
+        for tree in retired_trees {
             snapshot.inodes.measure(&tree, &HashSet::new());
         }
+    }
+    // A path measured after a census was carried reached one of its records:
+    // that checkout is measured after all, beside whatever links it.
+    while let Some(index) = snapshot.inodes.contradicted.pop() {
+        let entry = &mut snapshot.entries[index];
+        if entry.carried > 0 {
+            entry.files = snapshot.inodes.measure_carried(index, entry);
+            entry.carried = 0;
+            censuses.remove(&entry.key);
+        }
+    }
+    if censuses != stored {
+        snapshot.censuses = Some(censuses);
     }
     Ok(snapshot)
 }
@@ -1639,22 +1919,39 @@ fn file_identity(path: &Path, _metadata: &std::fs::Metadata) -> (FileKey, Option
     (FileKey::Path(path.to_path_buf()), None)
 }
 
+#[cfg(test)]
+thread_local! {
+    static METADATA_LOOKUPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 #[derive(Default)]
 struct Inodes {
     files: HashMap<FileKey, (u64, usize)>,
     bytes: u64,
+    /// The churn records a [`Census`] counts unmeasured, by the entry each
+    /// belongs to. A record is in here or in `files`, never both for long.
+    carried: HashMap<FileKey, usize>,
+    /// Entries one of whose carried records a measured path also reached.
+    contradicted: Vec<usize>,
 }
 
 impl Inodes {
     /// Walk each subtree once, deduplicating both inside an owner and across
     /// owners. Bookkeeping participates in the same whole-sweep accounting.
     fn measure(&mut self, root: &Path, excluded: &HashSet<PathBuf>) -> Vec<FileKey> {
+        self.measure_all(vec![root.to_path_buf()], excluded)
+    }
+
+    /// Measure several subtrees as one owner.
+    fn measure_all(&mut self, roots: Vec<PathBuf>, excluded: &HashSet<PathBuf>) -> Vec<FileKey> {
         let mut files = HashSet::new();
-        let mut pending = vec![root.to_path_buf()];
+        let mut pending = roots;
         while let Some(path) = pending.pop() {
             if excluded.contains(&path) {
                 continue;
             }
+            #[cfg(test)]
+            METADATA_LOOKUPS.with(|counter| counter.set(counter.get() + 1));
             let Ok(metadata) = std::fs::symlink_metadata(&path) else {
                 continue;
             };
@@ -1662,6 +1959,9 @@ impl Inodes {
                 pending.extend(nested_entries(&path).into_iter().map(|entry| entry.path()));
             } else if metadata.is_file() {
                 let key = file_key(&path, &metadata);
+                if let Some(owner) = self.carried.get(&key) {
+                    self.contradicted.push(*owner);
+                }
                 self.files.entry(key.clone()).or_insert((metadata.len(), 0));
                 files.insert(key);
             }
@@ -1674,6 +1974,44 @@ impl Inodes {
             *references += 1;
         }
         files.into_iter().collect()
+    }
+
+    /// Count `bytes` for the records `keys` of entry `owner` without
+    /// measuring them. Refused, counting nothing, when a measured path or
+    /// another census already reaches one of them: each file counts once.
+    fn carry(&mut self, owner: usize, keys: &[FileKey], bytes: u64) -> bool {
+        for (taken, key) in keys.iter().enumerate() {
+            let other = if self.files.contains_key(key) {
+                Some(owner)
+            } else {
+                self.carried.insert(key.clone(), owner)
+            };
+            let Some(other) = other else {
+                continue;
+            };
+            for key in &keys[..taken] {
+                self.carried.remove(key);
+            }
+            if other != owner {
+                self.carried.insert(key.clone(), other);
+                self.contradicted.push(other);
+            } else if !self.files.contains_key(key) {
+                self.carried.remove(key);
+            }
+            return false;
+        }
+        self.bytes = self.bytes.saturating_add(bytes);
+        true
+    }
+
+    /// Measure a checkout whose records a census counted, in place of that
+    /// census.
+    fn measure_carried(&mut self, owner: usize, entry: &Entry) -> Vec<FileKey> {
+        self.carried.retain(|_, carried| *carried != owner);
+        self.bytes = self.bytes.saturating_sub(entry.carried);
+        self.release(&entry.files);
+        let retired = retired_children(&entry.directory.join("blake3"));
+        self.measure(&entry.directory, &entry.excluded(retired))
     }
 
     fn release(&mut self, files: &[FileKey]) {
@@ -3420,5 +3758,191 @@ mod tests {
         let outcome = collect(&root, None, None, false, false, None).unwrap();
         assert_eq!(outcome.remaining_directories, 1);
         assert_eq!(outcome.removed_bytes, 0);
+    }
+
+    /// A checkout with churn records and no unit, its listing old enough to
+    /// be trusted.
+    fn record_checkout(cache: &Path, workspace: &Path, records: &[(&str, usize)]) -> PathBuf {
+        let state = touch(cache, workspace).unwrap();
+        drop(state.lease);
+        for (name, length) in records {
+            write_record(&state.directory, name, *length);
+        }
+        settle(&state.directory);
+        state.directory
+    }
+
+    /// Publish a churn record the way a compile does.
+    fn write_record(checkout: &Path, name: &str, length: usize) -> PathBuf {
+        let record = checkout.join("blake3").join(name).with_extension("json");
+        crate::util::write_advisory(&record, &vec![b'r'; length]).unwrap();
+        record
+    }
+
+    const SETTLED: i64 = 1_000_000;
+
+    fn settle(checkout: &Path) {
+        filetime::set_file_mtime(
+            checkout.join("blake3"),
+            filetime::FileTime::from_unix_time(SETTLED, 0),
+        )
+        .unwrap();
+    }
+
+    fn sweep(cache: &Path) -> PruneOutcome {
+        collect(cache, None, None, false, false, None).unwrap()
+    }
+
+    fn lookups<T>(run: impl FnOnce() -> T) -> (T, usize) {
+        let before = METADATA_LOOKUPS.get();
+        let value = run();
+        (value, METADATA_LOOKUPS.get() - before)
+    }
+
+    fn counts(outcome: &PruneOutcome) -> [u64; 6] {
+        [
+            outcome.removed_bytes,
+            outcome.remaining_bytes,
+            outcome.removed_directories,
+            outcome.remaining_directories,
+            outcome.removed_units,
+            outcome.remaining_units,
+        ]
+    }
+
+    /// What the store holds as an earlier sweep left it counted, against the
+    /// same store measured with nothing carried over.
+    fn assert_counted_as_measured(cache: &Path) {
+        let carried = stats(cache).unwrap().bytes;
+        let _ = std::fs::remove_file(cache.join(CENSUS_FILE));
+        assert_eq!(carried, stats(cache).unwrap().bytes);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unchanged_unit_less_checkout_is_counted_without_looking_up_its_records() {
+        let cache = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let records = (0..40)
+            .map(|index| (format!("{index:064x}"), 100 + index))
+            .collect::<Vec<_>>();
+        let records = records
+            .iter()
+            .map(|(name, length)| (name.as_str(), *length))
+            .collect::<Vec<_>>();
+        record_checkout(cache.path(), workspace.path(), &records);
+        let (first, measured) = lookups(|| sweep(cache.path()));
+        let (second, carried) = lookups(|| sweep(cache.path()));
+        assert_eq!(counts(&first), counts(&second));
+        assert_eq!(first.removed_directories, 0);
+        assert!(first.remaining_bytes >= (100..140).sum::<u64>());
+        assert!(
+            carried + records.len() <= measured,
+            "{carried} lookups after {measured}"
+        );
+        let (_, preview) = lookups(|| stats(cache.path()).unwrap());
+        assert!(preview + records.len() <= measured);
+        assert_counted_as_measured(cache.path());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_changed_listing_is_measured_again() {
+        let cache = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let checkout = record_checkout(
+            cache.path(),
+            workspace.path(),
+            &[("kept", 10), ("replaced", 20), ("removed", 30)],
+        );
+        sweep(cache.path());
+        // A replacement and a removal under the very timestamp the earlier
+        // sweep saw, as a coarse or stepped clock would leave them.
+        write_record(&checkout, "replaced", 2_000);
+        std::fs::remove_file(checkout.join("blake3/removed.json")).unwrap();
+        settle(&checkout);
+        let before = sweep(cache.path());
+        assert_counted_as_measured(cache.path());
+        sweep(cache.path());
+        // A new record under a clock that went back.
+        write_record(&checkout, "added", 400);
+        filetime::set_file_mtime(
+            checkout.join("blake3"),
+            filetime::FileTime::from_unix_time(SETTLED - 100, 0),
+        )
+        .unwrap();
+        let after = sweep(cache.path());
+        assert_eq!(after.remaining_bytes, before.remaining_bytes + 400);
+        assert_counted_as_measured(cache.path());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_listing_changed_moments_ago_is_not_carried_over() {
+        let cache = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let checkout = record_checkout(cache.path(), workspace.path(), &[("a", 10), ("b", 20)]);
+        // A compile publishing beside the sweep: the directory's time is the
+        // sweep's own, so a later write could leave it unchanged.
+        write_record(&checkout, "c", 30);
+        let (_, measured) = lookups(|| sweep(cache.path()));
+        let record = write_record(&checkout, "c", 300);
+        let (_, again) = lookups(|| sweep(cache.path()));
+        assert_eq!(measured, again);
+        assert!(record.exists());
+        assert_counted_as_measured(cache.path());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_record_linked_after_it_was_counted_still_counts_once() {
+        let cache = tempfile::tempdir().unwrap();
+        let workspaces = [(); 3].map(|()| tempfile::tempdir().unwrap());
+        let first = record_checkout(cache.path(), workspaces[0].path(), &[("a", 1_000)]);
+        let second = record_checkout(cache.path(), workspaces[1].path(), &[("b", 2_000)]);
+        let state = touch(cache.path(), workspaces[2].path()).unwrap();
+        let unit = unit(&state.directory, "unit", now_secs());
+        drop(state.lease);
+        let before = sweep(cache.path());
+        // Neither link changes the listing of the directory it comes from.
+        std::fs::hard_link(
+            first.join("blake3/a.json"),
+            unit.join("crate-id/s-session/linked"),
+        )
+        .unwrap();
+        std::fs::hard_link(first.join("blake3/a.json"), second.join("stray")).unwrap();
+        std::fs::hard_link(second.join("blake3/b.json"), first.join("stray")).unwrap();
+        let after = sweep(cache.path());
+        assert_eq!(after.remaining_bytes, before.remaining_bytes);
+        assert_counted_as_measured(cache.path());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn removing_a_carried_checkout_credits_what_a_measured_one_would() {
+        let outcomes = [true, false].map(|carried| {
+            let cache = tempfile::tempdir().unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            let gone = tempfile::tempdir().unwrap();
+            let kept = tempfile::tempdir().unwrap();
+            let checkout = record_checkout(cache.path(), gone.path(), &[("a", 100), ("b", 200)]);
+            record_checkout(cache.path(), kept.path(), &[("c", 400)]);
+            if carried {
+                sweep(cache.path());
+                assert!(cache.path().join(CENSUS_FILE).exists());
+            }
+            // Linked from outside the store after it was counted: removing
+            // the checkout does not remove this record's last link.
+            std::fs::hard_link(checkout.join("blake3/b.json"), outside.path().join("held"))
+                .unwrap();
+            gone.close().unwrap();
+            let preview = collect(cache.path(), None, None, true, false, None).unwrap();
+            assert!(checkout.exists());
+            let removal = sweep(cache.path());
+            assert!(!checkout.exists());
+            assert_eq!(removal.removed_directories, 1);
+            (counts(&preview), counts(&removal))
+        });
+        assert_eq!(outcomes[0], outcomes[1]);
     }
 }

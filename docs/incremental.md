@@ -110,6 +110,18 @@ compile can link a file after the sweep listed it. Counts reflect each
 sweep's snapshot, so links created during a sweep are counted at the next one. Live checkouts retain their bookkeeping even when all their units are removed;
 a deleted checkout loses its directory and bookkeeping after its last unit
 is collected.
+
+A checkout with no unit left still holds one small record per crate it
+compiled. A sweep measures those records once and writes their total to
+`incremental/records.json`. Later sweeps and `mbx cache stats` count them
+from one listing of their directory instead of looking up every file, for as
+long as the listing names the same files and none of them is hard linked
+from anything else the sweep measures. A record is only ever replaced by a
+new file, so an unchanged listing means unchanged sizes. A checkout whose
+directory changed in the last few seconds, and one about to be removed, is
+measured file by file, as are rustc sessions, last-use stamps and everything
+else. Deleting `records.json` costs one full measure.
+
 To change either limit:
 
 ```sh
