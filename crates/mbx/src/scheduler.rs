@@ -198,6 +198,7 @@ const GATE_DEADLINE: Duration = Duration::from_secs(120);
 
 /// The lease this process was granted most recently in each pool; see
 /// `relocate_lease`.
+#[cfg(any(target_os = "linux", test))]
 static LAST_GRANT: std::sync::Mutex<BTreeMap<PathBuf, PathBuf>> =
     std::sync::Mutex::new(BTreeMap::new());
 
@@ -511,6 +512,11 @@ struct Waiting {
     memory_bytes: Option<u64>,
     priority: String,
     domain: String,
+    /// A handoff charges the waiter's cgroups, not the registrar holder's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cgroups: Option<std::borrow::Cow<'static, [String]>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    written: Option<crate::util::Stamp>,
     domain_capacity: u64,
     #[serde(default)]
     global_capacity: Option<u64>,
@@ -752,6 +758,8 @@ impl From<&Waiting> for Lease {
             priority: record.priority.clone(),
             build_id: record.build.as_ref().map(|(id, _)| id.clone()),
             domain: Some(record.domain.clone()),
+            cgroups: record.cgroups.as_deref().map(<[String]>::to_vec),
+            written: record.written,
             bytes_per_permit: record.bytes_per_permit,
         }
     }
@@ -904,12 +912,32 @@ struct PassGrant {
     trace: Option<decisions::Trace>,
 }
 
+#[derive(Clone, Copy)]
+struct MemoryGate<'a> {
+    available: &'a crate::util::Available,
+    dir: &'a Path,
+    contains: CgroupContains,
+}
+
+impl MemoryGate<'_> {
+    fn blocks(self, live: &[Lease], needed: u64) -> bool {
+        !live.is_empty()
+            && self.available.bytes < needed
+            && holds_short_memory(
+                self.dir,
+                live,
+                self.available.short_of(needed).as_deref(),
+                self.contains,
+            )
+    }
+}
+
 /// What an admission pass reads besides the leases and the queue.
 #[derive(Clone, Copy)]
-struct PassContext {
+struct PassContext<'a> {
     now_ms: u64,
     /// The reading every request's available-memory gate compares.
-    available_memory: Option<u64>,
+    available_memory: Option<MemoryGate<'a>>,
     /// Pressure recovery or resuming suspended work spaces admissions out:
     /// the pass grants one request at most.
     single: bool,
@@ -1032,7 +1060,7 @@ fn admission_pass(
     queue: &[Waiting],
     request: Waiting,
     handoff: Handoff,
-    context: PassContext,
+    context: PassContext<'_>,
     trace: bool,
 ) -> Pass {
     // A record as its holder would judge itself: against its holder's budget.
@@ -1147,10 +1175,9 @@ fn admission_pass(
                 .and_then(|handoff| handoff.gate)
                 .is_some_and(|gate| {
                     context.now_ms < gate.until_ms
-                        && !live.is_empty()
                         && context
                             .available_memory
-                            .is_some_and(|available| available < gate.bytes)
+                            .is_some_and(|memory| memory.blocks(&live, gate.bytes))
                 });
         if gated {
             continue;
@@ -1998,6 +2025,7 @@ pub(crate) struct Pool {
     /// that a waiter can tell which compilations hold the memory it is short
     /// of. Injectable for tests.
     memory_cgroups: &'static [String],
+    cgroups_written: std::sync::LazyLock<crate::util::Stamp>,
     /// Whether a lease's cgroups sit inside a short cgroup, injectable for
     /// tests.
     cgroup_contains: CgroupContains,
@@ -2336,6 +2364,7 @@ impl Pool {
             pressure_probe: crate::pressure::probe,
             pressure_domain: crate::pressure::domain(),
             memory_cgroups: memory_cgroups(),
+            cgroups_written: std::sync::LazyLock::new(crate::util::Stamp::now),
             cgroup_contains,
             clock: crate::pressure::now_ms,
             lease_nonce: next_lease_nonce,
@@ -2879,6 +2908,13 @@ impl Pool {
     ) -> Result<Option<Permit>> {
         let mut events = Vec::new();
         let result = self.try_admit_inner(resources, weight, predicted, state, demand, &mut events);
+        #[cfg(any(target_os = "linux", test))]
+        if let Ok(Some(permit)) = &result {
+            LAST_GRANT
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .insert(self.dir.clone(), permit.path.clone());
+        }
         // The registrar guard belongs to try_admit_inner and has been dropped,
         // including on errors. No log encoding, append or rotation holds it.
         if result.is_err() {
@@ -2992,6 +3028,11 @@ impl Pool {
             return Ok(None);
         }
         let available_memory = (self.available_memory)();
+        let memory_gate = available_memory.as_ref().map(|available| MemoryGate {
+            available,
+            dir: &self.dir,
+            contains: self.cgroup_contains,
+        });
         // The permit arithmetic bounds what history predicted; this bounds it
         // against the machine as it is right now, catching pressure the
         // ledger cannot see -- unmeasured crates already running, or memory
@@ -3002,14 +3043,7 @@ impl Pool {
         // so deferring would stall the one thing that could proceed and wait
         // out the deadline to reach the same answer.
         if let Some(needed) = predicted
-            && let Some(available) = &available_memory
-            && available.bytes < needed
-            && holds_short_memory(
-                &self.dir,
-                &live,
-                available.short_of(needed).as_deref(),
-                self.cgroup_contains,
-            )
+            && memory_gate.is_some_and(|gate| gate.blocks(&live, needed))
         {
             self.gated(state, "available-memory", events, || {
                 self.waiting_record(
@@ -3055,7 +3089,7 @@ impl Pool {
             },
             PassContext {
                 now_ms: now,
-                available_memory,
+                available_memory: memory_gate,
                 // Each admission spaces out the next: recovery admits one at a
                 // time, and once anything runs, pressure or work waiting to
                 // resume gates the rest.
@@ -3166,6 +3200,8 @@ impl Pool {
                 .map_or(self.priority.as_str(), |decayed| decayed.to.as_str())
                 .into(),
             domain: self.pressure_domain.into(),
+            cgroups: (!self.memory_cgroups.is_empty()).then_some(self.memory_cgroups.into()),
+            written: (!self.memory_cgroups.is_empty()).then(|| *self.cgroups_written),
             domain_capacity: self.legacy_domain_capacity,
             domain_cpu_cap: Some(self.domain_capacity),
             global_capacity: Some(self.capacity),

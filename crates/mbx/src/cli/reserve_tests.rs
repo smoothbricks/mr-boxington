@@ -42,22 +42,26 @@ fn external_work_skips_nested_admission_without_leaking_the_worker_marker() {
     assert_eq!(environment.get("MBX_RESERVE_WORKER"), Some(&None));
 }
 
-fn reserved_cpus(cpus: Option<u64>) -> Option<Option<String>> {
+fn reserved_cpus(cpus: Option<u64>, variable: &str) -> Option<Option<String>> {
     reserve::external_command("echo", &[], cpus)
         .get_envs()
-        .find(|(name, _)| *name == "MBX_RESERVED_CPUS")
+        .find(|(name, _)| *name == variable)
         .map(|(_, value)| value.map(|value| value.to_string_lossy().into_owned()))
 }
 
 #[test]
 fn external_work_is_told_how_many_cores_it_holds() {
-    assert_eq!(reserved_cpus(Some(4)), Some(Some("4".into())));
+    for variable in ["MBX_RESERVE_CPUS", "MBX_RESERVED_CPUS"] {
+        assert_eq!(reserved_cpus(Some(4), variable), Some(Some("4".into())));
+    }
 }
 
 #[test]
 fn a_reservation_without_cores_clears_the_inherited_width() {
-    assert_eq!(reserved_cpus(None), Some(None));
-    assert_eq!(reserved_cpus(Some(0)), Some(None));
+    for variable in ["MBX_RESERVE_CPUS", "MBX_RESERVED_CPUS"] {
+        assert_eq!(reserved_cpus(None, variable), Some(None));
+        assert_eq!(reserved_cpus(Some(0), variable), Some(None));
+    }
 }
 
 #[test]

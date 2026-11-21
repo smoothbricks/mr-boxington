@@ -38,6 +38,7 @@ while :; do sleep 0.05; done
             .env("MBX_SCHEDULER_CPUS", "2")
             .env("MBX_SCHEDULER_MEMORY", "none")
             .env("MBX_SCHEDULER_PRESSURE", "0")
+            .env("MBX_EVENTS", "1")
             .env("MBX_GC_AUTO", "0")
             .stdout(Stdio::null())
             .stderr(Stdio::null());
@@ -79,42 +80,36 @@ while :; do sleep 0.05; done
         }
     }
 
-    /// The scheduler touches `priority-wait` after a failed admission attempt,
-    /// which is the evidence that a reservation reached the capacity wait.
-    fn stamps(root: &Path) -> Vec<std::path::PathBuf> {
-        let mut found = Vec::new();
-        let mut pending = vec![root.join("cache")];
-        while let Some(dir) = pending.pop() {
-            let Ok(entries) = fs::read_dir(&dir) else {
-                continue;
-            };
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    pending.push(path);
-                } else if path.file_name().is_some_and(|name| name == "priority-wait") {
-                    found.push(path);
+    /// Receive the named probe's actual queue and grant decisions. Keeping the
+    /// FIFO open lets separate appenders close between records without an EOF.
+    fn probe_events(root: &Path) -> (std::sync::mpsc::Receiver<String>, fs::File) {
+        use std::io::{BufRead, BufReader};
+        let dir = root.join("cache/scheduler");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("decisions.jsonl");
+        assert!(
+            Command::new("mkfifo")
+                .arg(&path)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let (send, receive) = std::sync::mpsc::channel();
+        let reader_path = path.clone();
+        thread::spawn(move || {
+            let reader = BufReader::new(fs::File::open(reader_path).unwrap());
+            for line in reader.lines() {
+                let event: serde_json::Value = serde_json::from_str(&line.unwrap()).unwrap();
+                if event["name"] == "probe"
+                    && let Some(kind @ ("enqueued" | "admitted")) = event["event"].as_str()
+                    && send.send(kind.to_owned()).is_err()
+                {
+                    break;
                 }
             }
-        }
-        found
-    }
-
-    fn clear_stamps(root: &Path) {
-        for stamp in stamps(root) {
-            let _ = fs::remove_file(stamp);
-        }
-    }
-
-    fn wait_for_queue(root: &Path) {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while stamps(root).is_empty() {
-            assert!(
-                Instant::now() < deadline,
-                "the reservation never reached the capacity wait"
-            );
-            thread::sleep(Duration::from_millis(10));
-        }
+        });
+        let writer = fs::OpenOptions::new().write(true).open(path).unwrap();
+        (receive, writer)
     }
 
     fn wait_for(path: &Path) {
@@ -143,37 +138,12 @@ while :; do sleep 0.05; done
         }
     }
 
-    /// Whether a second whole-budget reservation is admitted. `false` means it
-    /// was seen waiting for capacity, not merely that it was slow to start.
-    fn probe_admitted(root: &Path) -> bool {
-        let marker = root.join("probe");
-        let _ = fs::remove_file(&marker);
-        clear_stamps(root);
-        let _probe = Group::spawn(
-            mbx(root)
-                .args(["reserve", "--cpus", "2", "--", "touch"])
-                .arg(&marker),
-        );
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while Instant::now() < deadline {
-            if marker.exists() {
-                return true;
-            }
-            if !stamps(root).is_empty() {
-                // Queued. Give a wrongly released lease time to admit it.
-                thread::sleep(Duration::from_millis(500));
-                return marker.exists();
-            }
-            thread::sleep(Duration::from_millis(10));
-        }
-        panic!("the probe neither ran nor reached the capacity wait");
-    }
-
     #[test]
     fn group_signals_keep_the_lease_until_the_command_exits() {
         for signal in [libc::SIGHUP, libc::SIGINT, libc::SIGQUIT, libc::SIGTERM] {
             let dir = tempfile::tempdir().unwrap();
             let root = dir.path();
+            let (events, _writer) = probe_events(root);
             let mut job = Group::spawn(
                 mbx(root)
                     .args(["reserve", "--cpus", "2", "--", "sh", "-c", SLOW_STOP, "sh"])
@@ -189,20 +159,25 @@ while :; do sleep 0.05; done
                 "signal {signal}: the invoker ends by the signal, got {status}"
             );
             wait_for(&root.join("stopping"));
-            assert!(
-                !probe_admitted(root),
+            let mut probe = Group::spawn(
+                mbx(root).args(["reserve", "--name", "probe", "--cpus", "2", "--", "true"]),
+            );
+            assert_eq!(
+                events.recv_timeout(Duration::from_secs(10)).unwrap(),
+                "enqueued"
+            );
+            assert_eq!(
+                events.recv_timeout(Duration::from_millis(500)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout),
                 "signal {signal}: the lease was released while the command was stopping"
             );
 
             fs::write(root.join("finish"), "").unwrap();
-            // Once the command is gone the lease is free.
-            let deadline = Instant::now() + Duration::from_secs(10);
-            while !probe_admitted(root) {
-                assert!(
-                    Instant::now() < deadline,
-                    "signal {signal}: the lease was never released"
-                );
-            }
+            assert_eq!(
+                events.recv_timeout(Duration::from_secs(10)).unwrap(),
+                "admitted"
+            );
+            assert!(wait_child(&mut probe).success());
         }
     }
 
@@ -287,6 +262,7 @@ while :; do sleep 0.05; done
     fn a_signal_while_waiting_for_capacity_ends_at_once_without_running() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
+        let (events, _writer) = probe_events(root);
         let holder = Group::spawn(
             mbx(root)
                 .args(["reserve", "--cpus", "2", "--", "sh", "-c", SLOW_STOP, "sh"])
@@ -294,13 +270,15 @@ while :; do sleep 0.05; done
         );
         wait_for(&root.join("ready"));
 
-        clear_stamps(root);
         let mut waiter = Group::spawn(
             mbx(root)
-                .args(["reserve", "--cpus", "2", "--", "touch"])
+                .args(["reserve", "--name", "probe", "--cpus", "2", "--", "touch"])
                 .arg(root.join("ran")),
         );
-        wait_for_queue(root);
+        assert_eq!(
+            events.recv_timeout(Duration::from_secs(10)).unwrap(),
+            "enqueued"
+        );
         waiter.signal(libc::SIGTERM);
         let status = wait_child(&mut waiter);
         assert_eq!(status.signal(), Some(libc::SIGTERM), "got {status}");

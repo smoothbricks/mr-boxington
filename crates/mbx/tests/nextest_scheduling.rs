@@ -348,7 +348,7 @@ mod unix {
         let output = reserve(temp.path(), &cache, "2")
             .args(["--cpus", "8", "--", "sh", "-c"])
             .arg(format!(
-                "echo \"$MBX_RESERVE_CPUS\"; '{}' reserve --cpus 1 -- sh -c 'echo \"$MBX_RESERVE_CPUS\"'",
+                "echo \"$MBX_RESERVE_CPUS:$MBX_RESERVED_CPUS\"; '{0}' reserve --cpus 1 -- sh -c 'echo \"$MBX_RESERVE_CPUS:$MBX_RESERVED_CPUS\"'; '{0}' reserve --cpus 8 -- sh -c 'echo \"$MBX_RESERVE_CPUS:$MBX_RESERVED_CPUS\"'",
                 env!("CARGO_BIN_EXE_mbx")
             ))
             .output()
@@ -358,7 +358,7 @@ mod unix {
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
-        assert_eq!(String::from_utf8_lossy(&output.stdout), "2\n1\n");
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "2:2\n1:1\n2:2\n");
     }
 
     /// `mbx reservations` serves the pool `mbx reserve` reserves from, on a

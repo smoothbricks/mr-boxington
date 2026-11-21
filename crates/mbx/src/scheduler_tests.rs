@@ -3322,6 +3322,8 @@ fn waiter(ticket: u64, weight: u64, domain: (&str, u64), build: Option<(&str, u6
         domain_cpu_cap: None,
         priority: "normal".into(),
         domain: domain.0.into(),
+        cgroups: None,
+        written: None,
         domain_capacity: domain.1,
         global_capacity: None,
         bytes_per_permit: 0,
@@ -5118,19 +5120,19 @@ fn pass_record(ticket: u64, cpu: u64, memory_bytes: u64, handoff: bool) -> Waiti
 /// The ticket a request that has not queued yet carries.
 const NEW: u64 = u64::MAX;
 
-struct PassCase {
+struct PassCase<'a> {
     name: &'static str,
     /// CPU and memory of each live lease.
     live: Vec<(u64, u64)>,
     queue: Vec<Waiting>,
     request: Waiting,
-    context: PassContext,
+    context: PassContext<'a>,
     /// Granted tickets in grant order, `true` marking the caller's request,
     /// with the cores each grant holds.
     granted: Vec<(u64, bool, u64)>,
 }
 
-fn pass_grants(case: &PassCase) -> Vec<(u64, bool, u64)> {
+fn pass_grants(case: &PassCase<'_>) -> Vec<(u64, bool, u64)> {
     let live = case
         .live
         .iter()
@@ -5171,8 +5173,13 @@ fn an_admission_pass_grants_what_the_pool_rule_admits() {
         now_ms: AGING_MS,
         ..idle
     };
+    let available = crate::util::Available::host(GIB);
     let short = PassContext {
-        available_memory: Some(GIB),
+        available_memory: Some(MemoryGate {
+            available: &available,
+            dir: Path::new(""),
+            contains: listed,
+        }),
         ..idle
     };
     let small = |ticket| pass_record(ticket, 1, 0, true);
@@ -5820,6 +5827,73 @@ fn a_release_is_granted_to_the_queue_head_by_whoever_polls_next() {
     assert!(pool.try_admit(1, None).unwrap().is_none());
     drop(granted);
     assert!(pool.try_admit(2, None).unwrap().is_some());
+}
+
+#[test]
+fn a_handoff_gates_only_on_grants_in_the_short_memory_scope() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut other = pool_at(directory.path(), 3, 100);
+    other.memory_cgroups = cgroups(&["other"]);
+    let mut local = pool_at(directory.path(), 3, 100);
+    local.memory_cgroups = cgroups(&["local"]);
+    let held = other.try_admit(3, None).unwrap().unwrap();
+    let (mut first, mut second, mut third) = (None, None, None);
+    for (pool, waiter) in [
+        (&other, &mut first),
+        (&local, &mut second),
+        (&local, &mut third),
+    ] {
+        assert!(
+            pool.try_admit_queued(1, Some(100), waiter)
+                .unwrap()
+                .is_none()
+        );
+    }
+    drop(held);
+
+    // One pass can grant the foreign holder and the first local holder,
+    // but that new local lease gates the next predicted request in this pass.
+    local.available_memory = || {
+        Some(crate::util::Available {
+            bytes: 0,
+            limits: vec![crate::util::Limit {
+                cgroup: Some("local".into()),
+                bytes: 0,
+            }],
+        })
+    };
+    assert!(local.try_admit(3, None).unwrap().is_none());
+    let leases = scan_leases(&directory.path().join(LEASES_DIR)).unwrap();
+    assert_eq!(leases.len(), 2);
+    let first = other
+        .try_admit_queued(1, Some(100), &mut first)
+        .unwrap()
+        .unwrap();
+    let second = local
+        .try_admit_queued(1, Some(100), &mut second)
+        .unwrap()
+        .unwrap();
+    assert!(
+        local
+            .try_admit_queued(1, Some(100), &mut third)
+            .unwrap()
+            .is_none()
+    );
+    let recorded = |permit: &Permit| {
+        serde_json::from_slice::<Lease>(&std::fs::read(&permit.path).unwrap()).unwrap()
+    };
+    assert_eq!(
+        recorded(&first).cgroups.as_deref(),
+        Some(other.memory_cgroups)
+    );
+    assert!(recorded(&first).written.is_some());
+    // The worker that claimed the second handoff can now relocate just that lease.
+    local.relocate_lease(Some("supervised"));
+    assert_eq!(recorded(&second).cgroups.unwrap(), ["supervised"]);
+    assert_eq!(
+        recorded(&first).cgroups.as_deref(),
+        Some(other.memory_cgroups)
+    );
 }
 
 #[test]

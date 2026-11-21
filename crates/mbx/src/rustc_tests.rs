@@ -3107,6 +3107,8 @@ fn a_non_utf8_workspace_root_is_keyed_to_its_checkout() {
                 PathBuf::from(OsStr::from_bytes(name)),
                 "workspace",
             )],
+            target: None,
+            compiler_key: OnceLock::new(),
             arguments: Vec::new(),
             build_script_inputs: None,
         };

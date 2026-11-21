@@ -173,6 +173,8 @@ fn record(
         memory_bytes: Some(0),
         priority: published,
         domain: "host".into(),
+        cgroups: None,
+        written: None,
         domain_capacity: pool,
         global_capacity: Some(pool),
         cpu_cap: Some(pool),

@@ -462,33 +462,30 @@ mbx reserve --memory 6GiB --cpus 4 -- ./run-windows-build-in-vm.sh
 `--cpus` is a maximum. The command starts as soon as one core is free (or its
 `--min` until it has waited 30 seconds), on as
 many of the cores it asked for as are free then, and the reservation holds
-those. The command reads that count from `MBX_RESERVE_CPUS` and should size its
-own parallelism from it. Memory is reserved exactly, and the command waits
-until all of it fits; an omitted resource reserves zero of that resource, and
-without `--cpus` the command gets no `MBX_RESERVE_CPUS`. Once the reservation is granted, a dedicated
+those. Both `MBX_RESERVE_CPUS` and `MBX_RESERVED_CPUS` report the granted
+count. Memory is reserved exactly, and the command waits until all of it
+fits; an omitted resource reserves zero. Once the reservation is granted, a dedicated
 worker holds it until the external command exits. Killing the invoking `mbx reserve`
 process alone does not release capacity while that worker still waits for the
 command. On Unix the worker also stays alive through HUP, INT, QUIT and TERM,
 so ^C, a hangup, or a signal sent to the whole process group does not release
 capacity until the command itself has exited. A crashed worker does release its lease
 through the operating system.
-The command runs with `MBX_RESERVED_CPUS` set to the cores the reservation
-holds, so a runner can size its own workers from the lease instead of being
-given the number twice:
+For example, a runner can size its workers from its actual grant:
 
 ```sh
 mbx reserve --cpus 4 -- sh -c 'gradle --max-workers "$MBX_RESERVED_CPUS" test'
 ```
 
 A reservation that holds no cores, because `--cpus` is omitted or `0`, removes
-the variable, including one inherited from an enclosing reservation.
+both variables, including values inherited from an enclosing reservation.
 The command must wait for work it launches: detached background processes can
 outlive the reservation and are not covered after the command exits. That
 includes a nested `mbx reserve`: run by a command a reservation already covers,
 it runs its own command under the enclosing grant at once, without a lease of
 its own, instead of queueing behind capacity its enclosing reservation holds;
-its command's `MBX_RESERVE_CPUS` is the smaller of its `--cpus` and the
-enclosing grant's, or its `--cpus` when no enclosing grant names one.
+both variables report the smaller of its `--cpus` and the enclosing grant's
+count, or its `--cpus` when no enclosing grant names one.
 `--memory` is measured against `scheduler.memory`; omit it when memory
 scheduling is disabled. Use `--priority interactive` with `--job-started` for
 work someone waits on, and `--priority low` for background work that should

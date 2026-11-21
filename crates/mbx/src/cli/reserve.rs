@@ -166,23 +166,27 @@ fn run_direct(config: &Config, args: &ReserveArgs, grant: Option<Descriptor>) ->
         permit.announce();
     }
     // The hold on --grant-fd ends, announcing its release, once the command has.
-    let hold = grant.map(Descriptor::granted).transpose()?;
-    let mut command = external_command(program, arguments, args.cpus.map(|_| admission.cpus()));
-    // A signal during startup reaches the new process too, so it checks for one
-    // itself before exec and refuses to start the command.
-    guard.refuse_start_if_signalled(&mut command);
-    let status = match command.spawn() {
-        Ok(mut child) => child.wait().map_err(eyre::Report::from),
-        Err(error) => match guard.pending() {
-            Some(signal) if error.kind() == std::io::ErrorKind::Interrupted => {
-                drop(permit);
-                guard.end_by(signal);
+    let status = match grant.map(Descriptor::granted).transpose() {
+        Err(error) => Err(error),
+        Ok(_hold) => {
+            let mut command =
+                external_command(program, arguments, args.cpus.map(|_| admission.cpus()));
+            // A signal during startup reaches the new process too, so it checks for one
+            // itself before exec and refuses to start the command.
+            guard.refuse_start_if_signalled(&mut command);
+            match command.spawn() {
+                Ok(mut child) => child.wait().map_err(eyre::Report::from),
+                Err(error) => match guard.pending() {
+                    Some(signal) if error.kind() == std::io::ErrorKind::Interrupted => {
+                        drop(permit);
+                        guard.end_by(signal);
+                    }
+                    _ => Err(eyre::Report::from(error)),
+                },
             }
-            _ => Err(eyre::Report::from(error)),
-        },
-    }
-    .wrap_err_with(|| format!("failed to run {program}"));
-    drop(hold);
+            .wrap_err_with(|| format!("failed to run {program}"))
+        }
+    };
     drop(guard);
     drop(permit);
     pool.observe_reservation(args.name.as_deref(), admission, status.as_ref().ok());
@@ -257,9 +261,13 @@ pub(super) fn external_command(program: &str, arguments: &[String], cpus: Option
     match cpus.filter(|cpus| *cpus > 0) {
         Some(cpus) => {
             let width = cpus.to_string();
-            command.env(GRANTED_CPUS_ENV, &width).env("MBX_RESERVED_CPUS", width)
+            command
+                .env(GRANTED_CPUS_ENV, &width)
+                .env("MBX_RESERVED_CPUS", width)
         }
-        None => command.env_remove(GRANTED_CPUS_ENV).env_remove("MBX_RESERVED_CPUS"),
+        None => command
+            .env_remove(GRANTED_CPUS_ENV)
+            .env_remove("MBX_RESERVED_CPUS"),
     };
     command
 }
