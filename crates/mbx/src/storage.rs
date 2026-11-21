@@ -30,8 +30,27 @@ fn require_local_with(
     setting: &str,
     probe: impl FnOnce(&Path) -> io::Result<bool>,
 ) -> Result<()> {
+    require_local_observed(path, role, setting, probe, &mut |_, _| {})
+}
+
+/// Which of the two looks [`existing_directory`] takes at a path comes next:
+/// what kind of entry it is, then where that entry leads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Look {
+    Kind,
+    Destination,
+}
+
+/// [`require_local_with`], telling `before` each look at each path first.
+fn require_local_observed(
+    path: &Path,
+    role: &str,
+    setting: &str,
+    probe: impl FnOnce(&Path) -> io::Result<bool>,
+    before: &mut dyn FnMut(&Path, Look),
+) -> Result<()> {
     let absolute = std::path::absolute(path)?;
-    let existing = existing_directory(&absolute, 0)
+    let existing = existing_directory(&absolute, 0, before)
         .wrap_err_with(|| format!("could not inspect {role} {}", path.display()))?;
     if probe(&existing).wrap_err_with(|| {
         format!(
@@ -49,23 +68,52 @@ fn require_local_with(
 
 /// Follow even dangling directory links before choosing an existing ancestor.
 /// `Path::exists` alone would mistake a dangling link to NFS for local storage.
-fn existing_directory(path: &Path, depth: usize) -> io::Result<PathBuf> {
+///
+/// Each path is looked at twice: for what kind of entry it is, then for
+/// where that entry leads. Commands of one checkout share its view lease, so
+/// one may move a real `target/` into the view, link it, or undo its link
+/// between another's two looks. A path that is gone at the second look has
+/// changed kind, and is looked at again as what it is now: followed if it
+/// became a link, an ancestor if it is absent. That takes a step of the same
+/// bound as following a link, so a path that never holds still is refused.
+/// Any other failure of the second look is an error.
+fn existing_directory(
+    path: &Path,
+    depth: usize,
+    before: &mut dyn FnMut(&Path, Look),
+) -> io::Result<PathBuf> {
     if depth > 256 {
         return Err(io::Error::other(
             "too many directory or symbolic-link components",
         ));
     }
+    before(path, Look::Kind);
     match std::fs::symlink_metadata(path) {
         Ok(metadata) if metadata.is_symlink() => {
-            let destination = std::fs::read_link(path)?;
+            before(path, Look::Destination);
+            let destination = match std::fs::read_link(path) {
+                Ok(destination) => destination,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    return existing_directory(path, depth + 1, before);
+                }
+                Err(error) => return Err(error),
+            };
             let destination = if destination.is_absolute() {
                 destination
             } else {
                 path.parent().unwrap_or(Path::new(".")).join(destination)
             };
-            existing_directory(&destination, depth + 1)
+            existing_directory(&destination, depth + 1, before)
         }
-        Ok(metadata) if metadata.is_dir() => std::fs::canonicalize(path),
+        Ok(metadata) if metadata.is_dir() => {
+            before(path, Look::Destination);
+            match std::fs::canonicalize(path) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    existing_directory(path, depth + 1, before)
+                }
+                canonical => canonical,
+            }
+        }
         Ok(_) => Err(io::Error::new(
             io::ErrorKind::NotADirectory,
             "not a directory",
@@ -75,7 +123,7 @@ fn existing_directory(path: &Path, depth: usize) -> io::Result<PathBuf> {
                 .parent()
                 .filter(|parent| *parent != path)
                 .ok_or(error)?;
-            existing_directory(parent, depth + 1)
+            existing_directory(parent, depth + 1, before)
         }
         Err(error) => Err(error),
     }
@@ -166,6 +214,180 @@ mod tests {
         require_local_with(&nfs.join("target/missing"), "target", "setting", probe).unwrap();
         symlink("loop", local.join("loop")).unwrap();
         assert!(require_local_with(&local.join("loop"), "target", "setting", probe).is_err());
+    }
+
+    /// A checkout with a target path, a place for its managed view, and a
+    /// directory the probe calls NFS.
+    #[cfg(unix)]
+    struct Placement {
+        _temp: tempfile::TempDir,
+        root: PathBuf,
+        target: PathBuf,
+        view: PathBuf,
+        nfs: PathBuf,
+    }
+
+    #[cfg(unix)]
+    impl Placement {
+        fn new() -> Self {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().canonicalize().unwrap();
+            for directory in ["checkout", "views", "nfs"] {
+                std::fs::create_dir(root.join(directory)).unwrap();
+            }
+            Self {
+                target: root.join("checkout/target"),
+                view: root.join("views/view"),
+                nfs: root.join("nfs"),
+                root,
+                _temp: temp,
+            }
+        }
+
+        /// Check the target while `change` runs once, between the two looks
+        /// at it. Returns the directory the probe was asked about.
+        fn checked_while(&self, mut change: impl FnMut()) -> Result<PathBuf> {
+            let mut probed = None;
+            let mut pending = true;
+            require_local_observed(
+                &self.target,
+                "Cargo target directory",
+                "CARGO_TARGET_DIR or build.target-dir",
+                |existing| {
+                    probed = Some(existing.to_path_buf());
+                    Ok(existing.starts_with(&self.nfs))
+                },
+                &mut |path, look| {
+                    if pending && path == self.target && look == Look::Destination {
+                        pending = false;
+                        change();
+                    }
+                },
+            )?;
+            Ok(probed.unwrap())
+        }
+    }
+
+    /// Another command of the same checkout moves its real `target/` into the
+    /// managed view and links it while this one is checking it.
+    #[test]
+    #[cfg(unix)]
+    fn a_target_adopted_while_it_is_checked_is_followed_into_its_view() {
+        use std::os::unix::fs::symlink;
+        let placed = Placement::new();
+        std::fs::create_dir(&placed.target).unwrap();
+        let probed = placed
+            .checked_while(|| {
+                std::fs::rename(&placed.target, &placed.view).unwrap();
+                symlink(&placed.view, &placed.target).unwrap();
+            })
+            .unwrap();
+        assert_eq!(probed, placed.view);
+
+        // Renamed away, and the link not placed yet.
+        let placed = Placement::new();
+        std::fs::create_dir(&placed.target).unwrap();
+        let probed = placed
+            .checked_while(|| std::fs::rename(&placed.target, &placed.view).unwrap())
+            .unwrap();
+        assert_eq!(probed, placed.root.join("checkout"));
+
+        // Linked to a view placement has not created yet.
+        let placed = Placement::new();
+        std::fs::create_dir(&placed.target).unwrap();
+        let probed = placed
+            .checked_while(|| {
+                std::fs::remove_dir(&placed.target).unwrap();
+                symlink(&placed.view, &placed.target).unwrap();
+            })
+            .unwrap();
+        assert_eq!(probed, placed.root.join("views"));
+    }
+
+    /// A placement that undoes its own link, or replaces an outdated one,
+    /// while another command is checking the target.
+    #[test]
+    #[cfg(unix)]
+    fn a_target_link_removed_while_it_is_checked_reads_as_not_placed() {
+        use std::os::unix::fs::symlink;
+        let placed = Placement::new();
+        std::fs::create_dir(&placed.view).unwrap();
+        symlink(&placed.view, &placed.target).unwrap();
+        let probed = placed
+            .checked_while(|| std::fs::remove_file(&placed.target).unwrap())
+            .unwrap();
+        assert_eq!(probed, placed.root.join("checkout"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_target_moved_onto_nfs_while_it_is_checked_is_still_refused() {
+        use std::os::unix::fs::symlink;
+        for destination in ["target", "not/created"] {
+            let placed = Placement::new();
+            std::fs::create_dir(&placed.target).unwrap();
+            let remote = placed.nfs.join(destination);
+            let error = placed
+                .checked_while(|| {
+                    std::fs::remove_dir(&placed.target).unwrap();
+                    if destination == "target" {
+                        std::fs::create_dir(&remote).unwrap();
+                    }
+                    symlink(&remote, &placed.target).unwrap();
+                })
+                .unwrap_err();
+            assert!(error.to_string().contains("is on NFS"), "{error:#}");
+        }
+    }
+
+    /// Only a path that is gone at the second look is looked at again.
+    #[test]
+    #[cfg(unix)]
+    fn a_target_that_stops_being_a_link_while_it_is_checked_is_an_error() {
+        use std::os::unix::fs::symlink;
+        let placed = Placement::new();
+        std::fs::create_dir(&placed.view).unwrap();
+        symlink(&placed.view, &placed.target).unwrap();
+        let error = placed
+            .checked_while(|| {
+                std::fs::remove_file(&placed.target).unwrap();
+                std::fs::create_dir(&placed.target).unwrap();
+            })
+            .unwrap_err();
+        let cause = error.downcast_ref::<io::Error>().unwrap();
+        assert_eq!(cause.kind(), io::ErrorKind::InvalidInput, "{error:#}");
+        assert!(error.to_string().contains("could not inspect"));
+    }
+
+    /// A path that is there at every first look and gone at every second
+    /// uses up the walk's bound instead of holding the command forever.
+    #[test]
+    fn a_target_that_never_holds_still_is_refused_within_the_bound() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().canonicalize().unwrap().join("target");
+        let mut looks = 0;
+        let error = require_local_observed(
+            &target,
+            "Cargo target directory",
+            "CARGO_TARGET_DIR or build.target-dir",
+            |_| Ok(false),
+            &mut |path, look| {
+                if path != target {
+                    return;
+                }
+                looks += 1;
+                match look {
+                    Look::Kind => std::fs::create_dir(&target).unwrap(),
+                    Look::Destination => std::fs::remove_dir(&target).unwrap(),
+                }
+            },
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("too many directory or symbolic-link components"),
+            "{error:#}"
+        );
+        assert_eq!(looks, 2 * 257);
     }
 
     #[test]
