@@ -103,6 +103,19 @@ async fn a_client_learns_that_this_mbx_gates_tests() {
     assert_eq!(client.reply().await, granted(1, 1));
     client.close().await;
 }
+
+#[tokio::test]
+async fn a_client_learns_the_pools_aging_bound() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut client = Client::connect(&pools(dir.path(), 2));
+    client.send(json!({"type": "capabilities"})).await;
+    assert_eq!(
+        client.reply().await,
+        Some(json!({"type": "capabilities", "test_gate": true, "aging_ms": 30_000}))
+    );
+    client.close().await;
+}
+
 #[test]
 fn a_request_is_exactly_one_of_the_protocol_lines() {
     for (line, request) in [
