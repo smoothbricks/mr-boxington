@@ -327,25 +327,26 @@ position.
 
 A reservation may name a minimum: `mbx reserve --min N`, or `min` on a
 [served reservation](#serve-reservations-to-many-commands). Until it has
-waited 30 seconds, it starts only once that many of its cores are free, and
-then at once on as many of the cores it asked for as are free: `--cpus` stays
-a ceiling, not a target, and a grant never grows after it starts or is taken
-back. The minimum is cut to the cores of the smallest scope the reservation is
-charged in, so it never waits for cores no scope has, and a minimum of one is
-no minimum. While it gathers, it keeps its place in its band, and no request
-that asked after it or comes after it in the order starts if it is `low` or
-belongs to the reservation's party: the other reservations of the same
-`mbx reservations` server, which serves one Nx run, or, for an `mbx reserve`
-run inside an mbx Cargo build, that build's compiles, links and tests. Every
-other request passes it as it passes any request that cannot start, and so
-does a request that asked after it but sorts ahead of it and gathers toward a
-minimum of its own: two gathering reservations wait for each other only in
-the order, never both for each other. A Cargo build's compiles, links and
-tests carry that build's own id and nothing that names the server, so a
-served reservation holds back only its server's reservations and `low` work.
-At 30 seconds it starts on what is free, as a reservation without a minimum
-does. Its decision rows carry `min`, and an admission that started on fewer
-cores than its minimum carries `short_of_min: true`.
+waited 30 seconds (the pool's aging bound, which the reservations endpoint
+states as `aging_ms` in its `capabilities` answer), it starts only once that
+many of its cores are free, and then at once on as many of the cores it asked
+for as are free: `--cpus` stays a ceiling, not a target, and a grant never
+grows after it starts or is taken back. The minimum is cut to the cores of the
+smallest scope the reservation is charged in, so it never waits for cores no
+scope has, and a minimum of one is no minimum. While it gathers, it keeps its
+place in its band, and no request that asked after it or comes after it in the
+order starts if it is `low` or belongs to the reservation's party: the other
+reservations of the same `mbx reservations` server, which serves one Nx run,
+or, for an `mbx reserve` run inside an mbx Cargo build, that build's compiles,
+links and tests. Every other request passes it as it passes any request that
+cannot start, and so does a request that asked after it but sorts ahead of it
+and gathers toward a minimum of its own: two gathering reservations wait for
+each other only in the order, never both for each other. A Cargo build's
+compiles, links and tests carry that build's own id and nothing that names the
+server, so a served reservation holds back only its server's reservations and
+`low` work. At 30 seconds it starts on what is free, as a reservation without
+a minimum does. Its decision rows carry `min`, and an admission that started
+on fewer cores than its minimum carries `short_of_min: true`.
 
 Each admission attempt serves the whole queue. Whichever process takes the
 pool's lock admits, in that order, every waiting request these rules admit,
@@ -544,9 +545,11 @@ connection does not hold is answered `{"type":"error","error":"..."}`, and the
 connection is closed with the same effect.
 
 `{"type":"capabilities"}` is answered
-`{"type":"capabilities","test_gate":true}` by an mbx whose test runner asks a
-[test gate](#schedule-test-binaries) before it starts a nextest test; an mbx
-that does not know the request answers an error and closes the connection.
+`{"type":"capabilities","test_gate":true,"aging_ms":30000}` by an mbx whose test
+runner asks a [test gate](#schedule-test-binaries) before it starts a nextest
+test, with `aging_ms` stating the pool's aging bound, which a `min` gathers for
+at most; an mbx that does not know the request answers an error and closes the
+connection.
 
 A served reservation runs no command, so mbx sets no `MBX_RESERVE_CPUS` and
 announces nothing on a grant descriptor: the client hands the granted count to

@@ -23,8 +23,10 @@
 //! - `{"type":"release","id":N}` gives grant `N` back, or withdraws it while it
 //!   still waits. It has no reply.
 //! - `{"type":"capabilities"}` is answered
-//!   `{"type":"capabilities","test_gate":true}`: this mbx's test shim asks the
-//!   gate `MBX_TEST_GATE` names before it starts a nextest test.
+//!   `{"type":"capabilities","test_gate":true,"aging_ms":30000}`: this mbx's
+//!   test shim asks the gate `MBX_TEST_GATE` names before it starts a nextest
+//!   test, and `aging_ms` is the pool's aging bound, which a `min` gathers for
+//!   at most.
 //!
 //! A connection holds any number of grants at once, each under the id its
 //! client chose; an id is free again once released. Replies come in the order
@@ -44,7 +46,7 @@
 //! write end, so the server, and every grant it serves, ends with the starter.
 
 use crate::config::{Config, SchedulerPriority};
-use crate::scheduler::{Admission, Permit, Pool, SCHED_DISABLE_ENV};
+use crate::scheduler::{AGING_MS, Admission, Permit, Pool, SCHED_DISABLE_ENV};
 use eyre::{Result, WrapErr};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -103,8 +105,9 @@ pub(super) enum Reply {
     /// The client broke the protocol; the connection closes after this line.
     Error { error: String },
     /// This mbx's test shim asks `MBX_TEST_GATE` before it starts a nextest
-    /// test (`cli/test_runner.rs`).
-    Capabilities { test_gate: bool },
+    /// test (`cli/test_runner.rs`), and `aging_ms` states the pool's aging
+    /// bound (`AGING_MS`), which a `min` gathers for at most.
+    Capabilities { test_gate: bool, aging_ms: u64 },
 }
 
 /// The pool at each priority a request may name: the same pools
@@ -350,7 +353,10 @@ impl Connection {
                 Some(_) => Step::Quiet,
                 None => Step::Close(format!("no reservation {id} on this connection to release")),
             },
-            Ok(Request::Capabilities) => Step::Say(Reply::Capabilities { test_gate: true }),
+            Ok(Request::Capabilities) => Step::Say(Reply::Capabilities {
+                test_gate: true,
+                aging_ms: AGING_MS,
+            }),
             Err(error) => Step::Close(format!("not a reservation request: {error}")),
         }
     }

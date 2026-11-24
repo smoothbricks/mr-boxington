@@ -958,7 +958,7 @@ struct Pass {
 /// How long a request waits before it goes ahead of the fresher requests of
 /// its priority and, unable to start even so, holds back the requests behind
 /// it in the scopes it is short of: the starvation bound.
-const AGING_MS: u64 = 30_000;
+pub(crate) const AGING_MS: u64 = 30_000;
 
 /// How long after its job started an `interactive` request still asks as
 /// `interactive`; until [`NORMAL_UNTIL_MS`] it asks as `normal`, then as

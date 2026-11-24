@@ -90,29 +90,17 @@ async fn queued(dir: &Path, requests: usize) {
 }
 
 #[tokio::test]
-async fn a_client_learns_that_this_mbx_gates_tests() {
+async fn a_client_learns_the_endpoints_capabilities() {
     let dir = tempfile::tempdir().unwrap();
     let mut client = Client::connect(&pools(dir.path(), 2));
     client.send(json!({"type": "capabilities"})).await;
     assert_eq!(
         client.reply().await,
-        Some(json!({"type": "capabilities", "test_gate": true}))
+        Some(json!({"type": "capabilities", "test_gate": true, "aging_ms": AGING_MS}))
     );
     // The connection keeps serving.
     client.send(reserve(1, 1, "low")).await;
     assert_eq!(client.reply().await, granted(1, 1));
-    client.close().await;
-}
-
-#[tokio::test]
-async fn a_client_learns_the_pools_aging_bound() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut client = Client::connect(&pools(dir.path(), 2));
-    client.send(json!({"type": "capabilities"})).await;
-    assert_eq!(
-        client.reply().await,
-        Some(json!({"type": "capabilities", "test_gate": true, "aging_ms": 30_000}))
-    );
     client.close().await;
 }
 
