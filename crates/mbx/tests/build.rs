@@ -10648,3 +10648,126 @@ fn damaged_shared_out_dir_falls_back_in_a_second_checkout() {
         }
     }
 }
+
+/// Build-script launchers name their profile's pinned mbx by absolute path, so
+/// cloning a checkout that carries a real unplaced `target/` (as a copy-on-write
+/// fork does) leaves launchers pointing into the source checkout. Once the source
+/// is removed, rerunning a build script without recompiling it fails unless mbx
+/// repairs launchers for unplaced target directories too.
+#[cfg(unix)]
+#[test]
+fn a_cloned_unplaced_target_runs_its_build_scripts_after_the_source_is_removed() {
+    let store = tempfile::tempdir().unwrap();
+    let reports = tempfile::tempdir().unwrap();
+    // Keep the workspace path short so the pinned binary fits within the Unix
+    // `#!` shebang limit instead of falling back to the relative shell launcher.
+    let directory = tempfile::Builder::new()
+        .prefix("m")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let root = std::fs::canonicalize(directory.path()).unwrap();
+    let source = root.join("a");
+    let copy = root.join("b");
+    write_project(&source);
+    std::fs::write(
+        source.join("build.rs"),
+        r#"fn main() {
+    println!("cargo:rerun-if-env-changed=CLONED_BUILD_VALUE");
+    let value = std::env::var("CLONED_BUILD_VALUE").unwrap_or_else(|_| "unset".into());
+    let out = std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
+    std::fs::write(
+        out.join("value.rs"),
+        format!("pub const VALUE: &str = {value:?};\n"),
+    )
+    .unwrap();
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        source.join("src/lib.rs"),
+        "include!(concat!(env!(\"OUT_DIR\"), \"/value.rs\"));\n",
+    )
+    .unwrap();
+    std::fs::write(
+        source.join("src/main.rs"),
+        "fn main() {\n    println!(\"{}\", fixture::VALUE);\n}\n",
+    )
+    .unwrap();
+
+    build_with(
+        &source,
+        store.path(),
+        &reports.path().join("first.json"),
+        &[
+            ("MBX_TARGET_VIEWS", "0"),
+            ("MBX_CACHE_LINKS", "0"),
+            ("CLONED_BUILD_VALUE", "first"),
+        ],
+    );
+
+    assert!(
+        std::fs::symlink_metadata(source.join("target"))
+            .unwrap()
+            .is_dir(),
+        "MBX_TARGET_VIEWS=0 should leave target/ as a real directory"
+    );
+    let launchers = find_files(&source.join("target/debug/build"), |path| {
+        file_name_is(path, |name| {
+            (name == "build_script_build" || name.starts_with("build_script_build-"))
+                && !name.ends_with(".d")
+                && !name.ends_with(".pdb")
+                && !name.contains(".mbx-real")
+                && path.with_file_name(format!("{name}.mbx-real")).is_file()
+        })
+    });
+    assert!(
+        !launchers.is_empty(),
+        "the first build should install a build-script launcher"
+    );
+    let launcher = std::fs::read_to_string(&launchers[0]).unwrap();
+    let interpreter = launcher
+        .strip_prefix("#!")
+        .expect("the build script should use a direct shebang launcher")
+        .trim_end();
+    assert!(
+        !interpreter.contains('\n') && Path::new(interpreter).starts_with(&source),
+        "the first launcher should name the source path: {launcher:?}"
+    );
+
+    let status = Command::new("cp")
+        .arg("-Rp")
+        .arg(&source)
+        .arg(&copy)
+        .status()
+        .expect("cp should run");
+    assert!(status.success(), "cp -Rp should copy the workspace");
+    std::fs::remove_dir_all(&source).unwrap();
+
+    build_with(
+        &copy,
+        store.path(),
+        &reports.path().join("second.json"),
+        &[
+            ("MBX_TARGET_VIEWS", "0"),
+            ("MBX_CACHE_LINKS", "0"),
+            ("CLONED_BUILD_VALUE", "second"),
+        ],
+    );
+
+    assert!(
+        std::fs::symlink_metadata(copy.join("target"))
+            .unwrap()
+            .is_dir(),
+        "the cloned target/ should stay a real directory"
+    );
+    let output = Command::new(copy.join("target/debug/fixture"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"second\n");
+}
