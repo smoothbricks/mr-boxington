@@ -416,7 +416,7 @@ fn cargo_with_settings_bypass_log_and_roots(
             ByteSize::b(bytes).display().iec()
         ));
     }
-    if let Some(view) = placement.directory.as_deref() {
+    let placed_view = placement.directory.as_deref().map(|view| {
         // A check lane and the editor's checks keep profiles of their own below
         // the managed target, so they start from the same lane in another
         // checkout rather than from its build profiles.
@@ -437,25 +437,29 @@ fn cargo_with_settings_bypass_log_and_roots(
         } else {
             view.to_path_buf()
         };
-        // Launchers name their pinned mbx by absolute path, so a profile that
-        // has moved needs them rewritten whether or not it is also seeded.
-        #[cfg(unix)]
+        (view, lane)
+    });
+    // Launchers name their pinned mbx by absolute path, so a profile that has
+    // moved needs them rewritten whether or not placement ran: a clone or move
+    // of a real `target/` (such as a copy-on-write fork) carries launchers that
+    // still name the old path.
+    #[cfg(unix)]
+    {
+        let launcher_root = if let Some((view, lane)) = &placed_view {
+            view.join(lane)
+        } else {
+            roots.target_dir.clone()
+        };
         crate::target_seed::repair_all_launchers(
-            &view.join(lane),
+            &launcher_root,
             &crate::target_seed::profile_directories(arguments),
         );
-        if config.target.seed {
-            seed_target_view(
-                config,
-                &cargo,
-                &roots.workspace_root,
-                &view,
-                lane,
-                arguments,
-            );
-        }
     }
-    if placement.directory.is_none() {
+    if let Some((view, lane)) = &placed_view {
+        if config.target.seed {
+            seed_target_view(config, &cargo, &roots.workspace_root, view, lane, arguments);
+        }
+    } else {
         // Placement declined, but an earlier one may have left a link this
         // build is about to write through. Keep that directory's record fresh
         // so collection does not treat it as idle.

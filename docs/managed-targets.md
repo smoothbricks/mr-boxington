@@ -44,6 +44,10 @@ where mbx leaves an existing `target/` in place, including every CI build, see
 [Adoption during a build](#adoption-during-a-build) and
 [Eligibility and recovery](#eligibility-and-recovery).
 
+Build-script launchers in a target directory mbx does not place are repaired
+the same way as in a managed target when the directory moves or is cloned to a
+new path.
+
 ## Checks run beside builds {#check-lanes}
 
 Cargo locks a target directory while it compiles, so a `cargo clippy` started
