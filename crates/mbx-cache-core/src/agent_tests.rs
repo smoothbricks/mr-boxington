@@ -7967,3 +7967,48 @@ async fn waiting_callers_read_a_racy_file_digest_independently() {
     assert!(agent.file_digests.lock().unwrap().is_empty());
     assert!(flight.resolution.lock().unwrap().is_none());
 }
+
+#[tokio::test]
+async fn sibling_task_without_manifest_or_fallback_finds_recorded_prediction() {
+    let directory = tempfile::tempdir().unwrap();
+    let cache = directory.path().join("cache");
+    let task_a = "a".repeat(64);
+    let task_b = "b".repeat(64);
+    let invocation = CacheDigest::blake3(b"sibling invocation");
+    let prediction = ActionPrediction {
+        invocation: invocation.clone(),
+        action: CacheDigest::blake3(b"sibling action"),
+        adapter: "rustc".into(),
+        payload: "{}".into(),
+    };
+
+    let seed = CacheAgent::new(&cache, "test-version");
+    let run_a = seed.begin_task(&task_a).await.unwrap();
+    assert!(matches!(
+        seed.respond(AgentRequest::RecordActionPrediction {
+            task: run_a.clone(),
+            prediction: prediction.clone(),
+        })
+        .await,
+        AgentResponse::ActionPredictionRecorded
+    ));
+    seed.commit_task(&run_a).await.unwrap();
+
+    let sibling = CacheAgent::new(&cache, "test-version");
+    let run_b = sibling.begin_task(&task_b).await.unwrap();
+    let response = sibling
+        .respond(AgentRequest::FindActionPrediction {
+            task: run_b,
+            invocation,
+        })
+        .await;
+    assert!(
+        matches!(
+            &response,
+            AgentResponse::ActionPrediction {
+                prediction: Some(found)
+            } if *found == prediction
+        ),
+        "expected sibling task to find prediction from local index, got {response:?}"
+    );
+}
