@@ -3223,6 +3223,115 @@ fn scheduler_stats_activity_only_excludes_history_and_full_report_fields() {
 }
 
 #[test]
+fn scheduler_stats_publish_first_admitted_without_modifying_records() {
+    static CLOCK: AtomicU64 = AtomicU64::new(0);
+    const GRANTED_START: u64 = 1_000_000;
+    const GRANT_MS: u64 = 1_050_000;
+    const QUEUED_START: u64 = 1_010_000;
+    const QUEUED_ASK_MS: u64 = 1_060_000;
+
+    let directory = tempfile::tempdir().unwrap();
+    let config = Config::for_test(directory.path());
+    let scheduler_dir = config.cache_dir.join(SCHEDULER_DIR);
+    let record_path = scheduler_dir.join(FIRST_ADMITTED_FILE);
+
+    let full_empty = serde_json::to_value(scheduler_report(&config)).unwrap();
+    let activity_empty = serde_json::to_value(scheduler_activity_report(&config)).unwrap();
+    assert_eq!(full_empty["first_admitted"], serde_json::json!([]));
+    assert_eq!(
+        activity_empty["scheduler"]["first_admitted"],
+        serde_json::json!([])
+    );
+
+    let mut granted_pool = pool_at(&scheduler_dir, 1, 0);
+    granted_pool.priority = SchedulerPriority::Interactive;
+    granted_pool.job_id = Some("job-granted".into());
+    granted_pool.job_started_ms = Some(GRANTED_START);
+    granted_pool.clock = || CLOCK.load(Ordering::SeqCst);
+
+    CLOCK.store(GRANT_MS, Ordering::SeqCst);
+    let held = granted_pool
+        .try_admit_named(
+            Resources {
+                cpu: 1,
+                memory_bytes: 0,
+            },
+            1,
+            None,
+            &mut None,
+            Some(&Demand::new("granted-crate", false)),
+        )
+        .unwrap()
+        .expect("interactive job is granted");
+
+    let mut queued_pool = pool_at(&scheduler_dir, 1, 0);
+    queued_pool.priority = SchedulerPriority::Interactive;
+    queued_pool.job_id = Some("job-never-granted".into());
+    queued_pool.job_started_ms = Some(QUEUED_START);
+    queued_pool.clock = || CLOCK.load(Ordering::SeqCst);
+
+    CLOCK.store(QUEUED_ASK_MS, Ordering::SeqCst);
+    let mut queued = None;
+    assert!(
+        queued_pool
+            .try_admit_named(
+                Resources {
+                    cpu: 1,
+                    memory_bytes: 0,
+                },
+                1,
+                None,
+                &mut queued,
+                Some(&Demand::new("queued-crate", false)),
+            )
+            .unwrap()
+            .is_none(),
+        "second interactive job queues without a grant"
+    );
+
+    let before_bytes = std::fs::read(&record_path).unwrap();
+    let expected = serde_json::json!([{
+        "job_id": "job-granted",
+        "job_started_ms": GRANTED_START,
+        "first_admitted_ms": GRANT_MS,
+    }]);
+
+    let full = serde_json::to_value(scheduler_report(&config)).unwrap();
+    let activity = serde_json::to_value(scheduler_activity_report(&config)).unwrap();
+    assert_eq!(full["first_admitted"], expected);
+    assert_eq!(activity["scheduler"]["first_admitted"], expected);
+    assert_eq!(
+        std::fs::read(&record_path).unwrap(),
+        before_bytes,
+        "stats read must leave first_admitted.json byte-identical"
+    );
+
+    // Dropping the live lease and waiter makes the entry stale; stats still must not prune it.
+    drop(queued);
+    drop(held);
+    let full_stale = serde_json::to_value(scheduler_report(&config)).unwrap();
+    let activity_stale = serde_json::to_value(scheduler_activity_report(&config)).unwrap();
+    assert_eq!(full_stale["first_admitted"], expected);
+    assert_eq!(activity_stale["scheduler"]["first_admitted"], expected);
+    assert_eq!(
+        std::fs::read(&record_path).unwrap(),
+        before_bytes,
+        "stats read must not prune stale first_admitted.json records"
+    );
+
+    let corrupt = b"not json";
+    std::fs::write(&record_path, corrupt).unwrap();
+    let full_corrupt = serde_json::to_value(scheduler_report(&config)).unwrap();
+    let activity_corrupt = serde_json::to_value(scheduler_activity_report(&config)).unwrap();
+    assert_eq!(full_corrupt["first_admitted"], serde_json::json!([]));
+    assert_eq!(
+        activity_corrupt["scheduler"]["first_admitted"],
+        serde_json::json!([])
+    );
+    assert_eq!(std::fs::read(&record_path).unwrap(), corrupt);
+}
+
+#[test]
 fn scheduler_stats_report_links_and_defer_test_charges_to_admission() {
     let directory = tempfile::tempdir().unwrap();
     let pool = pool_at(directory.path(), 10, 100);
