@@ -42,6 +42,44 @@ pub fn open_shared_lock(path: &Path) -> std::io::Result<fslock::LockFile> {
     fslock::LockFile::open(path)
 }
 
+/// Atomically write `contents` to `path` via a sibling temporary file, syncing
+/// it to disk before replacing `path`.
+pub fn write_atomic(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    write_via_tempfile(path, contents, true)
+}
+
+/// Atomically write `contents` to `path` via a sibling temporary file without
+/// syncing to disk, for advisory or self-validating records.
+pub fn write_atomic_unsynced(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    write_via_tempfile(path, contents, false)
+}
+
+fn write_via_tempfile(path: &Path, contents: &[u8], sync: bool) -> std::io::Result<()> {
+    use std::io::Write as _;
+
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("path has no parent: {}", path.display()),
+            )
+        })?;
+    std::fs::create_dir_all(parent)?;
+    let mut temporary = shared_tempfile_builder()
+        .prefix(".mbx-")
+        .tempfile_in(parent)?;
+    temporary.write_all(contents)?;
+    if sync {
+        temporary.as_file_mut().sync_all()?;
+    } else {
+        temporary.flush()?;
+    }
+    temporary.persist(path).map_err(|error| error.error)?;
+    Ok(())
+}
+
 /// Clone `from` to `to` where the filesystem can, and copy it where it cannot.
 ///
 /// `reflink_copy::reflink_or_copy` gives up instead of copying when the clone

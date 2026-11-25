@@ -4181,8 +4181,10 @@ fn a_noisy_build_script_keeps_the_stored_result_and_restores_it_next_time() {
     };
 
     build(first.path(), "first");
-    // The prediction is retired, as a full task manifest retires it.
+    // The prediction is retired, as a full task manifest retires it, and its
+    // per-invocation index entry with it, as the collector retires that.
     std::fs::remove_dir_all(store.path().join("actions/task-manifests/v1")).unwrap();
+    std::fs::remove_dir_all(store.path().join("actions/predictions/v1")).unwrap();
     let (_, conflicted) = build(second.path(), "conflicted");
     assert!(
         conflicted.contains("noisy-fixture build script: kept the result already stored")

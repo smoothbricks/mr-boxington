@@ -1,9 +1,12 @@
-use crate::{CacheDigest, RemoteActionResult, canonical_json};
+use crate::{ActionPrediction, CacheDigest, RemoteActionResult, canonical_json};
 use eyre::{Result, bail};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
+
+/// Relative store directory for the local per-invocation prediction index.
+pub const PREDICTION_INDEX_DIR: &str = "predictions/v1";
 
 /// Why [`LocalActionCache::store`] refuses to replace an intact result.
 pub const ACTION_CONFLICT_MESSAGE: &str = "local action key already has a different result";
@@ -126,6 +129,27 @@ pub struct LocalActionCache {
     cas: LocalCas,
 }
 
+/// A local per-invocation fallback index from invocation digests to their
+/// latest recorded [`ActionPrediction`].
+#[derive(Debug, Clone)]
+pub struct LocalPredictionIndex {
+    root: PathBuf,
+}
+
+fn sharded_digest_path(
+    root: &Path,
+    subdir: &str,
+    digest: &CacheDigest,
+    extension: &str,
+) -> Result<PathBuf> {
+    digest.validate()?;
+    Ok(root
+        .join(subdir)
+        .join(&digest.algorithm)
+        .join(&digest.hash[..2])
+        .join(format!("{}-{}{extension}", digest.hash, digest.size)))
+}
+
 /// The result of publishing an action with first-writer semantics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActionStoreOutcome {
@@ -150,13 +174,7 @@ impl LocalCas {
 
     /// Resolve the storage path for a validated digest.
     pub fn path_for(&self, digest: &CacheDigest) -> Result<PathBuf> {
-        digest.validate()?;
-        Ok(self
-            .root
-            .join("cas/v1")
-            .join(&digest.algorithm)
-            .join(&digest.hash[..2])
-            .join(format!("{}-{}", digest.hash, digest.size)))
+        sharded_digest_path(&self.root, "cas/v1", digest, "")
     }
 
     /// Record that a build used the object `digest` names at `now`; see
@@ -399,12 +417,7 @@ impl LocalActionCache {
         if action.algorithm != "blake3" {
             bail!("local action keys must use blake3");
         }
-        Ok(self
-            .root
-            .join("action-results/v1")
-            .join(&action.algorithm)
-            .join(&action.hash[..2])
-            .join(format!("{}-{}.json", action.hash, action.size)))
+        sharded_digest_path(&self.root, "action-results/v1", action, ".json")
     }
 
     /// Find and strictly validate a canonical action result.
@@ -655,6 +668,87 @@ impl LocalActionCache {
             }
         }
         bail!("action record kept changing while publishing")
+    }
+}
+
+impl LocalPredictionIndex {
+    /// Create a per-invocation prediction index beneath `root`.
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self { root: root.into() }
+    }
+
+    /// Resolve the storage path for an invocation digest.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `invocation` is invalid or does not use `blake3`.
+    pub fn path_for(&self, invocation: &CacheDigest) -> Result<PathBuf> {
+        invocation.validate()?;
+        if invocation.algorithm != "blake3" {
+            bail!("local prediction keys must use blake3");
+        }
+        sharded_digest_path(&self.root, PREDICTION_INDEX_DIR, invocation, ".json")
+    }
+
+    /// Parse and strictly validate canonical prediction index bytes.
+    #[must_use]
+    pub fn parse_entry(bytes: &[u8]) -> Option<ActionPrediction> {
+        let prediction: ActionPrediction = serde_json::from_slice(bytes).ok()?;
+        prediction.validate().ok()?;
+        (canonical_json(&prediction).ok().as_deref() == Some(bytes)).then_some(prediction)
+    }
+
+    /// Look up the latest recorded prediction for `invocation`.
+    ///
+    /// Missing, unreadable, or corrupt entries return `None` rather than
+    /// failing the lookup; operational failures are logged at `debug`.
+    #[must_use]
+    pub fn find(&self, invocation: &CacheDigest) -> Option<ActionPrediction> {
+        let path = match self.path_for(invocation) {
+            Ok(path) => path,
+            Err(error) => {
+                log::debug!("ignoring invalid prediction index lookup: {error}");
+                return None;
+            }
+        };
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(error) => {
+                log::debug!(
+                    "could not read prediction index {}: {error}",
+                    path.display()
+                );
+                return None;
+            }
+        };
+        match Self::parse_entry(&bytes) {
+            Some(prediction) if prediction.invocation == *invocation => Some(prediction),
+            _ => {
+                log::debug!("ignoring corrupt prediction index entry {}", path.display());
+                None
+            }
+        }
+    }
+
+    /// Atomically store `prediction` under its invocation digest when the
+    /// existing entry is absent or differs.
+    ///
+    /// Returns `Ok(true)` if the entry was written and `Ok(false)` when an
+    /// identical entry was already on disk.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `prediction` is invalid or the atomic write fails.
+    pub fn store(&self, prediction: &ActionPrediction) -> Result<bool> {
+        prediction.validate()?;
+        let path = self.path_for(&prediction.invocation)?;
+        let bytes = canonical_json(prediction)?;
+        if fs::read(&path).is_ok_and(|existing| existing == bytes) {
+            return Ok(false);
+        }
+        crate::write_atomic_unsynced(&path, &bytes)?;
+        Ok(true)
     }
 }
 

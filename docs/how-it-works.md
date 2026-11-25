@@ -158,11 +158,19 @@ build, which list the files each compilation read. It records the set as a
 key to look up yet. mbx still stores it after compiling, so it can warm the
 next build.
 
-Predictions are grouped by the `Cargo.lock` digest. When a dependency update
-creates a new group, mbx looks for earlier predictions in up to eight lockfile
-states from Git history, then in recent local store records. Each borrowed
-prediction is checked against the current inputs: unchanged crates can hit,
-while changed crates compile and record new predictions.
+Predictions are grouped by the `Cargo.lock` digest into a task manifest, which
+remains the unit for prefetching and remote publication. When a dependency
+update creates a new group, mbx looks for earlier predictions in up to eight
+lockfile states from Git history, then in recent local store records.
+
+Locally, mbx also maintains a per-invocation prediction index as a fallback
+when the active task manifest misses an invocation. That covers predictions
+recorded under a sibling checkout's lockfile as well as rarely run invocations
+evicted by LRU pruning when a manifest reaches its size limit. The index stays
+local and is pruned with its action results by `mbx gc`. Every prediction—from
+a manifest, a borrowed lockfile, or the local index—is checked against the
+current inputs before restoring: unchanged crates can hit, while changed crates
+compile and record new predictions.
 
 mbx saves the borrowed record under the new lockfile for subsequent commands,
 and eligible trusted CI builds publish it remotely. A shallow clone limits

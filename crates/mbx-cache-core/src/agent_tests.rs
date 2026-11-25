@@ -8012,3 +8012,238 @@ async fn sibling_task_without_manifest_or_fallback_finds_recorded_prediction() {
         "expected sibling task to find prediction from local index, got {response:?}"
     );
 }
+
+#[tokio::test]
+async fn prediction_index_backfills_legacy_stores_skips_unchanged_writes_and_keeps_latest() {
+    let directory = tempfile::tempdir().unwrap();
+    let cache = directory.path().join("cache");
+    let task_a = "a".repeat(64);
+    let task_b = "b".repeat(64);
+    let invocation = CacheDigest::blake3(b"backfill invocation");
+    let initial = ActionPrediction {
+        invocation: invocation.clone(),
+        action: CacheDigest::blake3(b"initial action"),
+        adapter: "rustc".into(),
+        payload: "{}".into(),
+    };
+    let updated = ActionPrediction {
+        invocation: invocation.clone(),
+        action: CacheDigest::blake3(b"updated action"),
+        adapter: "rustc".into(),
+        payload: "{\"v\":2}".into(),
+    };
+
+    // Simulate a store that predates the per-invocation index: only the task
+    // manifest is on disk.
+    let legacy = CacheAgent::new(&cache, "test-version");
+    legacy
+        .persist_task_manifest(&TaskActionManifest {
+            version: TASK_ACTION_MANIFEST_VERSION,
+            task: task_a.clone(),
+            predictions: vec![initial.clone()],
+        })
+        .unwrap();
+    let index = LocalPredictionIndex::new(&cache);
+    let index_path = index.path_for(&invocation).unwrap();
+    assert!(!index_path.exists());
+
+    // A hit-only run recording the same prediction backfills the missing index
+    // entry without rewriting the manifest.
+    let first_hit = CacheAgent::new(&cache, "test-version");
+    let run = first_hit.begin_task(&task_a).await.unwrap();
+    assert!(matches!(
+        first_hit
+            .respond(AgentRequest::RecordActionPrediction {
+                task: run.clone(),
+                prediction: initial.clone(),
+            })
+            .await,
+        AgentResponse::ActionPredictionRecorded
+    ));
+    first_hit.commit_task(&run).await.unwrap();
+    assert_eq!(index.find(&invocation), Some(initial.clone()));
+
+    // Backdate mtime so we can verify a second hit recording the exact same
+    // prediction performs no write at all.
+    let earlier = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    fs::File::options()
+        .write(true)
+        .open(&index_path)
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(earlier))
+        .unwrap();
+    let second_hit = CacheAgent::new(&cache, "test-version");
+    let run = second_hit.begin_task(&task_a).await.unwrap();
+    assert!(matches!(
+        second_hit
+            .respond(AgentRequest::RecordActionPrediction {
+                task: run.clone(),
+                prediction: initial.clone(),
+            })
+            .await,
+        AgentResponse::ActionPredictionRecorded
+    ));
+    second_hit.commit_task(&run).await.unwrap();
+    assert_eq!(
+        fs::metadata(&index_path).unwrap().modified().unwrap(),
+        earlier,
+        "recording an unchanged prediction must not rewrite the index file"
+    );
+
+    // Recording a newer prediction for the same invocation overwrites the
+    // index entry so the latest recorded prediction wins.
+    let updater = CacheAgent::new(&cache, "test-version");
+    let run = updater.begin_task(&task_a).await.unwrap();
+    assert!(matches!(
+        updater
+            .respond(AgentRequest::RecordActionPrediction {
+                task: run.clone(),
+                prediction: updated.clone(),
+            })
+            .await,
+        AgentResponse::ActionPredictionRecorded
+    ));
+    updater.commit_task(&run).await.unwrap();
+    let sibling = CacheAgent::new(&cache, "test-version");
+    let run_b = sibling.begin_task(&task_b).await.unwrap();
+    assert!(matches!(
+        sibling
+            .respond(AgentRequest::FindActionPrediction {
+                task: run_b,
+                invocation,
+            })
+            .await,
+        AgentResponse::ActionPrediction {
+            prediction: Some(found)
+        } if found == updated
+    ));
+}
+
+#[tokio::test]
+async fn prediction_evicted_from_manifest_is_found_via_local_index_and_corrupt_entry_is_none() {
+    let directory = tempfile::tempdir().unwrap();
+    let cache = directory.path().join("cache");
+    let task = "a".repeat(64);
+    let evicted = ActionPrediction {
+        invocation: CacheDigest::blake3(b"rare cross build script"),
+        action: CacheDigest::blake3(b"rare action"),
+        adapter: "build-script".into(),
+        payload: "{}".into(),
+    };
+    let kept = ActionPrediction {
+        invocation: CacheDigest::blake3(b"frequent crate"),
+        action: CacheDigest::blake3(b"frequent action"),
+        adapter: "rustc".into(),
+        payload: "{}".into(),
+    };
+
+    let seed = CacheAgent::new(&cache, "test-version");
+    let run = seed.begin_task(&task).await.unwrap();
+    for prediction in [&evicted, &kept] {
+        assert!(matches!(
+            seed.respond(AgentRequest::RecordActionPrediction {
+                task: run.clone(),
+                prediction: prediction.clone(),
+            })
+            .await,
+            AgentResponse::ActionPredictionRecorded
+        ));
+    }
+    seed.commit_task(&run).await.unwrap();
+
+    // Simulate LRU eviction dropping `evicted` from the task manifest while
+    // keeping `kept`.
+    seed.persist_task_manifest(&TaskActionManifest {
+        version: TASK_ACTION_MANIFEST_VERSION,
+        task: task.clone(),
+        predictions: vec![kept],
+    })
+    .unwrap();
+
+    let reader = CacheAgent::new(&cache, "test-version");
+    let run = reader.begin_task(&task).await.unwrap();
+    assert!(matches!(
+        reader
+            .respond(AgentRequest::FindActionPrediction {
+                task: run.clone(),
+                invocation: evicted.invocation.clone(),
+            })
+            .await,
+        AgentResponse::ActionPrediction {
+            prediction: Some(found)
+        } if found == evicted
+    ));
+
+    // A corrupt index entry answers None rather than failing the lookup.
+    let index_path = LocalPredictionIndex::new(&cache)
+        .path_for(&evicted.invocation)
+        .unwrap();
+    fs::write(&index_path, b"not valid json").unwrap();
+    assert!(matches!(
+        reader
+            .respond(AgentRequest::FindActionPrediction {
+                task: run,
+                invocation: evicted.invocation,
+            })
+            .await,
+        AgentResponse::ActionPrediction { prediction: None }
+    ));
+}
+
+#[tokio::test]
+async fn local_prediction_index_hit_does_not_trigger_adapter_prefetch() {
+    let directory = tempfile::tempdir().unwrap();
+    let cache = directory.path().join("reader");
+    let mut server = mockito::Server::new_async().await;
+    let task = "b".repeat(64);
+    let manifest_prediction = ActionPrediction {
+        invocation: CacheDigest::blake3(b"manifest rustc"),
+        action: CacheDigest::blake3(b"manifest rustc action"),
+        adapter: "rustc".into(),
+        payload: "{}".into(),
+    };
+    let indexed_prediction = ActionPrediction {
+        invocation: CacheDigest::blake3(b"sibling rustc"),
+        action: CacheDigest::blake3(b"sibling rustc action"),
+        adapter: "rustc".into(),
+        payload: "{}".into(),
+    };
+    LocalPredictionIndex::new(&cache)
+        .store(&indexed_prediction)
+        .unwrap();
+
+    let manifest_bytes = canonical_json(&TaskActionManifest {
+        version: TASK_ACTION_MANIFEST_VERSION,
+        task: task.clone(),
+        predictions: vec![manifest_prediction],
+    })
+    .unwrap();
+    let manifest_etag = blake3::hash(&manifest_bytes).to_hex().to_string();
+    let (_, selector) = CacheAgent::task_manifest_selector(&task).unwrap();
+    let manifest = server
+        .mock("GET", action_manifest_path(&selector).as_str())
+        .with_status(200)
+        .with_header("etag", &format!("\"{manifest_etag}\""))
+        .with_body(manifest_bytes)
+        .expect(1)
+        .create_async()
+        .await;
+    let agent = remote_agent(&server, cache, RemoteCacheMode::ReadOnly);
+
+    let run = agent.begin_task_on_prediction(&task).await.unwrap();
+    assert!(matches!(
+        agent
+            .respond(AgentRequest::FindActionPrediction {
+                task: run,
+                invocation: indexed_prediction.invocation.clone(),
+            })
+            .await,
+        AgentResponse::ActionPrediction {
+            prediction: Some(found)
+        } if found == indexed_prediction
+    ));
+    agent.wait_for_prefetches().await;
+
+    manifest.assert_async().await;
+    assert_eq!(agent.stats().prefetch_runs, 0);
+}

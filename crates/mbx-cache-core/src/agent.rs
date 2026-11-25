@@ -1,9 +1,9 @@
 use crate::uploads::{ConnectionUploads, UploadQueue, UploadSink};
 use crate::{
     ActionPrediction, ActionPromiseCompletion, ActionPromiseState, CacheDigest, CacheDirectory,
-    LocalActionCache, LocalCas, MAX_STAGED_BLOB_PACK_BYTES, ManifestPutOutcome, RemoteActionResult,
-    RemoteCacheClient, RemoteCacheMode, RustcMetadata, TaskActionManifest, blob_pack_chunk,
-    canonical_json,
+    LocalActionCache, LocalCas, LocalPredictionIndex, MAX_STAGED_BLOB_PACK_BYTES,
+    ManifestPutOutcome, RemoteActionResult, RemoteCacheClient, RemoteCacheMode, RustcMetadata,
+    TaskActionManifest, blob_pack_chunk, canonical_json,
 };
 use eyre::{Context, Result, bail};
 use futures_util::{FutureExt, StreamExt, future::BoxFuture, stream};
@@ -354,6 +354,7 @@ pub type TaskLoader = dyn for<'a> Fn(&'a CacheAgent, &'a str) -> BoxFuture<'a, (
 pub struct CacheAgent {
     cas: LocalCas,
     actions: LocalActionCache,
+    predictions: LocalPredictionIndex,
     verified_blobs: Arc<Mutex<BTreeMap<CacheDigest, VerifiedBlob>>>,
     version: Arc<str>,
     write_locks: Arc<Mutex<BTreeMap<CacheDigest, Weak<tokio::sync::Mutex<()>>>>>,
@@ -957,6 +958,7 @@ impl CacheAgent {
         Self {
             cas: LocalCas::new(cache_dir.clone()),
             actions: LocalActionCache::new(cache_dir.clone()),
+            predictions: LocalPredictionIndex::new(cache_dir.clone()),
             verified_blobs: Arc::new(Mutex::new(BTreeMap::new())),
             version,
             write_locks: Arc::new(Mutex::new(BTreeMap::new())),
@@ -1568,8 +1570,11 @@ impl CacheAgent {
                 && !refresh_hit_order
                 && !state.remote_publication_needed
             {
-                let completed = state.pending_predictions.values().cloned().collect();
+                let completed: Vec<ActionPrediction> =
+                    state.pending_predictions.values().cloned().collect();
                 runs.remove(run);
+                drop(runs);
+                self.index_predictions(&completed);
                 return Ok(completed);
             }
             state.clone()
@@ -1639,6 +1644,7 @@ impl CacheAgent {
             && !state.remote_publication_needed
         {
             self.task_actions.lock().unwrap().remove(run);
+            self.index_predictions(&completed);
             return Ok(completed);
         }
         let (manifest, concurrent_updates) = {
@@ -1666,6 +1672,7 @@ impl CacheAgent {
             (manifest, concurrent_updates)
         };
         self.task_actions.lock().unwrap().remove(run);
+        self.index_predictions(&completed);
         if self.remote_mode.writes() {
             // A manifest advertises the actions it predicts, so it must not
             // reach the remote cache before the results a reader would then go
@@ -1845,15 +1852,19 @@ impl CacheAgent {
 
     fn persist_task_manifest(&self, manifest: &TaskActionManifest) -> Result<()> {
         let bytes = canonical_json(manifest)?;
-        fs::create_dir_all(self.manifest_dir.as_path())?;
-        let mut temporary =
-            crate::shared_tempfile_builder().tempfile_in(self.manifest_dir.as_path())?;
-        std::io::Write::write_all(temporary.as_file_mut(), &bytes)?;
-        temporary.as_file_mut().sync_all()?;
-        temporary
-            .persist(self.task_manifest_path(&manifest.task))
-            .map_err(|error| error.error)?;
+        crate::write_atomic(&self.task_manifest_path(&manifest.task), &bytes)?;
         Ok(())
+    }
+
+    fn index_predictions(&self, predictions: &[ActionPrediction]) {
+        for prediction in predictions {
+            if let Err(error) = self.predictions.store(prediction) {
+                debug!(
+                    "could not write prediction index for {}: {error}",
+                    prediction.invocation.hash
+                );
+            }
+        }
     }
 
     async fn get_remote_task_manifest(
@@ -3056,14 +3067,15 @@ impl CacheAgent {
         invocation.validate()?;
         let (prediction, prefetch) = {
             let mut tasks = self.task_actions.lock().unwrap();
-            let Some(state) = tasks.get_mut(task) else {
-                return Ok(AgentResponse::ActionPrediction { prediction: None });
-            };
-            activate_prediction_adapter(state, invocation)
+            match tasks.get_mut(task) {
+                Some(state) => activate_prediction_adapter(state, invocation),
+                None => (None, None),
+            }
         };
         if let Some(prefetch) = prefetch {
             self.spawn_prefetch_predictions(prefetch);
         }
+        let prediction = prediction.or_else(|| self.predictions.find(invocation));
         Ok(AgentResponse::ActionPrediction { prediction })
     }
 

@@ -312,10 +312,14 @@ prefetched 161 actions; 214.8 MiB downloaded and 214.8 MiB stored locally
   lockfile or for an earlier lockfile it can borrow (see the next item), mbx
   prints `no recorded actions for this workspace and Cargo command` and exits
   successfully. There was nothing to fetch, which is normal for a first build.
-- **New lockfile.** A lockfile that has not been built yet borrows the manifest
-  of the most recent earlier lockfile in Git history that has one, looking back
-  up to eight lockfile states, so a dependency bump still prefetches the
-  unchanged part of the graph. A shallow checkout needs that history fetched.
+- **New lockfile.** Prefetch and remote publication continue to operate on the
+  `Cargo.lock`-grouped manifest. A lockfile that has not been built yet borrows
+  the manifest of the most recent earlier lockfile in Git history that has one,
+  looking back up to eight lockfile states, so a dependency bump still
+  prefetches the unchanged part of the graph. (During a local build, a
+  per-invocation prediction index also acts as a local-only fallback for
+  predictions recorded under a sibling checkout's lockfile or evicted from a
+  full manifest by LRU pruning.) A shallow checkout needs that history fetched.
   For GitHub Actions builds of the default pull-request merge commit,
   `fetch-depth: 2` includes its base parent; builds of a PR head or another ref
   may need more history.

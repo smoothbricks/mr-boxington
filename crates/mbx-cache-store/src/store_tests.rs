@@ -1873,6 +1873,7 @@ fn a_blocked_unrooted_object_does_not_cost_a_rooted_one() {
             removed_bytes: 10,
             remaining_bytes: 20,
             freed_results: HashSet::new(),
+            freed_predictions: HashSet::new(),
         },
         "a locked unrooted blob should leave the store over budget before protected objects are evicted"
     );
@@ -3832,4 +3833,218 @@ fn configured_session_limits_and_live_lock_apply_to_real_and_dry_gc() {
             .removed_session_streams,
         1
     );
+}
+
+#[test]
+fn gc_collects_prediction_index_entry_with_its_action_result_and_keeps_live_ones() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = directory.path();
+    let cas = LocalCas::new(store);
+    let results = LocalActionCache::new(store);
+    let predictions = LocalPredictionIndex::new(store);
+    let size = |path: PathBuf| std::fs::metadata(path).unwrap().len();
+
+    let old_output = store_object(store, &[1_u8; 4_096]);
+    let new_output = store_object(store, &[2_u8; 4_096]);
+    let old = store_result(store, "old", std::slice::from_ref(&old_output));
+    let new = store_result(store, "new", std::slice::from_ref(&new_output));
+    let old_prediction = ActionPrediction {
+        invocation: CacheDigest::blake3(b"old invocation"),
+        action: old.clone(),
+        adapter: "rustc".into(),
+        payload: "{}".into(),
+    };
+    let new_prediction = ActionPrediction {
+        invocation: CacheDigest::blake3(b"new invocation"),
+        action: new.clone(),
+        adapter: "rustc".into(),
+        payload: "{}".into(),
+    };
+    predictions.store(&old_prediction).unwrap();
+    predictions.store(&new_prediction).unwrap();
+
+    let old_root = results.find(&old).unwrap().unwrap().output_root.unwrap();
+    let new_root = results.find(&new).unwrap().unwrap().output_root.unwrap();
+    let old_objects = [&old, &old_root, &old_output];
+    let new_objects = [&new, &new_root, &new_output];
+    for digest in old_objects {
+        age(store, digest, Duration::from_secs(2 * 60 * 60));
+    }
+    for digest in new_objects {
+        age(store, digest, Duration::from_secs(60));
+    }
+    age_result(store, &old, Duration::from_secs(2 * 60 * 60));
+    age_result(store, &new, Duration::from_secs(60));
+
+    let old_pred_path = predictions.path_for(&old_prediction.invocation).unwrap();
+    let new_pred_path = predictions.path_for(&new_prediction.invocation).unwrap();
+    let old_bytes = old_objects
+        .iter()
+        .map(|digest| size(cas.path_for(digest).unwrap()))
+        .sum::<u64>()
+        + size(results.path_for(&old).unwrap())
+        + size(old_pred_path.clone());
+    let new_bytes = new_objects
+        .iter()
+        .map(|digest| size(cas.path_for(digest).unwrap()))
+        .sum::<u64>()
+        + size(results.path_for(&new).unwrap())
+        + size(new_pred_path.clone());
+
+    let dry = gc_dry_run(store, new_bytes).unwrap();
+    assert_eq!(dry.removed_objects, 3);
+    assert_eq!(dry.removed_action_results, 1);
+    assert_eq!(dry.removed_bytes, old_bytes);
+    assert_eq!(dry.remaining_bytes, new_bytes);
+    assert!(old_pred_path.exists());
+    assert!(new_pred_path.exists());
+
+    let outcome = gc(store, new_bytes).unwrap();
+    assert_eq!(outcome.removed_objects, 3);
+    assert_eq!(outcome.removed_action_results, 1);
+    assert_eq!(outcome.removed_bytes, old_bytes);
+    assert_eq!(outcome.remaining_bytes, new_bytes);
+    assert!(results.find(&old).unwrap().is_none());
+    assert!(predictions.find(&old_prediction.invocation).is_none());
+    assert!(!old_pred_path.exists());
+    assert!(results.find(&new).unwrap().is_some());
+    assert_eq!(
+        predictions.find(&new_prediction.invocation),
+        Some(new_prediction)
+    );
+}
+
+#[test]
+fn gc_that_removes_no_action_result_reads_no_prediction_index_entry() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = directory.path();
+    let predictions = LocalPredictionIndex::new(store);
+    let output = store_object(store, b"live output");
+    let live_action = store_result(store, "live", std::slice::from_ref(&output));
+
+    let live_prediction = ActionPrediction {
+        invocation: CacheDigest::blake3(b"live invocation"),
+        action: live_action,
+        adapter: "rustc".into(),
+        payload: "{}".into(),
+    };
+    let dangling_prediction = ActionPrediction {
+        invocation: CacheDigest::blake3(b"dangling invocation"),
+        action: CacheDigest::blake3(b"missing action"),
+        adapter: "rustc".into(),
+        payload: "{}".into(),
+    };
+    let corrupt_invocation = CacheDigest::blake3(b"corrupt invocation");
+    predictions.store(&live_prediction).unwrap();
+    predictions.store(&dangling_prediction).unwrap();
+    let corrupt_path = predictions.path_for(&corrupt_invocation).unwrap();
+    std::fs::create_dir_all(corrupt_path.parent().unwrap()).unwrap();
+    std::fs::write(&corrupt_path, b"corrupt!").unwrap();
+
+    let live_path = predictions.path_for(&live_prediction.invocation).unwrap();
+    let dangling_path = predictions
+        .path_for(&dangling_prediction.invocation)
+        .unwrap();
+    let staging_file = tempfile::Builder::new()
+        .prefix(".mbx-")
+        .tempfile_in(live_path.parent().unwrap())
+        .unwrap();
+    std::fs::write(staging_file.path(), b"in progress").unwrap();
+
+    let indexed_bytes = std::fs::metadata(&live_path).unwrap().len()
+        + std::fs::metadata(&dangling_path).unwrap().len()
+        + std::fs::metadata(&corrupt_path).unwrap().len();
+    PREDICTION_INDEX_READS.with(|count| count.set(0));
+    let outcome = gc(store, u64::MAX).unwrap();
+
+    // Under budget with no removed results: entries are stat'd for `live_bytes`
+    // and never opened or read, so externally orphaned/corrupt entries wait for
+    // a sweep that actually removes a result.
+    PREDICTION_INDEX_READS.with(|count| assert_eq!(count.get(), 0));
+    assert_eq!(outcome.removed_action_results, 0);
+    assert_eq!(outcome.removed_bytes, 0);
+    assert_eq!(
+        outcome.remaining_bytes,
+        stats(store).unwrap().total_bytes() + indexed_bytes
+    );
+    assert!(live_path.exists());
+    assert!(dangling_path.exists());
+    assert!(corrupt_path.exists());
+    assert!(staging_file.path().exists());
+
+    // Once a sweep removes a dangling action result, it reads the index and
+    // sweeps the orphaned and corrupt entries while keeping live entries and
+    // in-progress staging files intact.
+    let doomed_output = store_object(store, b"doomed output");
+    let doomed_action = store_result(store, "doomed", std::slice::from_ref(&doomed_output));
+    let doomed_result_size = std::fs::metadata(
+        LocalActionCache::new(store)
+            .path_for(&doomed_action)
+            .unwrap(),
+    )
+    .unwrap()
+    .len();
+    let doomed_prediction = ActionPrediction {
+        invocation: CacheDigest::blake3(b"doomed invocation"),
+        action: doomed_action.clone(),
+        adapter: "rustc".into(),
+        payload: "{}".into(),
+    };
+    predictions.store(&doomed_prediction).unwrap();
+    let doomed_pred_path = predictions.path_for(&doomed_prediction.invocation).unwrap();
+    std::fs::remove_file(LocalCas::new(store).path_for(&doomed_action).unwrap()).unwrap();
+
+    let removed_expected = doomed_result_size
+        + std::fs::metadata(&doomed_pred_path).unwrap().len()
+        + std::fs::metadata(&dangling_path).unwrap().len()
+        + std::fs::metadata(&corrupt_path).unwrap().len();
+    PREDICTION_INDEX_READS.with(|count| count.set(0));
+    let swept = gc(store, u64::MAX).unwrap();
+
+    PREDICTION_INDEX_READS.with(|count| assert!(count.get() > 0));
+    assert_eq!(swept.removed_action_results, 1);
+    assert_eq!(swept.removed_bytes, removed_expected);
+    assert!(!doomed_pred_path.exists());
+    assert!(!dangling_path.exists());
+    assert!(!corrupt_path.exists());
+    assert!(live_path.exists());
+    assert!(staging_file.path().exists());
+    assert_eq!(
+        swept.remaining_bytes,
+        stats(store).unwrap().total_bytes() + std::fs::metadata(&live_path).unwrap().len()
+    );
+}
+
+#[test]
+fn gc_stale_compilers_collects_prediction_index_entries_for_removed_results() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = dir.path();
+    let predictions = LocalPredictionIndex::new(store);
+    let (old, _) = store_rustc_result(store, "rustc 1.80.0", b"old output");
+    let (new, _) = store_rustc_result(store, "rustc 1.90.0", b"new output");
+    age_result(store, &old, 100 * DAY);
+
+    let old_prediction = ActionPrediction {
+        invocation: CacheDigest::blake3(b"old compiler invocation"),
+        action: old,
+        adapter: "rustc".into(),
+        payload: "{}".into(),
+    };
+    let new_prediction = ActionPrediction {
+        invocation: CacheDigest::blake3(b"new compiler invocation"),
+        action: new,
+        adapter: "rustc".into(),
+        payload: "{}".into(),
+    };
+    predictions.store(&old_prediction).unwrap();
+    predictions.store(&new_prediction).unwrap();
+    let old_pred_path = predictions.path_for(&old_prediction.invocation).unwrap();
+    let new_pred_path = predictions.path_for(&new_prediction.invocation).unwrap();
+
+    let preview = gc_dry_run_after_stale(store, u64::MAX, 90 * DAY).unwrap();
+    assert!(old_pred_path.exists());
+    let outcome = gc_stale_compilers(store, 90 * DAY, false).unwrap();
+    assert_eq!(preview.removed_bytes, outcome.removed_bytes);
+    assert!(!old_pred_path.exists());
+    assert!(new_pred_path.exists());
 }

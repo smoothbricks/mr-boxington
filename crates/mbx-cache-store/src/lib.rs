@@ -1,23 +1,24 @@
 //! Store inspection and garbage collection.
 //!
-//! The store holds six trees: `cas/v1` for content-addressed objects,
-//! `action-results/v1` for the results that reference them, `task-manifests/v1`
-//! for the prediction index, `checkouts/v1` for the checkouts that have built
-//! each identity, `build-receipts/v1` for exact completed build closures, and
-//! `sessions/v1` for per-build event streams. Only the first two are collected
-//! for size; receipts are small, checkout records expire with their checkout
-//! claims, a manifest goes once no live checkout claims its identity, and
-//! session streams are bounded by age and count because they are history
-//! rather than cache content.
+//! The store holds seven trees: `cas/v1` for content-addressed objects,
+//! `action-results/v1` for the results that reference them, `predictions/v1`
+//! for the local per-invocation prediction index, `task-manifests/v1` for
+//! lockfile-grouped prediction manifests, `checkouts/v1` for the checkouts that
+//! have built each identity, `build-receipts/v1` for exact completed build
+//! closures, and `sessions/v1` for per-build event streams. Only the first
+//! three are collected for size; receipts are small, checkout records expire
+//! with their checkout claims, a manifest goes once no live checkout claims its
+//! identity, and session streams are bounded by age and count because they are
+//! history rather than cache content.
 
 mod events;
 pub mod unlink_pace;
 
 use eyre::{Context, Result};
 use mbx_cache_core::{
-    ActionPrediction, ActionSlot, CacheDigest, CacheDirectory, CapturedOutput, LocalCas,
-    RemoteActionResult, RustcMetadata, TaskActionManifest, is_task_identity,
-    merge_task_action_predictions, task_manifest_actions,
+    ActionPrediction, ActionSlot, CacheDigest, CacheDirectory, CapturedOutput, LocalActionCache,
+    LocalCas, LocalPredictionIndex, PREDICTION_INDEX_DIR, RemoteActionResult, RustcMetadata,
+    TaskActionManifest, is_task_identity, merge_task_action_predictions, task_manifest_actions,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -2130,6 +2131,7 @@ type DanglingReadHook = Box<dyn FnMut(&Path)>;
 #[cfg(test)]
 thread_local! {
     static ACTION_RECORD_CLAIMS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static PREDICTION_INDEX_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// Runs after collection finds a record dangling and before it claims it.
     static AFTER_DANGLING_READ: std::cell::RefCell<Option<DanglingReadHook>> =
         const { std::cell::RefCell::new(None) };
@@ -2146,11 +2148,21 @@ fn gc_with_mode(
 ) -> Result<GcOutcome> {
     let mut objects = walk_files(&store.join(CAS_DIR))?;
     let mut results = walk_files(&store.join(ACTION_RESULTS_DIR))?;
+    // Stat only here so index bytes count in `live_bytes` without opening
+    // tens of thousands of entries on a sweep that removes nothing.
+    let mut walked_predictions = Some(walk_prediction_entries(store, &already_removed)?);
     objects.retain(|entry| !already_removed.contains(&entry.path));
     results.retain(|entry| !already_removed.contains(&entry.path));
     let mut live_bytes = objects
         .iter()
         .chain(results.iter())
+        .chain(
+            walked_predictions
+                .as_deref()
+                .expect("walked once")
+                .iter()
+                .map(|prediction| &prediction.entry),
+        )
         .map(|entry| entry.size)
         .sum::<u64>();
 
@@ -2182,6 +2194,8 @@ fn gc_with_mode(
     // a result's objects were all gone, and the sweep evicted a newer object
     // in its place. A result's name is its action digest, so no file is read.
     let mut freed_results = HashSet::new();
+    let mut freed_predictions = HashSet::new();
+    let mut parsed_predictions: Option<Vec<PredictionEntry>> = None;
     if live_bytes > max_bytes {
         // Reachability costs a read per action result and per output tree, so
         // it is computed only when something is actually about to be evicted.
@@ -2197,19 +2211,35 @@ fn gc_with_mode(
             store,
             grouped_receipt_actions(store)?,
         ));
-        let dependents = results
-            .iter()
-            .filter_map(|entry| {
-                let action = digest_from_path(&entry.path, true)?;
-                Some((cas.path_for(&action).ok()?, entry))
-            })
-            .collect::<HashMap<_, _>>();
+        let predictions = parsed_predictions.insert(read_prediction_entries(
+            walked_predictions.take().expect("walked once"),
+        ));
+        let mut dependents: HashMap<PathBuf, DescriptorDependents<'_>> = HashMap::new();
+        for entry in &results {
+            if let Some(action) = digest_from_path(&entry.path, true)
+                && let Ok(descriptor) = cas.path_for(&action)
+            {
+                dependents.entry(descriptor).or_default().result = Some(entry);
+            }
+        }
+        for prediction in predictions.iter() {
+            if let Some(action) = &prediction.action
+                && let Ok(descriptor) = cas.path_for(action)
+            {
+                dependents
+                    .entry(descriptor)
+                    .or_default()
+                    .predictions
+                    .push(&prediction.entry);
+            }
+        }
         // A hit refreshes its result and the blobs a restore reads, never the
         // descriptor blob the result is named after, and the result goes with
         // that blob; so the descriptor was last used when its result was.
         let last_use = |entry: &Entry| {
             dependents
                 .get(&entry.path)
+                .and_then(|dependent| dependent.result)
                 .map_or(entry.used, |result| entry.used.max(result.used))
         };
         let last_sweep = last_sweep(store);
@@ -2245,6 +2275,7 @@ fn gc_with_mode(
         outcome.removed_objects += evicted.removed_objects;
         outcome.removed_bytes += evicted.removed_bytes;
         freed_results = evicted.freed_results;
+        freed_predictions = evicted.freed_predictions;
     }
 
     // An action result whose objects are gone can only produce a miss, so drop
@@ -2261,6 +2292,7 @@ fn gc_with_mode(
     // already deleted them, so neither makes this sweep walk trees.
     let walk_trees = outcome.removed_objects > 0;
     let mut trees = HashMap::new();
+    let mut removed_any_result = false;
     for entry in &results {
         match action_result_is_dangling(
             &cas,
@@ -2343,6 +2375,8 @@ fn gc_with_mode(
         };
         match removal {
             Removal::Removed => {
+                removed_any_result = true;
+                virtually_removed.insert(entry.path.clone());
                 // Bytes the eviction already counted are not freed twice.
                 if !freed_results.remove(&entry.path) {
                     live_bytes = live_bytes.saturating_sub(entry.size);
@@ -2351,6 +2385,8 @@ fn gc_with_mode(
                 outcome.removed_bytes += entry.size;
             }
             Removal::Missing => {
+                removed_any_result = true;
+                virtually_removed.insert(entry.path.clone());
                 if !freed_results.remove(&entry.path) {
                     live_bytes = live_bytes.saturating_sub(entry.size);
                 }
@@ -2365,6 +2401,93 @@ fn gc_with_mode(
         .filter(|entry| freed_results.contains(&entry.path))
         .map(|entry| entry.size)
         .sum::<u64>();
+
+    // Collect local per-invocation prediction index entries only when this
+    // sweep evicted or removed something (or was over budget): an idle sweep
+    // stats the tree for `live_bytes` without reading every entry.
+    let sweep_predictions = parsed_predictions.is_some()
+        || outcome.removed_objects > 0
+        || outcome.removed_action_results > 0
+        || !freed_results.is_empty()
+        || removed_any_result;
+    if sweep_predictions {
+        let predictions = parsed_predictions.unwrap_or_else(|| {
+            read_prediction_entries(walked_predictions.take().expect("walked once"))
+        });
+        let action_cache = LocalActionCache::new(store);
+        let prediction_index = LocalPredictionIndex::new(store);
+        let action_is_gone = |action: Option<&CacheDigest>| match action {
+            None => true,
+            Some(action) => match action_cache.path_for(action) {
+                Ok(path) => {
+                    virtually_removed.contains(&path) || matches!(path.try_exists(), Ok(false))
+                }
+                Err(_) => true,
+            },
+        };
+        for prediction in &predictions {
+            if !action_is_gone(prediction.action.as_ref()) {
+                continue;
+            }
+            let removal = if dry_run {
+                Removal::Removed
+            } else {
+                // Re-check before unlinking so a concurrent build that replaced
+                // this entry with a prediction for a live action keeps its update.
+                let still_dangling = match read_prediction_entry_bytes(&prediction.entry.path) {
+                    Ok(bytes) => {
+                        let current_action = LocalPredictionIndex::parse_entry(&bytes)
+                            .filter(|current| {
+                                prediction_index
+                                    .path_for(&current.invocation)
+                                    .ok()
+                                    .as_deref()
+                                    == Some(prediction.entry.path.as_path())
+                            })
+                            .map(|current| current.action);
+                        action_is_gone(current_action.as_ref())
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        if !freed_predictions.remove(&prediction.entry.path) {
+                            live_bytes = live_bytes.saturating_sub(prediction.entry.size);
+                        }
+                        continue;
+                    }
+                    Err(error) if held_by_another_process(&error) => {
+                        log::debug!(
+                            "could not inspect {} for eviction: {error}",
+                            prediction.entry.path.display()
+                        );
+                        continue;
+                    }
+                    Err(_) => false,
+                };
+                if !still_dangling {
+                    continue;
+                }
+                remove(&prediction.entry.path)?
+            };
+            match removal {
+                Removal::Removed => {
+                    if !freed_predictions.remove(&prediction.entry.path) {
+                        live_bytes = live_bytes.saturating_sub(prediction.entry.size);
+                    }
+                    outcome.removed_bytes += prediction.entry.size;
+                }
+                Removal::Missing => {
+                    if !freed_predictions.remove(&prediction.entry.path) {
+                        live_bytes = live_bytes.saturating_sub(prediction.entry.size);
+                    }
+                }
+                Removal::Blocked => {}
+            }
+        }
+        live_bytes += predictions
+            .iter()
+            .filter(|prediction| freed_predictions.contains(&prediction.entry.path))
+            .map(|prediction| prediction.entry.size)
+            .sum::<u64>();
+    }
 
     let sessions = prune_sessions(store, dry_run, sessions)?;
     outcome.removed_session_streams += sessions.removed_streams;
@@ -2548,11 +2671,13 @@ fn stale_compilers_pass(
 
     let doomed = rooted_action_objects(store, stale.iter().map(|r| r.action.clone()));
     let kept = rooted_action_objects(store, kept_actions);
+    let mut removed_actions = HashSet::new();
     for result in &stale {
         if dry_run || matches!(remove(&result.entry.path)?, Removal::Removed) {
             outcome.removed_action_results += 1;
             outcome.removed_bytes += result.entry.size;
             planned.insert(result.entry.path.clone());
+            removed_actions.insert(result.action.clone());
         }
     }
     for path in doomed.difference(&kept) {
@@ -2563,6 +2688,20 @@ fn stale_compilers_pass(
             outcome.removed_objects += 1;
             outcome.removed_bytes += metadata.len();
             planned.insert(path.clone());
+        }
+    }
+    if !removed_actions.is_empty() {
+        let walked = walk_prediction_entries(store, &planned)?;
+        for prediction in read_prediction_entries(walked) {
+            if prediction
+                .action
+                .as_ref()
+                .is_some_and(|action| removed_actions.contains(action))
+                && (dry_run || matches!(remove(&prediction.entry.path)?, Removal::Removed))
+            {
+                outcome.removed_bytes += prediction.entry.size;
+                planned.insert(prediction.entry.path);
+            }
         }
     }
     Ok((outcome, planned))
@@ -3198,6 +3337,12 @@ fn remove(path: &Path) -> Result<Removal> {
     }
 }
 
+#[derive(Default)]
+struct DescriptorDependents<'a> {
+    result: Option<&'a Entry>,
+    predictions: Vec<&'a Entry>,
+}
+
 #[derive(Debug, Default, PartialEq, Eq)]
 struct ObjectEvictions {
     removed_objects: u64,
@@ -3205,15 +3350,18 @@ struct ObjectEvictions {
     remaining_bytes: u64,
     /// Results whose descriptor blob this pass evicted, already counted as freed.
     freed_results: HashSet<PathBuf>,
+    /// Prediction index entries whose action descriptor this pass evicted.
+    freed_predictions: HashSet<PathBuf>,
 }
 
 /// Evict sorted objects without crossing the checkout-protection boundary
 /// when an unrooted object cannot be removed. `dependents` maps a descriptor
-/// blob to the result named after it, which goes with it.
+/// blob to the result and prediction index entries named after it, which go
+/// with it.
 fn evict_objects(
     objects: &[Entry],
     rooted: &HashSet<PathBuf>,
-    dependents: &HashMap<PathBuf, &Entry>,
+    dependents: &HashMap<PathBuf, DescriptorDependents<'_>>,
     mut live_bytes: u64,
     max_bytes: u64,
     mut remove_file: impl FnMut(&Path) -> Result<Removal>,
@@ -3234,10 +3382,17 @@ fn evict_objects(
         let removal = remove_file(&entry.path)?;
         if matches!(removal, Removal::Removed | Removal::Missing) {
             live_bytes = live_bytes.saturating_sub(entry.size);
-            if let Some(result) = dependents.get(&entry.path)
-                && outcome.freed_results.insert(result.path.clone())
-            {
-                live_bytes = live_bytes.saturating_sub(result.size);
+            if let Some(dependent) = dependents.get(&entry.path) {
+                if let Some(result) = dependent.result
+                    && outcome.freed_results.insert(result.path.clone())
+                {
+                    live_bytes = live_bytes.saturating_sub(result.size);
+                }
+                for prediction in &dependent.predictions {
+                    if outcome.freed_predictions.insert(prediction.path.clone()) {
+                        live_bytes = live_bytes.saturating_sub(prediction.size);
+                    }
+                }
             }
         }
         match removal {
@@ -3438,13 +3593,70 @@ fn digest_from_path(path: &Path, action_result: bool) -> Option<CacheDigest> {
 fn addressed_digest(store: &Path, path: &Path, action_result: bool) -> Option<CacheDigest> {
     let digest = digest_from_path(path, action_result)?;
     let canonical = if action_result {
-        mbx_cache_core::LocalActionCache::new(store)
-            .path_for(&digest)
-            .ok()?
+        LocalActionCache::new(store).path_for(&digest).ok()?
     } else {
         LocalCas::new(store).path_for(&digest).ok()?
     };
     (canonical == path).then_some(digest)
+}
+
+struct WalkedPrediction {
+    entry: Entry,
+    invocation: CacheDigest,
+}
+
+struct PredictionEntry {
+    entry: Entry,
+    action: Option<CacheDigest>,
+}
+
+fn read_prediction_entry_bytes(path: &Path) -> std::io::Result<Vec<u8>> {
+    #[cfg(test)]
+    PREDICTION_INDEX_READS.with(|count| count.set(count.get() + 1));
+    mbx_cache_core::read_untouched(path)
+}
+
+fn walk_prediction_entries(
+    store: &Path,
+    already_removed: &HashSet<PathBuf>,
+) -> Result<Vec<WalkedPrediction>> {
+    let index = LocalPredictionIndex::new(store);
+    let mut entries = Vec::new();
+    for entry in walk_files(&store.join(PREDICTION_INDEX_DIR))? {
+        if already_removed.contains(&entry.path) {
+            continue;
+        }
+        let Some(invocation) = digest_from_path(&entry.path, true)
+            .filter(|digest| index.path_for(digest).ok().as_deref() == Some(entry.path.as_path()))
+        else {
+            // Skip in-progress atomic-write tempfiles and unrelated files.
+            continue;
+        };
+        entries.push(WalkedPrediction { entry, invocation });
+    }
+    Ok(entries)
+}
+
+fn read_prediction_entries(walked: Vec<WalkedPrediction>) -> Vec<PredictionEntry> {
+    let mut entries = Vec::with_capacity(walked.len());
+    for WalkedPrediction { entry, invocation } in walked {
+        let action = match read_prediction_entry_bytes(&entry.path) {
+            Ok(bytes) => LocalPredictionIndex::parse_entry(&bytes)
+                .filter(|prediction| prediction.invocation == invocation)
+                .map(|prediction| prediction.action),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) if held_by_another_process(&error) => {
+                log::debug!(
+                    "could not inspect {} for eviction: {error}",
+                    entry.path.display()
+                );
+                continue;
+            }
+            Err(_) => None,
+        };
+        entries.push(PredictionEntry { entry, action });
+    }
+    entries
 }
 
 fn cached_tree_bytes(cache: &mut BTreeMap<PathBuf, u64>, root: &Path) -> u64 {
@@ -3494,40 +3706,11 @@ mod tests;
 /// [`write_atomic`] without the sync: for records every build rewrites and
 /// that a torn or missing file only makes one build older.
 fn write_advisory(path: &Path, contents: &[u8]) -> Result<()> {
-    let parent = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .ok_or_else(|| eyre::eyre!("path has no parent: {}", path.display()))?;
-    std::fs::create_dir_all(parent)
-        .wrap_err_with(|| format!("failed to create {}", parent.display()))?;
-    let mut temporary = mbx_cache_core::shared_tempfile_builder()
-        .prefix(".mbx-")
-        .tempfile_in(parent)?;
-    use std::io::Write as _;
-    temporary.write_all(contents)?;
-    temporary
-        .persist(path)
-        .map_err(|error| error.error)
-        .wrap_err_with(|| format!("failed atomic write: {}", path.display()))?;
-    Ok(())
+    mbx_cache_core::write_atomic_unsynced(path, contents)
+        .wrap_err_with(|| format!("failed atomic write: {}", path.display()))
 }
 
 fn write_atomic(path: &Path, contents: &[u8]) -> Result<()> {
-    let parent = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .ok_or_else(|| eyre::eyre!("path has no parent: {}", path.display()))?;
-    std::fs::create_dir_all(parent)
-        .wrap_err_with(|| format!("failed to create {}", parent.display()))?;
-    let mut temporary = mbx_cache_core::shared_tempfile_builder()
-        .prefix(".mbx-")
-        .tempfile_in(parent)?;
-    use std::io::Write as _;
-    temporary.write_all(contents)?;
-    temporary.as_file_mut().sync_all()?;
-    temporary
-        .persist(path)
-        .map_err(|error| error.error)
-        .wrap_err_with(|| format!("failed atomic write: {}", path.display()))?;
-    Ok(())
+    mbx_cache_core::write_atomic(path, contents)
+        .wrap_err_with(|| format!("failed atomic write: {}", path.display()))
 }

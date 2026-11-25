@@ -63,7 +63,7 @@ pub use client::BlockingAgentClient;
 pub use imds::{InstanceRoleCredentials, TemporaryCredentials};
 pub use local::{
     ACTION_CONFLICT_MESSAGE, ActionStoreOutcome, CapturedOutput, LocalActionCache, LocalCas,
-    USE_REFRESH, read_untouched, record_file_use,
+    LocalPredictionIndex, PREDICTION_INDEX_DIR, USE_REFRESH, read_untouched, record_file_use,
 };
 pub use mbx_cache_protocol::{
     ACTION_PROMISE_MEDIA_TYPE, ACTION_RESULT_BATCH_MEDIA_TYPE, ACTION_RESULT_MEDIA_TYPE,
@@ -92,7 +92,9 @@ pub use remote_http::fuzz_decode_blob_pack;
 pub(crate) use remote_http::{BlobPackLimits, blob_pack_chunk};
 use remote_s3::S3RemoteCache;
 pub use remote_s3::{S3ConditionalWrites, S3RemoteCacheConfig};
-pub use shared_file::{clone_or_copy, open_shared_lock, shared_tempfile_builder};
+pub use shared_file::{
+    clone_or_copy, open_shared_lock, shared_tempfile_builder, write_atomic, write_atomic_unsynced,
+};
 pub use sigv4::S3Credentials;
 /// Cap the JSON bodies a remote cache can hand back. Blob downloads are bounded
 /// by the size their digest promises, but action results and manifests carry no
