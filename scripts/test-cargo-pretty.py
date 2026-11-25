@@ -169,14 +169,16 @@ pub fn answer() -> u32 { dep::value() }
         # A custom harness may leave a descendant holding Cargo's PTY open.
         # It must not hold mbx in raw mode, and the harness tail must survive.
         (root/'tests/custom.rs').write_text('''fn main() {
- let child = std::process::Command::new("sleep").arg("60").spawn().unwrap();
+ let child = std::process::Command::new("sleep").arg("86400").spawn().unwrap();
  std::fs::write("background.pid", child.id().to_string()).unwrap();
  for _ in 0..100000 { println!("TRAILING_HARNESS_OUTPUT"); }
  println!("HARNESS_TAIL_COMPLETE");
 }''')
+        code, output = terminal_run(root, env, ["test", "--test", "custom", "--no-run"])
+        assert code == 0, output[-3000:]
         try:
-            code, output = terminal_run(root, env, ['test', '--test', 'custom'], limit=20)
-            assert code == 0 and b'HARNESS_TAIL_COMPLETE' in output, output[-3000:]
+            code, output = terminal_run(root, env, ["test", "--test", "custom"])
+            assert code == 0 and b"HARNESS_TAIL_COMPLETE" in output, output[-3000:]
         finally:
             if (root/'background.pid').exists():
                 try:
