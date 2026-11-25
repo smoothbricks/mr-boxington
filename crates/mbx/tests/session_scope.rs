@@ -812,6 +812,88 @@ fn long_tmpdir_session_uses_explicit_root() {
         );
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn isolate_host_preserves_short_session_root_under_long_tmpdir() {
+    const INNER_ENV: &str = "MBX_TEST_ISOLATE_HOST_SESSION_ROOT_INNER";
+    const PROBE_ENV: &str = "MBX_TEST_ISOLATE_HOST_SESSION_ROOT_PROBE";
+    if let Some(expected_root) = std::env::var_os(PROBE_ENV) {
+        let socket = std::env::var_os("MBX_SOCKET").expect("session must export MBX_SOCKET");
+        assert_eq!(
+            Path::new(&socket).parent().unwrap().parent(),
+            Some(Path::new(&expected_root)),
+            "session socket did not use preserved MBX_SESSION_ROOT: {socket:?}"
+        );
+        assert!(socket.len() < 104, "{socket:?}");
+        return;
+    }
+    if let Some(expected_root) = std::env::var_os(INNER_ENV) {
+        let cache = Path::new(&expected_root).join("cache");
+        // Both integration-test isolation styles must preserve MBX_SESSION_ROOT:
+        // inheriting env (tests/build.rs) and env_clear + whitelist (tests/session_scope.rs).
+        let mut inherited = Command::new(env!("CARGO_BIN_EXE_mbx"));
+        support::isolate_host(&mut inherited);
+        inherited
+            .env("MBX_CACHE_DIR", &cache)
+            .env("MBX_SUMMARY", "off");
+
+        let cleared = mbx(Path::new(&expected_root));
+
+        for (label, mut command) in [("inherited", inherited), ("cleared", cleared)] {
+            let output = command
+                .env(PROBE_ENV, &expected_root)
+                .env_remove(INNER_ENV)
+                .args(["exec", "--"])
+                .arg(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "isolate_host_preserves_short_session_root_under_long_tmpdir",
+                    "--nocapture",
+                ])
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{label} isolate_host failed ({}): stdout={} stderr={}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+        }
+        return;
+    }
+
+    let parent = std::env::var_os("XDG_RUNTIME_DIR").unwrap_or_else(|| "/tmp".into());
+    let short_root = tempfile::Builder::new()
+        .prefix("mbx-sr-")
+        .tempdir_in(parent)
+        .unwrap();
+    let padding = 90usize
+        .checked_sub(short_root.path().as_os_str().len() + 1)
+        .unwrap();
+    let long_tmpdir = short_root.path().join("t".repeat(padding));
+    std::fs::create_dir(&long_tmpdir).unwrap();
+
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "isolate_host_preserves_short_session_root_under_long_tmpdir",
+            "--nocapture",
+        ])
+        .env(INNER_ENV, short_root.path())
+        .env("TMPDIR", &long_tmpdir)
+        .env("MBX_SESSION_ROOT", short_root.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "inner test failed ({}): stdout={} stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
 #[cfg(unix)]
 #[test]
 fn launch_preserves_non_unicode_environment_and_temporary_paths_with_spaces() {
