@@ -292,16 +292,25 @@ binary and profile, a test binary's or a nextest test's name, a reservation's
 request whose kind has no history goes after every predicted request of its
 band.
 
-An `interactive` request decays by the age of the job it runs for, named by
-`MBX_SCHEDULER_JOB_STARTED_MS`, `mbx reserve --job-started` or a reservation's
-`job_started_ms`, in milliseconds since the Unix epoch. Asking within 120
-seconds of that start, it is admitted as `interactive`; from 120 to 240
-seconds, as `normal`; after that, as `low`. The band is decided once, when the
-request asks, and kept while it waits; one without a job start (absent, or
-empty as cowshed sets it for every job that is not interactive, so a nested
-job never inherits its caller's start) stays `interactive`. Only an
-`interactive` request reads its job start, so a `normal` or `low` request
-never decays. A decayed request's decision rows carry
+An `interactive` request decays from its job's first admitted ask when it
+carries both a job identity (`MBX_SCHEDULER_JOB_ID`, `mbx reserve --job-id` or
+a reservation's `job_id`) and a job start (`MBX_SCHEDULER_JOB_STARTED_MS`,
+`mbx reserve --job-started` or a reservation's `job_started_ms`, in
+milliseconds since the Unix epoch). Before any request of that
+`(job_id, job_started_ms)` key is granted, the job keeps `interactive` even if
+it waited past a bound before its first ask. On the first grant carrying that
+key, mbx records `first_admitted_ms` in shared pool state beside leases and
+waiters; every later ask carrying the key is admitted as `interactive` within
+120 seconds of that first admission, as `normal` from 120 to 240 seconds, and
+as `low` after that. The record expires with the last lease or waiter carrying
+the key, so a later ask restarts the clock on its next grant. Without a
+`job_id`, an `interactive` request with `job_started_ms` decays by the same
+120 s and 240 s bounds from its job's start instead. The band is decided once,
+when the request asks, and kept while it waits; one without a job start
+(absent, or empty as cowshed sets it for every job that is not interactive, so
+a nested job never inherits its caller's clock) stays `interactive`. Only an
+`interactive` request reads its job identity or start, so a `normal` or `low`
+request never decays. A decayed request's decision rows carry
 `decayed: {from, to, elapsed_ms}`. A granted request's band no longer
 matters: nothing admitted is preempted. A version that does not know a band
 reads it as `low`.
@@ -445,8 +454,8 @@ checks.
 
 Use `scheduler.priority = "interactive"` (`MBX_SCHEDULER_PRIORITY=interactive`)
 for work a person or agent waits on, such as an agent's edit-feedback test,
-with `MBX_SCHEDULER_JOB_STARTED_MS` set to its job's start, and
-`scheduler.priority = "low"` for an editor's background check or CI on a
+with `MBX_SCHEDULER_JOB_ID` and `MBX_SCHEDULER_JOB_STARTED_MS` set for its job,
+and `scheduler.priority = "low"` for an editor's background check or CI on a
 shared machine. A waiting request of a higher band goes before every one of a
 lower band, so lower-band work starts only on room no waiting higher-band
 request can use; with none waiting, it may use the whole budget.
@@ -488,9 +497,9 @@ its own, instead of queueing behind capacity its enclosing reservation holds;
 both variables report the smaller of its `--cpus` and the enclosing grant's
 count, or its `--cpus` when no enclosing grant names one.
 `--memory` is measured against `scheduler.memory`; omit it when memory
-scheduling is disabled. Use `--priority interactive` with `--job-started` for
-work someone waits on, and `--priority low` for background work that should
-go after waiting normal-priority work; an admitted
+scheduling is disabled. Use `--priority interactive` with `--job-id` and
+`--job-started` for work someone waits on, and `--priority low` for background
+work that should go after waiting normal-priority work; an admitted
 reservation, like an admitted compiler, is never preempted or narrowed. `--grant-fd` tells a
 supervisor when the reservation gets its capacity; see
 [Tell a supervisor when work holds capacity](#tell-a-supervisor-when-work-holds-capacity).
@@ -527,9 +536,10 @@ A client connects and writes one JSON object per line:
 
 `reserve` asks for at most `cpus` cores at a `priority`, with an optional
 `memory` in bytes, an optional `name`, the class its run time is predicted
-by, an optional `job_started_ms`, and an optional `min`, the fewest of its
-cores it starts on before it has waited 30 seconds, and is admitted exactly as
-`mbx reserve --cpus --priority --memory --name --job-started --min`
+by, an optional `job_id` and `job_started_ms`, and an optional `min`, the
+fewest of its cores it starts on before it has waited 30 seconds, and is
+admitted exactly as
+`mbx reserve --cpus --priority --memory --name --job-id --job-started --min`
 is: the same pool, the same order, and as many of its cores as are free once
 one is, or once its `min` are. Every reservation one server serves belongs to
 that server's party. The answer is `granted` with the cores the request

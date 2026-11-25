@@ -3,7 +3,7 @@
 use super::cargo::exit_code;
 use crate::config::{Config, SchedulerPriority};
 use crate::scheduler::grant::Descriptor;
-use crate::scheduler::{Pool, SCHED_DISABLE_ENV};
+use crate::scheduler::{Job, Pool, SCHED_DISABLE_ENV};
 use bytesize::ByteSize;
 use eyre::{Result, WrapErr};
 use std::ffi::OsStr;
@@ -35,9 +35,16 @@ pub(super) struct ReserveArgs {
     /// first, then `normal` (the land gate), then `low`.
     #[usage(long, default = "normal")]
     pub(super) priority: SchedulerPriority,
+    /// Identity of the job an `interactive` reservation runs for, paired
+    /// with `--job-started` so its asks decay from the job's first admitted
+    /// ask rather than its start.
+    #[usage(long, value_name = "ID")]
+    pub(super) job_id: Option<String>,
     /// When the job an `interactive` reservation runs for started, in
-    /// milliseconds since the Unix epoch: asked 120 seconds after it, the
-    /// reservation is admitted as `normal`, and 240 seconds after it as `low`.
+    /// milliseconds since the Unix epoch. Paired with `--job-id`, the pair
+    /// keys the job's first-admission clock; without `--job-id`, asked 120
+    /// seconds after it the reservation is admitted as `normal`, and 240
+    /// seconds after it as `low`.
     #[usage(long, value_name = "MS")]
     pub(super) job_started: Option<u64>,
     /// The class this reservation's run time is remembered and predicted by,
@@ -118,6 +125,9 @@ fn spawn_worker(args: &ReserveArgs, grant: Option<Descriptor>) -> Result<ExitCod
     if let Some(name) = &args.name {
         worker.args(["--name", name]);
     }
+    if let Some(job_id) = &args.job_id {
+        worker.args(["--job-id", job_id]);
+    }
     if let Some(job_started) = args.job_started {
         worker.args(["--job-started", &job_started.to_string()]);
     }
@@ -144,7 +154,10 @@ fn run_direct(config: &Config, args: &ReserveArgs, grant: Option<Descriptor>) ->
         args.memory.map(|memory| memory.as_u64()),
         args.min,
         args.name.as_deref(),
-        args.job_started,
+        Job {
+            id: args.job_id.as_deref(),
+            started_ms: args.job_started,
+        },
         &AtomicBool::new(false),
     )?
     else {

@@ -98,6 +98,8 @@ fn reserve_names_each_priority_and_its_jobs_start() {
             "reserve",
             "--priority",
             priority,
+            "--job-id",
+            "job-1",
             "--job-started",
             "1700000000000",
             "--",
@@ -109,8 +111,8 @@ fn reserve_names_each_priority_and_its_jobs_start() {
             panic!("reserve should be reserved by mbx");
         };
         assert_eq!(
-            (args.priority, args.job_started),
-            (expected, Some(1_700_000_000_000))
+            (args.priority, args.job_id.as_deref(), args.job_started),
+            (expected, Some("job-1"), Some(1_700_000_000_000))
         );
     }
     let argv = ["mbx", "reserve", "--priority", "urgent", "--", "true"].map(std::ffi::OsStr::new);
@@ -134,6 +136,8 @@ fn reserve_options_stay_out_of_its_command() {
         &["--grant-fd", "5"][..],
         &["--grant-fd=5"],
         &["--name", "nx:ws:test"],
+        &["--job-id", "job-1"],
+        &["--job-id=job-1"],
         &["--job-started", "1700000000000"],
         &["--job-started=1700000000000"],
         &["--min", "1"],

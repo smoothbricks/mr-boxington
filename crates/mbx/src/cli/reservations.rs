@@ -11,9 +11,11 @@
 //!
 //! - `{"type":"reserve","id":N,"cpus":C,"priority":"interactive"|"normal"|"low"}`,
 //!   with an optional `"memory":BYTES`, an optional `"name":"<class>"`, the
-//!   class the pool predicts its run time by, and an optional
-//!   `"job_started_ms":MS`, when the job an `interactive` request runs for
-//!   started, which it decays by, and an optional `"min":M`, the fewest of its
+//!   class the pool predicts its run time by, an optional `"job_id":"<id>"`
+//!   and `"job_started_ms":MS`, the identity and start of the job an
+//!   `interactive` request runs for (paired, they key the job's first-admission
+//!   clock; with `"job_started_ms"` alone, it decays from its start), and an
+//!   optional `"min":M`, the fewest of its
 //!   cores it starts on before it has waited the pool's aging bound. It asks
 //!   for at most `C` cores. The reply is `{"type":"granted","id":N,"cpus":K}`
 //!   once the pool admits it, `K` being the cores it holds: as many of `C` as
@@ -46,7 +48,7 @@
 //! write end, so the server, and every grant it serves, ends with the starter.
 
 use crate::config::{Config, SchedulerPriority};
-use crate::scheduler::{AGING_MS, Admission, Permit, Pool, SCHED_DISABLE_ENV};
+use crate::scheduler::{AGING_MS, Admission, Job, Permit, Pool, SCHED_DISABLE_ENV};
 use eyre::{Result, WrapErr};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -79,6 +81,10 @@ pub(super) enum Request {
         /// predicts it by.
         #[serde(default)]
         name: Option<String>,
+        /// Identity of the job an `interactive` request runs for, paired with
+        /// `job_started_ms` so its asks decay from the job's first admission.
+        #[serde(default)]
+        job_id: Option<String>,
         /// When the job an `interactive` request runs for started, in
         /// milliseconds since the Unix epoch.
         #[serde(default)]
@@ -346,9 +352,19 @@ impl Connection {
                 priority,
                 memory,
                 name,
+                job_id,
                 job_started_ms,
                 min,
-            }) => self.reserve(id, cpus, priority, memory, name, job_started_ms, min),
+            }) => self.reserve(
+                id,
+                cpus,
+                priority,
+                memory,
+                name,
+                job_id,
+                job_started_ms,
+                min,
+            ),
             Ok(Request::Release { id }) => match self.slots.remove(&id) {
                 Some(_) => Step::Quiet,
                 None => Step::Close(format!("no reservation {id} on this connection to release")),
@@ -369,6 +385,7 @@ impl Connection {
         priority: SchedulerPriority,
         memory: Option<u64>,
         name: Option<String>,
+        job_id: Option<String>,
         job_started_ms: Option<u64>,
         min: Option<u64>,
     ) -> Step {
@@ -393,7 +410,10 @@ impl Connection {
                     memory,
                     min,
                     name.as_deref(),
-                    job_started_ms,
+                    Job {
+                        id: job_id.as_deref(),
+                        started_ms: job_started_ms,
+                    },
                     &waiting,
                 );
                 // A connection that has ended drops the answer, and any grant in it.

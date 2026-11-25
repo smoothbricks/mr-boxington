@@ -471,8 +471,10 @@ struct RawScheduler {
     /// person or agent waits on), then `normal` (the land gate), then `low`,
     /// each band starting only on room no waiting request of a band above it
     /// can use. An `interactive` build decays to `normal` 120 seconds after
-    /// `MBX_SCHEDULER_JOB_STARTED_MS` and to `low` 240 seconds after it. This
-    /// may also be set in workspace `.mbx.toml`; the environment variable wins.
+    /// its job's first admitted ask (with `MBX_SCHEDULER_JOB_ID` and
+    /// `MBX_SCHEDULER_JOB_STARTED_MS`) or after `MBX_SCHEDULER_JOB_STARTED_MS`
+    /// alone, and to `low` 240 seconds after it. This may also be set in
+    /// workspace `.mbx.toml`; the environment variable wins.
     #[usage(
         env = "MBX_SCHEDULER_PRIORITY",
         default = "normal",
@@ -507,12 +509,22 @@ struct RawScheduler {
     /// variable wins.
     #[usage(env = "MBX_SCHEDULER_TESTS", default = false)]
     tests: bool,
+    /// Identity of the job this build runs for, set beside
+    /// `MBX_SCHEDULER_JOB_STARTED_MS`: paired with it, an `interactive` job's
+    /// asks keep `interactive` until its first admitted ask, then decay to
+    /// `normal` 120 seconds after that first grant and to `low` 240 seconds
+    /// after it. Unset or empty, an `interactive` request with
+    /// `MBX_SCHEDULER_JOB_STARTED_MS` decays from its job's start instead.
+    /// Only an `interactive` request reads it.
+    #[usage(key = "job_id", env = "MBX_SCHEDULER_JOB_ID", scope = "env")]
+    job_id: Option<String>,
     /// When the job this build runs for started, in milliseconds since the
-    /// Unix epoch: an `interactive` request that asks 120 seconds after it is
-    /// admitted as `normal`, and 240 seconds after it as `low`. Unset or
-    /// empty, as cowshed sets it for every job that is not interactive, an
-    /// `interactive` request stays `interactive`. Only an `interactive`
-    /// request reads it.
+    /// Unix epoch. Paired with `MBX_SCHEDULER_JOB_ID`, the pair keys the job's
+    /// first-admission clock; without `MBX_SCHEDULER_JOB_ID`, an `interactive`
+    /// request that asks 120 seconds after this start is admitted as `normal`,
+    /// and 240 seconds after it as `low`. Unset or empty, as cowshed sets it
+    /// for every job that is not interactive, an `interactive` request stays
+    /// `interactive`. Only an `interactive` request reads it.
     #[usage(
         key = "job_started_ms",
         env = "MBX_SCHEDULER_JOB_STARTED_MS",
@@ -951,8 +963,12 @@ pub struct SchedulerSettings {
     pub memory_bytes: Option<u64>,
     /// Priority of this build's compilations against other builds.
     pub priority: SchedulerPriority,
-    /// When the job this build runs for started, on the pool clock: what an
-    /// `interactive` build's requests decay by.
+    /// Identity of the job this build runs for, paired with `job_started_ms`
+    /// so an `interactive` build's asks decay from its first admitted ask.
+    pub job_id: Option<String>,
+    /// When the job this build runs for started, on the pool clock: paired
+    /// with `job_id` to key the first-admission clock, or used directly when
+    /// `job_id` is absent.
     pub job_started_ms: Option<u64>,
     /// Whether `cargo test` and `cargo nextest` binaries take permits too.
     pub tests: bool,
@@ -986,6 +1002,7 @@ impl Default for SchedulerSettings {
             reserve_cpus: 0,
             memory_bytes: None,
             priority: SchedulerPriority::Normal,
+            job_id: None,
             job_started_ms: None,
             tests: false,
             pressure: false,
@@ -1589,6 +1606,7 @@ impl Config {
                 .priority
                 .parse()
                 .wrap_err(Invalid("scheduler.priority"))?,
+            job_id: raw.scheduler.job_id.filter(|value| !value.is_empty()),
             job_started_ms: raw
                 .scheduler
                 .job_started_ms
@@ -3720,26 +3738,30 @@ default = "rust-lld"
             None,
             &[
                 ("MBX_SCHEDULER_PRIORITY", "interactive"),
+                ("MBX_SCHEDULER_JOB_ID", "job-1"),
                 ("MBX_SCHEDULER_JOB_STARTED_MS", "1700000000000"),
             ],
         )
         .unwrap();
         assert_eq!(config.scheduler.priority, SchedulerPriority::Interactive);
+        assert_eq!(config.scheduler.job_id.as_deref(), Some("job-1"));
         assert_eq!(config.scheduler.job_started_ms, Some(1_700_000_000_000));
         let error = configured(None, &[("MBX_SCHEDULER_JOB_STARTED_MS", "-1")]).unwrap_err();
         assert!(
             error.to_string().contains("scheduler.job_started_ms"),
             "{error}"
         );
-        // Empty is no job start: the request does not decay.
+        // Empty is no job identity or start: the request does not decay.
         let config = configured(
             None,
             &[
                 ("MBX_SCHEDULER_PRIORITY", "interactive"),
+                ("MBX_SCHEDULER_JOB_ID", ""),
                 ("MBX_SCHEDULER_JOB_STARTED_MS", ""),
             ],
         )
         .unwrap();
+        assert_eq!(config.scheduler.job_id, None);
         assert_eq!(config.scheduler.job_started_ms, None);
     }
 

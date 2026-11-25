@@ -84,6 +84,8 @@ const INFLIGHT_DIR: &str = "inflight";
 const POOL_LOCK: &str = "pool.lock";
 /// Stamp every admission pass touches: something is serving the queue.
 const SERVED_STAMP: &str = "served";
+/// First-admission timestamps of active interactive jobs, kept under `POOL_LOCK`.
+const FIRST_ADMITTED_FILE: &str = "first_admitted.json";
 /// Ledger of peak compiler RSS by crate name.
 const LEDGER_FILE: &str = "memory.json";
 /// Lock serializing ledger updates.
@@ -121,6 +123,9 @@ const SCHED_MEMORY_BYTES_ENV: &str = "MBX_SCHED_MEMORY_BYTES";
 pub(crate) const SCHED_SLOT_BYTES_ENV: &str = "MBX_SCHED_SLOT_BYTES";
 /// Permit priority of this build's compilations.
 pub(crate) const SCHED_PRIORITY_ENV: &str = "MBX_SCHED_PRIORITY";
+/// Identity of the job this build's compilations run for, paired with
+/// [`SCHED_JOB_STARTED_ENV`] to key its first-admission clock.
+pub(crate) const SCHED_JOB_ID_ENV: &str = "MBX_SCHED_JOB_ID";
 /// When the job this build's compilations run for started, on the pool clock.
 pub(crate) const SCHED_JOB_STARTED_ENV: &str = "MBX_SCHED_JOB_STARTED_MS";
 /// Identity shared by every compiler shim in one Cargo build.
@@ -140,6 +145,8 @@ const SCHED_BUILD_SLOTS_ENV: &str = "MBX_SCHED_BUILD_SLOTS";
 
 /// Schema version of one lease record.
 const LEASE_VERSION: u8 = 1;
+/// Schema version of the active interactive jobs' first-admission record.
+const FIRST_ADMITTED_VERSION: u8 = 1;
 /// Schema version of one flight record.
 const FLIGHT_VERSION: u8 = 1;
 /// Largest prediction one finished compilation leaves behind for the next.
@@ -487,6 +494,13 @@ struct Lease {
     /// versions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     written: Option<crate::util::Stamp>,
+    /// Identity of the interactive job this lease belongs to, paired with
+    /// `job_started_ms` to keep its first-admission clock alive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    job_id: Option<String>,
+    /// Start timestamp of the interactive job this lease belongs to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    job_started_ms: Option<u64>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -553,6 +567,13 @@ struct Waiting {
     /// its minimum is not passed by a later request of its party.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     party: Option<String>,
+    /// Identity of the interactive job this ask belongs to, paired with
+    /// `job_started_ms` to key its first-admission clock.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    job_id: Option<String>,
+    /// Start timestamp of the interactive job this ask belongs to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    job_started_ms: Option<u64>,
 }
 
 /// What any registrar holder needs to admit a queued request on its holder's
@@ -621,6 +642,17 @@ impl Drop for QueueEntry {
     }
 }
 
+/// Whether an ask's interactive decay has been decided yet.
+///
+/// Decided once when the request first asks, and kept while it waits. A
+/// keyed interactive ask decides on its first pass under `POOL_LOCK`, after
+/// pruning expired records; every other ask decides immediately.
+#[derive(Clone, Debug)]
+enum DecayState {
+    Pending,
+    Decided(Option<Decayed>),
+}
+
 struct AdmissionState {
     queued: Option<QueueEntry>,
     /// When the request first asked, on the pool clock: the age that orders
@@ -636,9 +668,11 @@ struct AdmissionState {
     periodic: bool,
     /// What its class is predicted to run for, read once when it asks.
     predicted_ms: Option<u64>,
-    /// The band below its declared one its job's age put it in when it
+    /// Key of the interactive job this ask belongs to, when keyed.
+    job: Option<JobKey>,
+    /// The band below its declared one its job's decay put it in when it
     /// asked, decided once: a request keeps the band it asked with.
-    decayed: Option<Decayed>,
+    decay: DecayState,
     /// The fewest cores it starts on before it ages, when it names one.
     min: Option<u64>,
 }
@@ -655,8 +689,32 @@ impl AdmissionState {
             claimed: None,
             periodic: false,
             predicted_ms: None,
-            decayed: None,
+            job: None,
+            decay: DecayState::Decided(None),
             min: None,
+        }
+    }
+
+    fn with_job(
+        mut self,
+        priority: SchedulerPriority,
+        job_id: Option<&str>,
+        job_started_ms: Option<u64>,
+        now_ms: u64,
+    ) -> Self {
+        if let Some(key) = interactive_job_key(priority, job_id, job_started_ms) {
+            self.job = Some(key);
+            self.decay = DecayState::Pending;
+        } else {
+            self.decay = DecayState::Decided(decayed(priority, job_started_ms, now_ms));
+        }
+        self
+    }
+
+    fn decayed(&self) -> Option<&Decayed> {
+        match &self.decay {
+            DecayState::Pending => None,
+            DecayState::Decided(decayed) => decayed.as_ref(),
         }
     }
 }
@@ -703,6 +761,11 @@ impl Lease {
             self.bytes_per_permit,
         )
     }
+
+    fn matches_job(&self, key: &JobKey) -> bool {
+        self.job_id.as_deref() == Some(key.job_id.as_str())
+            && self.job_started_ms == Some(key.job_started_ms)
+    }
 }
 
 impl Waiting {
@@ -712,6 +775,18 @@ impl Waiting {
         self.party
             .as_deref()
             .or_else(|| self.build.as_ref().map(|(id, _)| id.as_str()))
+    }
+    fn job_key(&self) -> Option<JobKey> {
+        let job_id = self.job_id.as_deref().filter(|id| !id.is_empty())?;
+        let job_started_ms = self.job_started_ms?;
+        Some(JobKey {
+            job_id: job_id.to_owned(),
+            job_started_ms,
+        })
+    }
+    fn matches_job(&self, key: &JobKey) -> bool {
+        self.job_id.as_deref() == Some(key.job_id.as_str())
+            && self.job_started_ms == Some(key.job_started_ms)
     }
     fn resources(&self) -> Resources {
         record_resources(
@@ -761,6 +836,8 @@ impl From<&Waiting> for Lease {
             cgroups: record.cgroups.as_deref().map(<[String]>::to_vec),
             written: record.written,
             bytes_per_permit: record.bytes_per_permit,
+            job_id: record.job_id.clone(),
+            job_started_ms: record.job_started_ms,
         }
     }
 }
@@ -960,14 +1037,176 @@ struct Pass {
 /// it in the scopes it is short of: the starvation bound.
 pub(crate) const AGING_MS: u64 = 30_000;
 
-/// How long after its job started an `interactive` request still asks as
-/// `interactive`; until [`NORMAL_UNTIL_MS`] it asks as `normal`, then as
-/// `low`. The bounds of the decay Danny set (tg#19152, tg#19154), moved to
-/// where the measured admission sweep put them: against 30 s and 120 s, its
-/// p95 fell 27 s and 0.85 pp more runs finished within the 240 s warm-cache
-/// window, and 120 s and 240 s sit inside its flat optimum.
+/// How long after its job's first admitted ask (or its job's start when
+/// unkeyed) an `interactive` request still asks as `interactive`; until
+/// [`NORMAL_UNTIL_MS`] it asks as `normal`, then as `low`. The bounds of the
+/// decay Danny set (tg#19152, tg#19154), moved to where the measured admission
+/// sweep put them: against 30 s and 120 s, its p95 fell 27 s and 0.85 pp more
+/// runs finished within the 240 s warm-cache window, and 120 s and 240 s sit
+/// inside its flat optimum.
 const INTERACTIVE_FOR_MS: u64 = 120_000;
 const NORMAL_UNTIL_MS: u64 = 240_000;
+
+/// Job identity and start timestamp a reservation carries for interactive decay.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Job<'a> {
+    pub(crate) id: Option<&'a str>,
+    pub(crate) started_ms: Option<u64>,
+}
+
+/// Key for an interactive job's first-admission clock.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+struct JobKey {
+    job_id: String,
+    job_started_ms: u64,
+}
+
+fn interactive_job_key(
+    priority: SchedulerPriority,
+    job_id: Option<&str>,
+    job_started_ms: Option<u64>,
+) -> Option<JobKey> {
+    if priority != SchedulerPriority::Interactive {
+        return None;
+    }
+    let job_id = job_id.filter(|id| !id.is_empty())?;
+    let job_started_ms = job_started_ms?;
+    Some(JobKey {
+        job_id: job_id.to_owned(),
+        job_started_ms,
+    })
+}
+
+/// One active interactive job's first admission on the pool clock.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct FirstAdmittedEntry {
+    job_id: String,
+    job_started_ms: u64,
+    first_admitted_ms: u64,
+}
+
+/// On-disk record of active interactive jobs' first admissions.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct FirstAdmittedLedger {
+    version: u8,
+    #[serde(default)]
+    entries: Vec<FirstAdmittedEntry>,
+}
+
+/// Active interactive jobs' first-admission timestamps, kept beside `leases`
+/// and `waiters` under `POOL_LOCK`.
+///
+/// On the first grant of an `interactive` request carrying `(job_id,
+/// job_started_ms)`, mbx records `first_admitted_ms` here; every later ask
+/// carrying that key decays by `now - first_admitted_ms`. Before any grant,
+/// the job keeps `interactive`. The record expires with the last live lease
+/// or waiter carrying the key.
+///
+/// A lost pool state (such as an mbx or host restart that clears the
+/// scheduler directory) loses only the band of jobs already running past
+/// their bound: such a job's next ask finds no record and starts its clock
+/// again at its next grant.
+#[derive(Debug, Default)]
+struct FirstAdmitted {
+    entries: BTreeMap<JobKey, u64>,
+    had_file: bool,
+    dirty: bool,
+}
+
+impl FirstAdmitted {
+    fn read(path: &Path) -> Self {
+        match std::fs::read(path) {
+            Ok(bytes) => {
+                let entries = serde_json::from_slice::<FirstAdmittedLedger>(&bytes)
+                    .ok()
+                    .map(|ledger| {
+                        ledger
+                            .entries
+                            .into_iter()
+                            .filter(|entry| !entry.job_id.is_empty())
+                            .map(|entry| {
+                                (
+                                    JobKey {
+                                        job_id: entry.job_id,
+                                        job_started_ms: entry.job_started_ms,
+                                    },
+                                    entry.first_admitted_ms,
+                                )
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                Self {
+                    entries,
+                    had_file: true,
+                    dirty: false,
+                }
+            }
+            Err(_) => Self::default(),
+        }
+    }
+
+    fn get(&self, key: &JobKey) -> Option<u64> {
+        self.entries.get(key).copied()
+    }
+
+    fn record_if_absent(&mut self, key: JobKey, now_ms: u64) {
+        if let std::collections::btree_map::Entry::Vacant(slot) = self.entries.entry(key) {
+            slot.insert(now_ms);
+            self.dirty = true;
+        }
+    }
+
+    fn prune(&mut self, live: &[Lease], waiters: &[Waiting]) {
+        if self.entries.is_empty() {
+            return;
+        }
+        let before = self.entries.len();
+        self.entries.retain(|key, _| {
+            live.iter().any(|lease| lease.matches_job(key))
+                || waiters.iter().any(|waiter| waiter.matches_job(key))
+        });
+        if self.entries.len() != before {
+            self.dirty = true;
+        }
+    }
+
+    fn remove(&mut self, key: &JobKey) {
+        if self.entries.remove(key).is_some() {
+            self.dirty = true;
+        }
+    }
+
+    fn save(&self, path: &Path) {
+        if !self.dirty {
+            return;
+        }
+        if self.entries.is_empty() {
+            if self.had_file {
+                let _ = std::fs::remove_file(path);
+            }
+            return;
+        }
+        let ledger = FirstAdmittedLedger {
+            version: FIRST_ADMITTED_VERSION,
+            entries: self
+                .entries
+                .iter()
+                .map(|(key, &first_admitted_ms)| FirstAdmittedEntry {
+                    job_id: key.job_id.clone(),
+                    job_started_ms: key.job_started_ms,
+                    first_admitted_ms,
+                })
+                .collect(),
+        };
+        if let Ok(mut contents) = serde_json::to_vec(&ledger) {
+            contents.push(b'\n');
+            if let Err(error) = crate::util::write_advisory(path, &contents) {
+                debug!("first-admission state was not saved: {error:#}");
+            }
+        }
+    }
+}
 
 /// The band a published priority is admitted in, the lower first: the pool's
 /// one lane order. A spelling this version does not know, a newer version's,
@@ -992,17 +1231,18 @@ struct Decayed {
 
 /// The band below `declared` a request asking at `asked_ms` is admitted in,
 /// `None` when it keeps its declared one. Only `interactive` decays, and only
-/// by the age of a job whose start it names; a grant is never re-ranked, since
-/// nothing granted is preempted.
+/// once its decay clock has started (`clock_start_ms`: the job's first
+/// admission when keyed, or its job start when unkeyed); a grant is never
+/// re-ranked, since nothing granted is preempted.
 fn decayed(
     declared: SchedulerPriority,
-    job_started_ms: Option<u64>,
+    clock_start_ms: Option<u64>,
     asked_ms: u64,
 ) -> Option<Decayed> {
     if declared != SchedulerPriority::Interactive {
         return None;
     }
-    let elapsed_ms = asked_ms.saturating_sub(job_started_ms?);
+    let elapsed_ms = asked_ms.saturating_sub(clock_start_ms?);
     let to = if elapsed_ms < INTERACTIVE_FOR_MS {
         return None;
     } else if elapsed_ms < NORMAL_UNTIL_MS {
@@ -2061,8 +2301,13 @@ pub(crate) struct Pool {
     bytes_per_permit: u64,
     events: bool,
     priority: SchedulerPriority,
-    /// When the job this pool's compilations run for started: what an
-    /// `interactive` request's band decays by.
+    /// Identity of the job this pool's compilations run for, paired with
+    /// `job_started_ms` so an `interactive` job's asks decay from its first
+    /// admitted ask.
+    job_id: Option<String>,
+    /// When the job this pool's compilations run for started: paired with
+    /// `job_id` to key the first-admission clock, or used directly when
+    /// `job_id` is absent.
     job_started_ms: Option<u64>,
     /// Probe for currently available memory, injectable for tests.
     available_memory: fn() -> Option<crate::util::Available>,
@@ -2141,6 +2386,9 @@ fn resolve_pool() -> Option<Pool> {
                     .and_then(|value| value.parse().ok())
                     .unwrap_or_default(),
             );
+            pool.job_id = std::env::var(SCHED_JOB_ID_ENV)
+                .ok()
+                .filter(|value| !value.is_empty());
             pool.job_started_ms = env_number(SCHED_JOB_STARTED_ENV);
             pool.domain_capacity = env_number(SCHED_CPUS_ENV)
                 .unwrap_or(capacity)
@@ -2225,6 +2473,10 @@ pub(crate) fn session_environment_with_jobs(
         (
             SCHED_PRIORITY_ENV.into(),
             scheduler.priority.as_str().into(),
+        ),
+        (
+            SCHED_JOB_ID_ENV.into(),
+            scheduler.job_id.clone().unwrap_or_default(),
         ),
         (
             SCHED_JOB_STARTED_ENV.into(),
@@ -2408,6 +2660,7 @@ impl Pool {
             bytes_per_permit,
             events: true,
             priority,
+            job_id: None,
             job_started_ms: None,
             available_memory: crate::util::memory_available,
             pressure: true,
@@ -2507,6 +2760,7 @@ impl Pool {
             pool.set_memory_capacity(scheduler.memory_bytes.unwrap_or(0));
             pool.events = config.events;
             pool.pressure = scheduler.pressure;
+            pool.job_id = scheduler.job_id.clone();
             pool.job_started_ms = scheduler.job_started_ms;
             pool
         })
@@ -2550,8 +2804,12 @@ impl Pool {
         let now_ms = (self.clock)();
         let mut state = AdmissionState {
             predicted_ms,
-            decayed: decayed(self.priority, self.job_started_ms, now_ms),
-            ..AdmissionState::new(now_ms, Shape::Rigid)
+            ..AdmissionState::new(now_ms, Shape::Rigid).with_job(
+                self.priority,
+                self.job_id.as_deref(),
+                self.job_started_ms,
+                now_ms,
+            )
         };
         let mut wake: Option<wait::Wait> = None;
         let mut complained = false;
@@ -2671,7 +2929,7 @@ impl Pool {
         memory_bytes: Option<u64>,
         min: Option<u64>,
         name: Option<&str>,
-        job_started_ms: Option<u64>,
+        job: Job<'_>,
         withdrawn: &AtomicBool,
     ) -> Result<Option<Permit>> {
         let weight = self.reservation_weight(cpus, memory_bytes, min)?;
@@ -2683,9 +2941,13 @@ impl Pool {
         let now_ms = (self.clock)();
         let mut state = AdmissionState {
             predicted_ms: self.predicted_run_ms(RunKind::Reservation, name),
-            decayed: decayed(self.priority, job_started_ms, now_ms),
             min,
-            ..AdmissionState::new(now_ms, Shape::Moldable)
+            ..AdmissionState::new(now_ms, Shape::Moldable).with_job(
+                self.priority,
+                job.id,
+                job.started_ms,
+                now_ms,
+            )
         };
         let mut wake: Option<wait::Wait> = None;
         loop {
@@ -2930,18 +3192,31 @@ impl Pool {
         queued: &mut Option<QueueEntry>,
         demand: Option<&Demand>,
     ) -> Result<Option<Permit>> {
-        // A queued request keeps its age across attempts, as its record says.
-        let first_arrival_ms = queued
+        // A queued request keeps its age and decay across attempts, as its record says.
+        let existing = queued
             .as_ref()
-            .and_then(|entry| {
-                serde_json::from_slice::<Waiting>(&entry.serialized_record)
-                    .ok()?
-                    .first_arrival_ms
-            })
+            .and_then(|entry| serde_json::from_slice::<Waiting>(&entry.serialized_record).ok());
+        let first_arrival_ms = existing
+            .as_ref()
+            .and_then(|record| record.first_arrival_ms)
             .unwrap_or_else(|| (self.clock)());
-        let mut state = AdmissionState {
-            queued: queued.take(),
-            ..AdmissionState::new(first_arrival_ms, Shape::Rigid)
+        let mut state = if let Some(record) = existing {
+            AdmissionState {
+                queued: queued.take(),
+                job: record.job_key(),
+                decay: DecayState::Decided(record.decayed),
+                ..AdmissionState::new(first_arrival_ms, Shape::Rigid)
+            }
+        } else {
+            AdmissionState {
+                queued: queued.take(),
+                ..AdmissionState::new(first_arrival_ms, Shape::Rigid).with_job(
+                    self.priority,
+                    self.job_id.as_deref(),
+                    self.job_started_ms,
+                    first_arrival_ms,
+                )
+            }
         };
         let result = self.try_admit_state(resources, weight, predicted, &mut state, demand);
         *queued = state.queued;
@@ -3021,7 +3296,6 @@ impl Pool {
         let first_arrival_ms = state.first_arrival_ms;
         let shape = state.shape;
         let predicted_ms = state.predicted_ms;
-        let decayed = state.decayed.clone();
         let min = state.min;
         // Broken sensing disables only this advisory gate, never CPU scheduling.
         let pressure_state = (self.pressure && self.bytes_per_permit > 0)
@@ -3033,6 +3307,9 @@ impl Pool {
             && self.bytes_per_permit > 0
             && crate::supervision::resumes_pending(&self.dir, now);
         if resuming && !live.is_empty() {
+            self.resolve_gated_decay(state, &live, now);
+            let decayed = state.decayed().cloned();
+            let job = state.job.clone();
             self.gated(state, "resumes-pending", events, || {
                 self.waiting_record(
                     resources,
@@ -3042,6 +3319,7 @@ impl Pool {
                     shape,
                     predicted_ms,
                     decayed.as_ref(),
+                    job.as_ref(),
                     min,
                     u64::MAX,
                 )
@@ -3062,6 +3340,9 @@ impl Pool {
                 self.cgroup_contains,
             )
         {
+            self.resolve_gated_decay(state, &live, now);
+            let decayed = state.decayed().cloned();
+            let job = state.job.clone();
             self.gated(state, "pressure", events, || {
                 self.waiting_record(
                     resources,
@@ -3071,6 +3352,7 @@ impl Pool {
                     shape,
                     predicted_ms,
                     decayed.as_ref(),
+                    job.as_ref(),
                     min,
                     u64::MAX,
                 )
@@ -3095,6 +3377,9 @@ impl Pool {
         if let Some(needed) = predicted
             && memory_gate.is_some_and(|gate| gate.blocks(&live, needed))
         {
+            self.resolve_gated_decay(state, &live, now);
+            let decayed = state.decayed().cloned();
+            let job = state.job.clone();
             self.gated(state, "available-memory", events, || {
                 self.waiting_record(
                     resources,
@@ -3104,6 +3389,7 @@ impl Pool {
                     shape,
                     predicted_ms,
                     decayed.as_ref(),
+                    job.as_ref(),
                     min,
                     u64::MAX,
                 )
@@ -3115,6 +3401,15 @@ impl Pool {
         let (paths, records): (Vec<_>, Vec<_>) = scan_waiters_logged(&waiters, Some(self), events)?
             .into_iter()
             .unzip();
+        let first_admitted_path = self.first_admitted_path();
+        let mut first_admitted = FirstAdmitted::read(&first_admitted_path);
+        first_admitted.prune(&live, &records);
+        if matches!(state.decay, DecayState::Pending) {
+            let clock_start = state.job.as_ref().and_then(|key| first_admitted.get(key));
+            state.decay = DecayState::Decided(decayed(self.priority, clock_start, now));
+        }
+        let decayed = state.decayed().cloned();
+        let job = state.job.clone();
         let ticket = state.queued.as_ref().map_or(u64::MAX, |entry| entry.ticket);
         let pass = admission_pass(
             live,
@@ -3127,6 +3422,7 @@ impl Pool {
                 shape,
                 predicted_ms,
                 decayed.as_ref(),
+                job.as_ref(),
                 min,
                 ticket,
             ),
@@ -3171,10 +3467,14 @@ impl Pool {
                 },
             };
             granted = true;
+            if let Some(key) = record.job_key() {
+                first_admitted.record_if_absent(key, now);
+            }
             if let Some(trace) = grant.trace {
                 self.admitted_event(record, live, grant.decision, trace, granted_by, events);
             }
         }
+        first_admitted.save(&first_admitted_path);
         if granted && let Some((path, sample)) = pressure_state.as_ref().zip(pressure.as_mut()) {
             sample.last_admission_ms = Some(now);
             let _ = crate::pressure::save(path, sample);
@@ -3222,6 +3522,35 @@ impl Pool {
         Ok(None)
     }
 
+    fn first_admitted_path(&self) -> PathBuf {
+        self.dir.join(FIRST_ADMITTED_FILE)
+    }
+
+    /// Resolve a keyed interactive ask's decay before returning on a gated path.
+    fn resolve_gated_decay(&self, state: &mut AdmissionState, live: &[Lease], now_ms: u64) {
+        if !matches!(state.decay, DecayState::Pending) {
+            return;
+        }
+        let Some(key) = &state.job else {
+            state.decay = DecayState::Decided(None);
+            return;
+        };
+        let path = self.first_admitted_path();
+        let mut first_admitted = FirstAdmitted::read(&path);
+        let clock_start = first_admitted.get(key).and_then(|admitted_ms| {
+            let alive = live.iter().any(|lease| lease.matches_job(key))
+                || live_waiter_matches_job(&self.dir.join(WAITERS_DIR), key);
+            if alive {
+                Some(admitted_ms)
+            } else {
+                first_admitted.remove(key);
+                first_admitted.save(&path);
+                None
+            }
+        });
+        state.decay = DecayState::Decided(decayed(self.priority, clock_start, now_ms));
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn waiting_record(
         &self,
@@ -3232,6 +3561,7 @@ impl Pool {
         shape: Shape,
         predicted_ms: Option<u64>,
         decayed: Option<&Decayed>,
+        job: Option<&JobKey>,
         min: Option<u64>,
         ticket: u64,
     ) -> Waiting {
@@ -3268,6 +3598,8 @@ impl Pool {
             decayed: decayed.cloned(),
             min,
             party: self.party.clone(),
+            job_id: job.map(|key| key.job_id.clone()),
+            job_started_ms: job.map(|key| key.job_started_ms),
         }
     }
 
@@ -4601,6 +4933,28 @@ fn scan_waiters(directory: &Path) -> Result<Vec<Waiting>> {
         .collect())
 }
 
+/// Whether any live waiter under `directory` carries `key`.
+fn live_waiter_matches_job(directory: &Path, key: &JobKey) -> bool {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(file) = File::open(&path) else {
+            continue;
+        };
+        if !matches!(waiter_is_live(&file), Ok(true)) {
+            continue;
+        }
+        if let Ok(Some(record)) = read_waiter(&path)
+            && record.matches_job(key)
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// Every live queue record, beside the path its holder keeps locked.
 fn scan_waiters_logged(
     directory: &Path,
@@ -4692,6 +5046,8 @@ fn scan_leases(leases: &Path) -> Result<Vec<Lease>> {
                     cgroups: None,
                     written: None,
                     bytes_per_permit: 0,
+                    job_id: None,
+                    job_started_ms: None,
                 },
                 |mut lease| {
                     lease.weight = lease.weight.max(1);

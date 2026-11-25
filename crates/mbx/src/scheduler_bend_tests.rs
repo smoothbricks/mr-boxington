@@ -21,9 +21,12 @@
 //! - **One lane per band.** The model's lanes are mbx's bands in order:
 //!   `interactive`, `normal`, `low`. mbx's `normal` is the model's `Gate`,
 //!   `interactive` its `Interactive` and `low` its `Background`. An ask
-//!   carries the seconds its job has run, by which the model's `lane` decays
-//!   an interactive one and from which mbx's record is published through
-//!   [`decayed`], with the job's start that many seconds before the ask.
+//!   carries the seconds elapsed on its job's decay clock (since the job's
+//!   first admitted ask when keyed, or 0 before its first admission; since
+//!   the job's start when unkeyed), by which the model's `lane`/`iband`
+//!   decays an interactive one and from which mbx's record is published
+//!   through [`decayed`], with the decay clock start that many seconds before
+//!   the ask.
 //! - **Minimums, where the model binds them.** A reservation may name a
 //!   minimum and a party, its endpoint server. The model's gather (`act`,
 //!   `gwalks`) holds back what its walk of a lane's `new` list reaches after
@@ -146,7 +149,8 @@ fn model_band(priority: SchedulerPriority) -> model::Band {
 
 /// The `id`th arrival as its holder publishes it: moldable, charging no
 /// memory, in the one domain, declared at `priority` and asking `elapsed`
-/// seconds after its job started.
+/// seconds after its decay clock started (first admission when keyed, or job
+/// start when unkeyed).
 fn record(
     id: u64,
     priority: SchedulerPriority,
@@ -188,6 +192,8 @@ fn record(
         decayed,
         min: None,
         party: None,
+        job_id: None,
+        job_started_ms: None,
     }
 }
 
@@ -527,19 +533,29 @@ fn on_a_deep_stack(test: impl FnOnce() + Send + 'static) {
 }
 
 /// mbx's decay and bands against the model's, ask by ask: the decay bounds
-/// are the model's, and each declared priority asking at each second into its
-/// job is published in the band whose index is the model's lane for it.
+/// are the model's, and each declared priority asking at each second after its
+/// decay clock started (first admission when keyed, or job start when unkeyed)
+/// is published in the band whose index is the model's lane for it, and never
+/// rises as elapsed grows.
 #[test]
 fn mbx_bands_each_ask_in_the_models_lane() {
     assert_eq!(model::b1() * TICK_MS, INTERACTIVE_FOR_MS);
     assert_eq!(model::b2() * TICK_MS, NORMAL_UNTIL_MS);
     for priority in PRIORITIES {
+        let mut previous = 0u8;
         for elapsed in 0..ELAPSED {
             let published = record(1, priority, elapsed, 1, None, EPOCH_MS, 1).priority;
+            let current = band(&published);
+            assert!(
+                current >= previous,
+                "decay_never_rises violated for {} at {elapsed} s: {current} < {previous}",
+                priority.as_str()
+            );
+            previous = current;
             assert_eq!(
-                u64::from(band(&published)),
+                u64::from(current),
                 model::lane(model_band(priority), elapsed),
-                "{} asking {elapsed} s into its job",
+                "{} asking {elapsed} s after its decay clock started",
                 priority.as_str()
             );
         }

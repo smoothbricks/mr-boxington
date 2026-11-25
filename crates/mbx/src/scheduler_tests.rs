@@ -221,7 +221,7 @@ fn a_reservation_charges_cpu_and_memory_separately() {
             Some(3 * 1024),
             None,
             None,
-            None,
+            Job::default(),
             &AtomicBool::default(),
         )
         .unwrap()
@@ -243,8 +243,15 @@ fn a_reservation_requires_a_requested_resource() {
     let pool = pool_at(directory.path(), 4, 1024);
 
     assert!(
-        pool.reserve(None, None, None, None, None, &AtomicBool::default())
-            .is_err()
+        pool.reserve(
+            None,
+            None,
+            None,
+            None,
+            Job::default(),
+            &AtomicBool::default()
+        )
+        .is_err()
     );
 }
 
@@ -254,8 +261,15 @@ fn a_memory_reservation_needs_a_memory_budget() {
     let pool = pool_at(directory.path(), 4, 0);
 
     assert!(
-        pool.reserve(None, Some(1024), None, None, None, &AtomicBool::default())
-            .is_err()
+        pool.reserve(
+            None,
+            Some(1024),
+            None,
+            None,
+            Job::default(),
+            &AtomicBool::default()
+        )
+        .is_err()
     );
 }
 
@@ -278,7 +292,14 @@ fn blocked_reservations_sleep_and_wake_in_fifo_order() {
                 crate::pressure::now_ms()
             };
             let permit = pool
-                .reserve(Some(1), None, None, None, None, &AtomicBool::default())
+                .reserve(
+                    Some(1),
+                    None,
+                    None,
+                    None,
+                    Job::default(),
+                    &AtomicBool::default(),
+                )
                 .unwrap()
                 .unwrap();
             admitted.send((index, permit)).unwrap();
@@ -340,7 +361,14 @@ fn a_waiting_reservation_recovers_a_silently_unlocked_lease() {
         admitted
             .send(
                 pool_at(&dir, 1, 0)
-                    .reserve(Some(1), None, None, None, None, &AtomicBool::default())
+                    .reserve(
+                        Some(1),
+                        None,
+                        None,
+                        None,
+                        Job::default(),
+                        &AtomicBool::default(),
+                    )
                     .unwrap()
                     .unwrap(),
             )
@@ -445,6 +473,8 @@ fn a_dead_holders_lease_is_reclaimed() {
             cgroups: None,
             written: None,
             bytes_per_permit: 0,
+            job_id: None,
+            job_started_ms: None,
         })
         .unwrap(),
     )
@@ -1327,6 +1357,7 @@ fn session_environment_states_off_explicitly() {
     config.scheduler.cpus = 8;
     config.scheduler.reserve_cpus = 2;
     config.scheduler.memory_bytes = Some(8000);
+    config.scheduler.job_id = Some("job-99".into());
     let environment = session_environment_with_jobs(&config, None);
     let value = |name: &str| {
         environment
@@ -1342,6 +1373,7 @@ fn session_environment_states_off_explicitly() {
     assert_eq!(value(SCHED_SLOTS_ENV), "6");
     assert_eq!(value(SCHED_SLOT_BYTES_ENV), "1333");
     assert_eq!(value(SCHED_PRIORITY_ENV), "normal");
+    assert_eq!(value(SCHED_JOB_ID_ENV), "job-99");
     assert!(!value(SCHED_BUILD_ID_ENV).is_empty());
     assert_eq!(value(SCHED_BUILD_SLOTS_ENV), "6");
 
@@ -2922,6 +2954,7 @@ fn scheduler_stats_rank_live_waiters_by_ticket_and_exclude_grants() {
             None,
             None,
             None,
+            None,
             ticket,
         );
         record.pid = Some(pid);
@@ -2947,6 +2980,7 @@ fn scheduler_stats_rank_live_waiters_by_ticket_and_exclude_grants() {
         None,
         0,
         Shape::Rigid,
+        None,
         None,
         None,
         None,
@@ -3446,6 +3480,8 @@ fn waiter(ticket: u64, weight: u64, domain: (&str, u64), build: Option<(&str, u6
         handoff: None,
         min: None,
         party: None,
+        job_id: None,
+        job_started_ms: None,
     }
 }
 fn vector_attempt(pool: &Pool, cpu: u64, memory_bytes: u64) -> Option<Permit> {
@@ -3571,7 +3607,7 @@ fn reservation_vector_and_legacy_charge_are_both_preserved() {
             Some(5 * GIB + 1),
             None,
             None,
-            None,
+            Job::default(),
             &AtomicBool::default(),
         )
         .unwrap()
@@ -3588,7 +3624,14 @@ fn reservation_vector_and_legacy_charge_are_both_preserved() {
     assert_eq!(record.bytes_per_permit, GIB);
     drop(lease);
     let lease = pool
-        .reserve(Some(2), None, None, None, None, &AtomicBool::default())
+        .reserve(
+            Some(2),
+            None,
+            None,
+            None,
+            Job::default(),
+            &AtomicBool::default(),
+        )
         .unwrap()
         .unwrap();
     let record: Lease = serde_json::from_slice(&std::fs::read(&lease.path).unwrap()).unwrap();
@@ -3601,7 +3644,14 @@ fn reservation_vector_and_legacy_charge_are_both_preserved() {
     );
     drop(lease);
     let lease = pool
-        .reserve(None, Some(GIB), None, None, None, &AtomicBool::default())
+        .reserve(
+            None,
+            Some(GIB),
+            None,
+            None,
+            Job::default(),
+            &AtomicBool::default(),
+        )
         .unwrap()
         .unwrap();
     let record: Lease = serde_json::from_slice(&std::fs::read(&lease.path).unwrap()).unwrap();
@@ -5870,7 +5920,10 @@ fn an_interactive_request_decays_by_its_jobs_age_when_it_asks() {
             None,
             None,
             Some("reservation"),
-            Some(NOW - NORMAL_UNTIL_MS),
+            Job {
+                id: None,
+                started_ms: Some(NOW - NORMAL_UNTIL_MS),
+            },
             &AtomicBool::default(),
         )
         .unwrap()
@@ -5996,7 +6049,11 @@ fn an_interactive_job_decays_from_its_first_admitted_ask() {
     // 4. Without job_id, decay by start is unchanged.
     let unkeyed = pool_for(None, START);
     CLOCK.store(FIRST_ASK, Ordering::SeqCst);
-    drop(unkeyed.admit(&Demand::new("without-job-id", false)).unwrap());
+    drop(
+        unkeyed
+            .admit(&Demand::new("without-job-id", false))
+            .unwrap(),
+    );
 
     let decayed = |to: &str, elapsed_ms: u64| {
         Some(serde_json::json!({"from": "interactive", "to": to, "elapsed_ms": elapsed_ms}))
@@ -6017,6 +6074,177 @@ fn an_interactive_job_decays_from_its_first_admitted_ask() {
             ("without-job-id", "low", decayed("low", 274_000)),
         ]
     );
+}
+
+#[test]
+fn first_admission_clock_starts_on_handoff_lives_with_waiters_and_ignores_non_interactive() {
+    static CLOCK: AtomicU64 = AtomicU64::new(0);
+    const START: u64 = 1_000_000;
+    const FIRST_ASK: u64 = START + 274_000;
+    const FIRST_GRANT: u64 = FIRST_ASK + 10_000;
+
+    let dir = tempfile::tempdir().unwrap();
+    let blocker = pool_at(dir.path(), 1, 0);
+    let held = blocker.try_admit(1, None).unwrap().unwrap();
+
+    let mut job = pool_at(dir.path(), 1, 0);
+    job.priority = SchedulerPriority::Interactive;
+    job.job_id = Some("job-handoff".into());
+    job.job_started_ms = Some(START);
+    job.clock = || CLOCK.load(Ordering::SeqCst);
+
+    // First ask queues while pool is full: no grant yet, so stays interactive and writes no record.
+    CLOCK.store(FIRST_ASK, Ordering::SeqCst);
+    let mut queued_first = None;
+    assert!(
+        job.try_admit_named(
+            Resources {
+                cpu: 1,
+                memory_bytes: 0,
+            },
+            1,
+            None,
+            &mut queued_first,
+            Some(&Demand::new("queued-first", false)),
+        )
+        .unwrap()
+        .is_none()
+    );
+    assert!(
+        !dir.path().join(FIRST_ADMITTED_FILE).exists(),
+        "no first-admission record before any grant"
+    );
+
+    // Another process releases and runs a pass that hands off to the queued interactive ask.
+    drop(held);
+    let mut passer = pool_at(dir.path(), 1, 0);
+    passer.clock = || CLOCK.load(Ordering::SeqCst);
+    CLOCK.store(FIRST_GRANT, Ordering::SeqCst);
+    let mut passer_queued = None;
+    assert!(
+        passer
+            .try_admit_queued(1, None, &mut passer_queued)
+            .unwrap()
+            .is_none()
+    );
+    drop(passer_queued);
+    let first_permit = job
+        .try_admit_queued(1, None, &mut queued_first)
+        .unwrap()
+        .expect("handed-off interactive ask claims its lease");
+
+    // 130 s after the handoff grant, a second ask queues while the first lease is still held -> normal.
+    CLOCK.store(FIRST_GRANT + 130_000, Ordering::SeqCst);
+    let mut queued_second = None;
+    assert!(
+        job.try_admit_named(
+            Resources {
+                cpu: 1,
+                memory_bytes: 0,
+            },
+            1,
+            None,
+            &mut queued_second,
+            Some(&Demand::new("queued-second", false)),
+        )
+        .unwrap()
+        .is_none()
+    );
+
+    // First lease ends while second ask is still waiting: the live waiter keeps the record alive.
+    drop(first_permit);
+    // Block the pool with an unrelated lease? Actually second ask is waiting so a third ask
+    // at +250 s sees the waiter keeping the record alive and decays to low!
+    CLOCK.store(FIRST_GRANT + 250_000, Ordering::SeqCst);
+    let mut queued_third = None;
+    let _ = job
+        .try_admit_named(
+            Resources {
+                cpu: 1,
+                memory_bytes: 0,
+            },
+            1,
+            None,
+            &mut queued_third,
+            Some(&Demand::new("third-at-250s", false)),
+        )
+        .unwrap();
+    // Claim queued_second (handed off by the pass above) and drop everything for this job.
+    let second_permit = job.try_admit_queued(1, None, &mut queued_second).unwrap();
+    drop(second_permit);
+    drop(queued_second);
+    drop(queued_third);
+
+    // Lost pool state (deleting first_admitted.json while a lease is held) restarts on next grant.
+    CLOCK.store(FIRST_GRANT + 300_000, Ordering::SeqCst);
+    let fresh = job
+        .admit(&Demand::new("fresh-after-all-gone", false))
+        .unwrap();
+    std::fs::remove_file(dir.path().join(FIRST_ADMITTED_FILE)).unwrap();
+    CLOCK.store(FIRST_GRANT + 300_000 + 250_000, Ordering::SeqCst);
+    let mut wide = pool_at(dir.path(), 4, 0);
+    wide.priority = SchedulerPriority::Interactive;
+    wide.job_id = Some("job-handoff".into());
+    wide.job_started_ms = Some(START);
+    wide.clock = || CLOCK.load(Ordering::SeqCst);
+    let after_loss = wide.admit(&Demand::new("after-state-loss", false)).unwrap();
+    drop(fresh);
+    drop(after_loss);
+
+    // Non-interactive priorities ignore job_id and job_started_ms completely.
+    for (priority, name) in [
+        (SchedulerPriority::Normal, "normal-with-key"),
+        (SchedulerPriority::Low, "low-with-key"),
+    ] {
+        wide.priority = priority;
+        drop(wide.admit(&Demand::new(name, false)).unwrap());
+    }
+    assert!(
+        !dir.path().join(FIRST_ADMITTED_FILE).exists(),
+        "non-interactive admissions never write a first-admission record"
+    );
+
+    let decayed = |to: &str, elapsed_ms: u64| {
+        Some(serde_json::json!({"from": "interactive", "to": to, "elapsed_ms": elapsed_ms}))
+    };
+    let rows: Vec<(String, String, String, Option<serde_json::Value>)> =
+        std::fs::read_to_string(dir.path().join("decisions.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter(|row| matches!(row["event"].as_str(), Some("enqueued" | "admitted")))
+            .filter_map(|row| {
+                let name = row["name"].as_str()?.to_owned();
+                Some((
+                    row["event"].as_str()?.to_owned(),
+                    name,
+                    row["priority"].as_str()?.to_owned(),
+                    row.get("decayed").cloned(),
+                ))
+            })
+            .collect();
+    let find = |event: &str, name: &str| {
+        rows.iter()
+            .find(|(e, n, _, _)| e == event && n == name)
+            .map(|(_, _, p, d)| (p.as_str(), d.clone()))
+            .unwrap_or_else(|| panic!("missing {event} for {name} in {rows:?}"))
+    };
+    assert_eq!(find("admitted", "queued-first"), ("interactive", None));
+    assert_eq!(
+        find("enqueued", "queued-second"),
+        ("normal", decayed("normal", 130_000))
+    );
+    assert_eq!(
+        find("enqueued", "third-at-250s"),
+        ("low", decayed("low", 250_000))
+    );
+    assert_eq!(
+        find("admitted", "fresh-after-all-gone"),
+        ("interactive", None)
+    );
+    assert_eq!(find("admitted", "after-state-loss"), ("interactive", None));
+    assert_eq!(find("admitted", "normal-with-key"), ("normal", None));
+    assert_eq!(find("admitted", "low-with-key"), ("low", None));
 }
 
 #[test]

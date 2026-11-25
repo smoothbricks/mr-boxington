@@ -447,6 +447,7 @@ fn original_reserve_arguments(arguments: &[std::ffi::OsString]) -> Result<Vec<St
                 | "--priority"
                 | "--grant-fd"
                 | "--name"
+                | "--job-id"
                 | "--job-started"
                 | "--min"
         ) {
@@ -456,6 +457,7 @@ fn original_reserve_arguments(arguments: &[std::ffi::OsString]) -> Result<Vec<St
             || first.starts_with("--priority=")
             || first.starts_with("--grant-fd=")
             || first.starts_with("--name=")
+            || first.starts_with("--job-id=")
             || first.starts_with("--job-started=")
             || first.starts_with("--min=")
         {

@@ -115,6 +115,7 @@ fn a_request_is_exactly_one_of_the_protocol_lines() {
                 priority: SchedulerPriority::Low,
                 memory: None,
                 name: None,
+                job_id: None,
                 job_started_ms: None,
                 min: None,
             }),
@@ -127,6 +128,7 @@ fn a_request_is_exactly_one_of_the_protocol_lines() {
                 priority: SchedulerPriority::Normal,
                 memory: Some(1024),
                 name: None,
+                job_id: None,
                 job_started_ms: None,
                 min: None,
             }),
@@ -139,6 +141,7 @@ fn a_request_is_exactly_one_of_the_protocol_lines() {
                 priority: SchedulerPriority::Low,
                 memory: None,
                 name: Some("nx:ws:build".into()),
+                job_id: None,
                 job_started_ms: None,
                 min: None,
             }),
@@ -155,19 +158,34 @@ fn a_request_is_exactly_one_of_the_protocol_lines() {
                 priority: SchedulerPriority::Interactive,
                 memory: None,
                 name: None,
+                job_id: None,
                 job_started_ms: Some(1_700_000_000_000),
                 min: None,
             }),
         ),
-        // Absent or null is no job start: the request does not decay.
         (
-            r#"{"type":"reserve","id":3,"cpus":4,"priority":"interactive","job_started_ms":null}"#,
+            r#"{"type":"reserve","id":3,"cpus":4,"priority":"interactive","job_id":"job-1","job_started_ms":1700000000000}"#,
             Some(Request::Reserve {
                 id: 3,
                 cpus: 4,
                 priority: SchedulerPriority::Interactive,
                 memory: None,
                 name: None,
+                job_id: Some("job-1".into()),
+                job_started_ms: Some(1_700_000_000_000),
+                min: None,
+            }),
+        ),
+        // Absent or null is no job identity or start: the request does not decay.
+        (
+            r#"{"type":"reserve","id":3,"cpus":4,"priority":"interactive","job_id":null,"job_started_ms":null}"#,
+            Some(Request::Reserve {
+                id: 3,
+                cpus: 4,
+                priority: SchedulerPriority::Interactive,
+                memory: None,
+                name: None,
+                job_id: None,
                 job_started_ms: None,
                 min: None,
             }),
@@ -180,6 +198,7 @@ fn a_request_is_exactly_one_of_the_protocol_lines() {
                 priority: SchedulerPriority::Normal,
                 memory: None,
                 name: None,
+                job_id: None,
                 job_started_ms: None,
                 min: Some(4),
             }),
@@ -438,9 +457,19 @@ async fn a_reservation_accepts_job_id_alongside_job_started_ms() {
             "cpus": 1,
             "priority": "interactive",
             "job_id": "job-274",
-            "job_started_ms": 1_700_000_000_000_u64,
+            // Far in the past (> 240 s before wall clock), yet first ask enters at interactive.
+            "job_started_ms": 1_000_000_u64,
         }))
         .await;
     assert_eq!(client.reply().await, granted(1, 1));
     client.close().await;
+    let admitted: Vec<Value> = std::fs::read_to_string(dir.path().join("decisions.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|row| row["event"] == "admitted")
+        .collect();
+    assert_eq!(admitted.len(), 1);
+    assert_eq!(admitted[0]["priority"], "interactive");
+    assert_eq!(admitted[0].get("decayed"), None);
 }

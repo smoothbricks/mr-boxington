@@ -690,6 +690,8 @@ mod tests {
             cgroups: None,
             written: None,
             bytes_per_permit: waiter.bytes_per_permit,
+            job_id: waiter.job_id.clone(),
+            job_started_ms: waiter.job_started_ms,
         }
     }
 
