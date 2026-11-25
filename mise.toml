@@ -91,8 +91,13 @@ run_windows = [
   'target\mbx-bootstrap\mbx.exe clippy --workspace --all-features --all-targets --fix --allow-dirty --allow-staged -- -D warnings',
 ]
 
+[tasks."check:shell"]
+description = "Assert the repository shell's Darwin compiler invariant (devenv.nix)"
+run = "bash scripts/check-shell.sh"
+run_windows = "pwsh -NoProfile -Command \"Write-Output 'The shell compiler invariant is Darwin-only'\""
+
 [tasks.ci]
-depends = ["lint", "build", "check:docs", "check:links", "test"]
+depends = ["check:shell", "lint", "build", "check:docs", "check:links", "test"]
 
 [tasks.docs]
 description = "Start the documentation development server"
