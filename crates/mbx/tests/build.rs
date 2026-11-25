@@ -9962,12 +9962,25 @@ fn object_files(project: &Path) -> std::collections::BTreeMap<String, u64> {
 /// The object files the linked `binary`'s debug map names, by file name.
 #[cfg(unix)]
 fn debug_map_objects(binary: &Path) -> std::collections::BTreeSet<String> {
+    // On macOS mbx passes ld64 `-oso_prefix` for the profile directory
+    // (`target/debug/`), so the binary's debug map records unit objects as
+    // `deps/...`. Run `dsymutil` from the binary's profile directory so those
+    // relative OSO paths resolve without disturbing absolute sysroot entries.
+    let profile_dir = binary
+        .parent()
+        .expect("binary should live in a profile directory");
     let map = Command::new("dsymutil")
+        .current_dir(profile_dir)
         .arg("-dump-debug-map")
         .arg(binary)
         .output()
         .expect("dsymutil should run");
-    assert!(map.status.success());
+    assert!(
+        map.status.success(),
+        "dsymutil failed ({}): {}",
+        map.status,
+        String::from_utf8_lossy(&map.stderr)
+    );
     String::from_utf8_lossy(&map.stdout)
         .lines()
         .filter_map(|line| line.trim().strip_prefix("- filename:"))
