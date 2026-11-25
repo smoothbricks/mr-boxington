@@ -587,6 +587,9 @@ fn main() {
 
 #[cfg(unix)]
 fn run_application_daemon_outlives_session(daemon_delay: std::time::Duration) {
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixListener;
+
     let root = tempfile::tempdir().unwrap();
     let other = root.path().join("other");
     project(&other, "fn main() {}\n");
@@ -603,39 +606,58 @@ fn run_application_daemon_outlives_session(daemon_delay: std::time::Duration) {
     project(
         root.path(),
         r#"
+use std::io::{Read, Write};
+use std::os::unix::net::UnixStream;
 use std::process::{Command, Stdio};
 fn main() {
     let args: Vec<_> = std::env::args().collect();
     if args.get(1).map(String::as_str) != Some("daemon") {
-        assert!(std::os::unix::net::UnixStream::connect(env!("OUTER_SOCKET")).is_err(), "session still alive at application launch");
+        assert!(UnixStream::connect(env!("OUTER_SOCKET")).is_err(), "session still alive at application launch");
         Command::new(std::env::current_exe().unwrap()).arg("daemon").args(&args[1..])
             .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
         return;
     }
-    for _ in 0..200 {
-        if std::path::Path::new(&args[4]).exists() { break; }
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
-    assert!(std::path::Path::new(&args[4]).exists());
+    let mut stream = UnixStream::connect(&args[4]).unwrap();
+    let mut go = [0u8; 1];
+    stream.read_exact(&mut go).unwrap();
+    assert_eq!(&go, b"g");
     assert!(std::env::var_os("MBX_SOCKET").is_none());
     assert!(std::env::var_os("RUSTC_WRAPPER").is_none());
     let output = Command::new(&args[2]).args(["check", "--offline"])
         .current_dir(&args[3]).env("MBX_LOG", "debug").output().unwrap();
-    assert!(output.status.success(), "{:?}", output);
-    assert!(!output.stderr.is_empty());
-    std::fs::write(&args[5], "independent build captured").unwrap();
+    if !output.status.success() {
+        let _ = write!(
+            stream,
+            "daemon check failed ({}): {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    if output.stderr.is_empty() {
+        let _ = write!(stream, "daemon check produced empty stderr");
+        return;
+    }
+    stream.write_all(b"independent build captured").unwrap();
 }
 "#,
     );
     std::fs::write(root.path().join("build.rs"),
         "fn main() { println!(\"cargo:rustc-env=OUTER_SOCKET={}\", std::env::var(\"MBX_SOCKET\").unwrap()); }\n").unwrap();
-    let gate = root.path().join("launcher-exited");
-    let result = root.path().join("daemon-result");
+    let sock_parent = std::env::var_os("MBX_SESSION_ROOT")
+        .filter(|root| !root.is_empty())
+        .or_else(|| std::env::var_os("XDG_RUNTIME_DIR").filter(|root| !root.is_empty()))
+        .unwrap_or_else(|| "/tmp".into());
+    let sock_dir = tempfile::Builder::new()
+        .prefix("mbx-d-")
+        .tempdir_in(sock_parent)
+        .unwrap();
+    let sock_path = sock_dir.path().join("s.sock");
+    let listener = UnixListener::bind(&sock_path).unwrap();
     let output = mbx(root.path())
         .args(["run", "--offline", "--", env!("CARGO_BIN_EXE_mbx")])
         .arg(&other)
-        .arg(&gate)
-        .arg(&result)
+        .arg(&sock_path)
         .output()
         .unwrap();
     assert!(
@@ -643,15 +665,12 @@ fn main() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    std::fs::write(&gate, "go").unwrap();
+    // Block on the daemon's socket connection, release it once `mbx run` has
+    // exited, then wait on socket EOF for the daemon's independent build.
+    let (mut stream, _) = listener.accept().unwrap();
+    stream.write_all(b"g").unwrap();
     let mut contents = String::new();
-    for _ in 0..200 {
-        contents = std::fs::read_to_string(&result).unwrap_or_default();
-        if contents == "independent build captured" {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
+    stream.read_to_string(&mut contents).unwrap();
     assert_eq!(contents, "independent build captured");
     assert!(!String::from_utf8_lossy(&output.stderr).contains("Checking scope-fixture"));
 }
