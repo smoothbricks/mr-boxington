@@ -23,6 +23,12 @@ pub fn isolate_host(command: &mut Command) -> &mut Command {
                 command.env(name, value);
             }
         }
+        // Keep the host or sandbox's short session root (such as cowshed's
+        // runtime alias beside a long TMPDIR) so session sockets stay within
+        // SUN_LEN, including after `Command::env_clear`.
+        if let Some(root) = std::env::var_os("MBX_SESSION_ROOT").filter(|root| !root.is_empty()) {
+            command.env("MBX_SESSION_ROOT", root);
+        }
         let home = isolated_home();
         command
             .env("HOME", home)
@@ -44,6 +50,11 @@ pub fn isolate_host(command: &mut Command) -> &mut Command {
 /// it produces can fail a test that asserts on stderr, which is a deliberate
 /// act rather than something the machine decides.
 ///
+/// `MBX_SESSION_ROOT` stays too. It is a host/sandbox runtime-root alias paired
+/// with a long `TMPDIR` so session Unix sockets fit inside `SUN_LEN`, not a
+/// build or cache setting. Tests that assert on `MBX_SESSION_ROOT` itself
+/// override or remove it explicitly.
+///
 /// This applies on every platform. Windows resolves the configuration
 /// directory through known-folder APIs rather than the environment, so a
 /// global `config.toml` on a Windows developer's machine is still visible
@@ -51,7 +62,7 @@ pub fn isolate_host(command: &mut Command) -> &mut Command {
 fn scrub_settings(command: &mut Command) {
     for (name, _) in std::env::vars_os() {
         let key = name.to_string_lossy().to_ascii_uppercase();
-        if key.starts_with("MBX_") && key != "MBX_LOG" {
+        if key.starts_with("MBX_") && key != "MBX_LOG" && key != "MBX_SESSION_ROOT" {
             command.env_remove(&name);
         }
     }

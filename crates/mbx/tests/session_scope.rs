@@ -911,6 +911,7 @@ fn main() { assert_eq!(std::env::var_os("OPAQUE").unwrap().as_bytes(), b"\xff");
         .tempdir_in("/tmp")
         .unwrap();
     let output = mbx(root.path())
+        .env_remove("MBX_SESSION_ROOT")
         .env("TMPDIR", temporary.path())
         .env("MBX_CC", "0")
         .env("OPAQUE", std::ffi::OsString::from_vec(vec![255]))
