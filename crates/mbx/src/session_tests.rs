@@ -268,7 +268,7 @@ fn test_config(cache_dir: &Path) -> Config {
 #[tokio::test]
 async fn cmake_selection_uses_the_final_build_environment() {
     let cache = tempfile::tempdir().unwrap();
-    let session_dir = tempfile::tempdir().unwrap();
+    let session_dir = temporary_directory().unwrap();
     let private = tempfile::tempdir().unwrap();
     let mut config = test_config(cache.path());
     config.shims_dir = private.path().join("shims");
@@ -317,7 +317,7 @@ async fn cmake_selection_uses_the_final_build_environment() {
 #[tokio::test]
 async fn session_environment_directs_cargo_at_the_shim() {
     let cache = tempfile::tempdir().unwrap();
-    let session_dir = tempfile::tempdir().unwrap();
+    let session_dir = temporary_directory().unwrap();
     let session = CacheSession::start(session_dir.path(), &test_config(cache.path()))
         .await
         .unwrap();
@@ -371,7 +371,7 @@ async fn failed_incremental_recording_replaces_an_inherited_root() {
     let cache = tempfile::tempdir().unwrap();
     // A file where the checkout-state directory belongs makes `touch` fail.
     std::fs::write(cache.path().join("incremental"), b"not a directory").unwrap();
-    let session_dir = tempfile::tempdir().unwrap();
+    let session_dir = temporary_directory().unwrap();
     let session = CacheSession::start(session_dir.path(), &test_config(cache.path()))
         .await
         .unwrap();
@@ -407,7 +407,7 @@ async fn rustc_shim_path_survives_and_is_reused_across_sessions() {
     let config = test_config(cache.path());
 
     let first_path = {
-        let session_dir = tempfile::tempdir().unwrap();
+        let session_dir = temporary_directory().unwrap();
         let session = CacheSession::start(session_dir.path(), &config)
             .await
             .unwrap();
@@ -421,7 +421,7 @@ async fn rustc_shim_path_survives_and_is_reused_across_sessions() {
         "the wrapper path cached by Cargo must survive its mbx session"
     );
 
-    let second_dir = tempfile::tempdir().unwrap();
+    let second_dir = temporary_directory().unwrap();
     let second = CacheSession::start(second_dir.path(), &config)
         .await
         .unwrap();
@@ -459,7 +459,7 @@ fn concurrent_persistent_shim_installation_keeps_the_binary_intact() {
 #[tokio::test]
 async fn a_session_with_no_shim_connection_does_not_load_a_manifest() {
     let cache = tempfile::tempdir().unwrap();
-    let session_dir = tempfile::tempdir().unwrap();
+    let session_dir = temporary_directory().unwrap();
     let session = CacheSession::start(session_dir.path(), &test_config(cache.path()))
         .await
         .unwrap();
@@ -512,7 +512,7 @@ async fn cc_shim_path_survives_and_is_reused_across_sessions() {
     config.cc = true;
 
     let first_path = {
-        let session_dir = tempfile::tempdir().unwrap();
+        let session_dir = temporary_directory().unwrap();
         let session = CacheSession::start(session_dir.path(), &config)
             .await
             .unwrap();
@@ -531,7 +531,7 @@ async fn cc_shim_path_survives_and_is_reused_across_sessions() {
         "the compiler path cached by a build system must survive its mbx session"
     );
 
-    let second_dir = tempfile::tempdir().unwrap();
+    let second_dir = temporary_directory().unwrap();
     let second = CacheSession::start(second_dir.path(), &config)
         .await
         .unwrap();
@@ -567,7 +567,7 @@ async fn concurrent_sessions_can_install_shared_cc_shims() {
         let config = config.clone();
         let barrier = Arc::clone(&barrier);
         starts.spawn(async move {
-            let session_dir = tempfile::tempdir().unwrap();
+            let session_dir = temporary_directory().unwrap();
             barrier.wait().await;
             let session = CacheSession::start(session_dir.path(), &config).await?;
             let shim = session
@@ -593,7 +593,7 @@ async fn concurrent_sessions_can_install_shared_cc_shims() {
 #[tokio::test]
 async fn incremental_builds_leave_cargo_incremental_alone() {
     let cache = tempfile::tempdir().unwrap();
-    let session_dir = tempfile::tempdir().unwrap();
+    let session_dir = temporary_directory().unwrap();
     let mut config = test_config(cache.path());
     config.incremental = true;
     let session = CacheSession::start(session_dir.path(), &config)
@@ -621,7 +621,7 @@ async fn incremental_builds_leave_cargo_incremental_alone() {
 #[tokio::test]
 async fn verify_mode_is_passed_to_the_shim() {
     let cache = tempfile::tempdir().unwrap();
-    let session_dir = tempfile::tempdir().unwrap();
+    let session_dir = temporary_directory().unwrap();
     let mut config = test_config(cache.path());
     config.verify = true;
     let session = CacheSession::start(session_dir.path(), &config)

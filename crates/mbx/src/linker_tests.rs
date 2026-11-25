@@ -746,7 +746,8 @@ fn relative_linker_searches_key_the_identity_by_working_directory() {
         return;
     }
     let directory = tempfile::tempdir().unwrap();
-    let socket = directory.path().join("agent.sock");
+    let session_dir = crate::session::temporary_directory().unwrap();
+    let socket = session_dir.path().join("agent.sock");
     // The child resolves `cc` from this directory alone, in a cleared environment: the driver
     // under test is this stub, never the host's `cc` (a Nix cc-wrapper in a devenv shell, refused
     // before any identity lookup) and never a Nix link variable the parent's shell carries.

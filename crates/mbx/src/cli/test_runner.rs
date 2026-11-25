@@ -595,7 +595,7 @@ mod tests {
         std::thread::JoinHandle<(String, bool)>,
     ) {
         use std::io::{BufRead as _, Read as _, Write as _};
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::session::temporary_directory().unwrap();
         let socket = dir.path().join("g.sock");
         let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
         let served = std::thread::spawn(move || {
