@@ -222,12 +222,14 @@ pub fn answer() -> u32 { dep::value() }
         (agent/'src/lib.rs').write_text('pub fn value() {}\n')
         (agent/'build.rs').write_text('fn main() { std::thread::sleep(std::time::Duration::from_secs(16)); }\n')
         agent_env = dict(environment(agent), MBX_SUMMARY='short')
-        result = subprocess.run([str(BINARY), 'check'], cwd=agent, env=agent_env, capture_output=True, timeout=60)
+        # The wait is mbx's exit, as for the JSON build above: a timer here would count the machine-wide scheduler's
+        # admission wait, which host load decides and this case does not test.
+        result = subprocess.run([str(BINARY), 'check'], cwd=agent, env=agent_env, capture_output=True)
         assert result.returncode == 0 and b'mbx[progress]:' in result.stderr, result.stderr
         assert b'\x1b' not in result.stderr and b'\r' not in result.stderr
         assert not result.stdout
         assert b'mr boxington' not in result.stderr, result.stderr
-        result = subprocess.run([str(BINARY), 'check', '--message-format=json'], cwd=agent, env=agent_env, capture_output=True, timeout=60)
+        result = subprocess.run([str(BINARY), 'check', '--message-format=json'], cwd=agent, env=agent_env, capture_output=True)
         assert result.returncode == 0 and b'mbx[progress]:' not in result.stderr
         assert b'mr boxington' not in result.stderr
         assert all(isinstance(json.loads(line), dict) for line in result.stdout.splitlines())
