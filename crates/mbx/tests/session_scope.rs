@@ -586,11 +586,20 @@ fn main() {
 }
 
 #[cfg(unix)]
-#[test]
-fn application_daemon_outlives_session_and_captures_an_independent_build() {
+fn run_application_daemon_outlives_session(daemon_delay: std::time::Duration) {
     let root = tempfile::tempdir().unwrap();
     let other = root.path().join("other");
     project(&other, "fn main() {}\n");
+    if !daemon_delay.is_zero() {
+        std::fs::write(
+            other.join("build.rs"),
+            format!(
+                "fn main() {{ std::thread::sleep(std::time::Duration::from_millis({})); }}\n",
+                daemon_delay.as_millis()
+            ),
+        )
+        .unwrap();
+    }
     project(
         root.path(),
         r#"
@@ -645,6 +654,18 @@ fn main() {
     }
     assert_eq!(contents, "independent build captured");
     assert!(!String::from_utf8_lossy(&output.stderr).contains("Checking scope-fixture"));
+}
+
+#[cfg(unix)]
+#[test]
+fn application_daemon_outlives_session_and_captures_an_independent_build() {
+    run_application_daemon_outlives_session(std::time::Duration::ZERO);
+}
+
+#[cfg(unix)]
+#[test]
+fn application_daemon_outlives_session_when_captured_build_exceeds_ten_seconds() {
+    run_application_daemon_outlives_session(std::time::Duration::from_secs(11));
 }
 
 #[test]
