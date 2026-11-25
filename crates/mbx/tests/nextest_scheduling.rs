@@ -16,7 +16,7 @@ mod unix {
     use std::path::{Path, PathBuf};
     use std::process::{Child, Command, ExitStatus, Stdio};
     use std::thread;
-    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use super::support;
 
@@ -118,32 +118,6 @@ mod unix {
         )
     }
 
-    fn wait_for(path: &Path, timeout: Duration) {
-        let deadline = Instant::now() + timeout;
-        while Instant::now() < deadline {
-            if path.exists() {
-                return;
-            }
-            thread::sleep(Duration::from_millis(10));
-        }
-        panic!("{} was not created within {timeout:?}", path.display());
-    }
-
-    fn wait_child(child: &mut Child, timeout: Duration) -> ExitStatus {
-        let deadline = Instant::now() + timeout;
-        loop {
-            if let Some(status) = child.try_wait().unwrap() {
-                return status;
-            }
-            if Instant::now() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
-                panic!("child did not exit within {timeout:?}");
-            }
-            thread::sleep(Duration::from_millis(20));
-        }
-    }
-
     struct LoggedChild {
         child: Child,
         stdout: PathBuf,
@@ -165,8 +139,8 @@ mod unix {
             }
         }
 
-        fn wait(mut self, timeout: Duration) -> (ExitStatus, String) {
-            let status = wait_child(&mut self.child, timeout);
+        fn wait(mut self) -> (ExitStatus, String) {
+            let status = self.child.wait().unwrap();
             let stdout = fs::read_to_string(self.stdout).unwrap_or_default();
             let stderr = fs::read_to_string(self.stderr).unwrap_or_default();
             (status, format!("{stdout}{stderr}"))
@@ -186,7 +160,7 @@ mod unix {
         command
     }
     struct Reservation {
-        child: Option<Child>,
+        child: Option<support::WatchedChild>,
         release: PathBuf,
     }
 
@@ -194,6 +168,7 @@ mod unix {
         fn start(root: &Path, cache: &Path, cpus: u64, name: &str) -> Self {
             let ready = root.join(format!("{name}.ready"));
             let release = root.join(format!("{name}.release"));
+            support::create_fifo(&release);
             let cpus = cpus.to_string();
             let mut command = reserve(root, cache, &cpus);
             command
@@ -203,14 +178,18 @@ mod unix {
                     "--",
                     "sh",
                     "-c",
-                    "touch \"$RESERVATION_READY\"; while [ ! -e \"$RESERVATION_RELEASE\" ]; do sleep 0.02; done",
+                    "touch \"$RESERVATION_READY\"; read _ < \"$RESERVATION_RELEASE\"",
                 ])
                 .env("RESERVATION_READY", &ready)
                 .env("RESERVATION_RELEASE", &release)
                 .stdout(Stdio::null())
                 .stderr(Stdio::null());
-            let child = command.spawn().unwrap();
-            wait_for(&ready, Duration::from_secs(5));
+            let mut child = support::WatchedChild::spawn_group(&mut command).unwrap();
+            support::wait_for_path_or_exit(
+                &ready,
+                &mut child,
+                "mbx reserve exited before becoming ready",
+            );
             Self {
                 child: Some(child),
                 release,
@@ -218,28 +197,18 @@ mod unix {
         }
 
         fn release(&mut self) {
-            fs::write(&self.release, "release").unwrap();
-            let status = wait_child(self.child.as_mut().unwrap(), Duration::from_secs(5));
-            assert!(status.success(), "reserve exited with {status}");
-            self.child = None;
-        }
-    }
-
-    impl Drop for Reservation {
-        fn drop(&mut self) {
-            if self.child.is_some() {
-                let _ = fs::write(&self.release, "release");
-                let mut child = self.child.take().unwrap();
-                let deadline = Instant::now() + Duration::from_secs(5);
-                while Instant::now() < deadline {
-                    if child.try_wait().ok().flatten().is_some() {
-                        return;
-                    }
-                    thread::sleep(Duration::from_millis(20));
-                }
-                let _ = child.kill();
-                let _ = child.wait();
-            }
+            fs::write(&self.release, "go\n").unwrap();
+            let output = self
+                .child
+                .take()
+                .expect("reservation already released")
+                .wait_with_output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "reserve exited with {}",
+                output.status
+            );
         }
     }
 
@@ -257,10 +226,6 @@ mod unix {
                     .collect()
             })
             .unwrap_or_default()
-    }
-
-    fn all_leases_are_lockable(cache: &Path) -> bool {
-        locked_lease_files(cache).is_empty()
     }
 
     fn locked_lease_files(cache: &Path) -> Vec<PathBuf> {
@@ -284,15 +249,32 @@ mod unix {
     }
 
     fn assert_no_live_leases(cache: &Path, stage: &str) {
-        let deadline = Instant::now() + Duration::from_secs(4);
-        while Instant::now() < deadline {
-            if all_leases_are_lockable(cache) {
-                return;
+        for path in lease_files(cache) {
+            let Ok(file) = File::open(&path) else {
+                continue;
+            };
+            // Block on the kernel lock release rather than polling with a timer.
+            loop {
+                // SAFETY: flock borrows the open descriptor until unlocked below.
+                if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
+                    break;
+                }
+                let error = std::io::Error::last_os_error();
+                assert_eq!(
+                    error.kind(),
+                    std::io::ErrorKind::Interrupted,
+                    "failed to lock lease {} {stage}: {error}",
+                    path.display()
+                );
             }
-            thread::sleep(Duration::from_millis(25));
+            // SAFETY: this releases the lock acquired above.
+            let _ = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
         }
         let live = locked_lease_files(cache);
-        panic!("scheduler leases are still locked {stage}: {live:?}");
+        assert!(
+            live.is_empty(),
+            "scheduler leases are still locked {stage}: {live:?}"
+        );
     }
 
     fn timestamp() -> u128 {
@@ -405,7 +387,7 @@ mod unix {
 
         // The client still holds its connection; the starter going ends it all.
         drop(server.stdin.take());
-        let status = wait_child(&mut server, Duration::from_secs(10));
+        let status = server.wait().unwrap();
         assert!(status.success(), "mbx reservations exited with {status}");
         assert!(!socket.exists(), "the server removes its socket");
         assert_no_live_leases(&cache, "after the server's starter went");
@@ -456,24 +438,16 @@ mod unix {
         // Only the command tree's copies of the write end remain.
         drop(command);
         drop(writer);
-        let status = wait_child(&mut child, Duration::from_secs(20));
         let mut output = String::new();
         reader.read_to_string(&mut output).unwrap();
+        let status = child.wait().unwrap();
         assert!(status.success(), "reserve exited with {status}: {output:?}");
         output
     }
 
     /// Wait until a request queues in the scheduler: its waiter record exists.
     fn wait_for_queued_request(cache: &Path) {
-        let waiters = cache.join("scheduler/waiters");
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while Instant::now() < deadline {
-            if fs::read_dir(&waiters).is_ok_and(|mut entries| entries.next().is_some()) {
-                return;
-            }
-            thread::sleep(Duration::from_millis(10));
-        }
-        panic!("no request queued in {} within 5s", waiters.display());
+        support::wait_for_dir_entry(&cache.join("scheduler/waiters"));
     }
 
     /// Read the grant pipe one byte at a time on its own thread: each byte
@@ -566,7 +540,7 @@ mod unix {
             Ok(Some(b'r'))
         );
         assert_eq!(received.recv_timeout(Duration::from_secs(5)), Ok(None));
-        let status = wait_child(&mut child, Duration::from_secs(5));
+        let status = child.wait().unwrap();
         assert!(status.success(), "reserve exited with {status}");
     }
 
@@ -630,7 +604,7 @@ mod unix {
             "a queued test announced a grant"
         );
         holder.release();
-        let (status, output) = running.wait(Duration::from_secs(20));
+        let (status, output) = running.wait();
         assert!(status.success(), "{output}");
         // Every byte, until end of file or a quiet pipe.
         let announced: Vec<u8> =
@@ -797,8 +771,7 @@ fn work() { event("start"); std::thread::sleep(std::time::Duration::from_millis(
         let mut reservation = Reservation::start(temp.path(), &cache, 2, "list-reservation");
         let mut list = nextest(&root, &cache);
         list.args(["list", "--offline"]);
-        let (status, output) =
-            LoggedChild::spawn(&mut list, temp.path(), "list").wait(Duration::from_secs(4));
+        let (status, output) = LoggedChild::spawn(&mut list, temp.path(), "list").wait();
         assert!(status.success(), "{output}");
 
         let started = temp.path().join("started");
@@ -818,9 +791,9 @@ fn work() { event("start"); std::thread::sleep(std::time::Duration::from_millis(
         );
         fs::write(&release_time, timestamp().to_string()).unwrap();
         reservation.release();
-        let (status, output) = running.wait(Duration::from_secs(8));
+        let (status, output) = running.wait();
         assert!(status.success(), "{output}");
-        wait_for(&started, Duration::from_secs(2));
+        support::wait_for_path(&started);
         let released: u128 = fs::read_to_string(release_time).unwrap().parse().unwrap();
         let start: u128 = fs::read_to_string(&started).unwrap().parse().unwrap();
         assert!(
@@ -1262,7 +1235,7 @@ pub fn observe(name: &str, heavy: bool) {
             .env("TEST_STARTED", temp.path().join("timeout-started"))
             .args(["run", "--offline", "-E", "test(hangs)"]);
         let timeout = LoggedChild::spawn(&mut timeout, temp.path(), "timeout-run");
-        let (status, output) = timeout.wait(Duration::from_secs(8));
+        let (status, output) = timeout.wait();
         assert!(
             !status.success(),
             "timed out test unexpectedly passed: {output}"
@@ -1280,7 +1253,7 @@ pub fn observe(name: &str, heavy: bool) {
             .env("TEST_STARTED", &queued_started)
             .args(["run", "--offline", "-E", "test(hangs)"]);
         let queued = LoggedChild::spawn(&mut queued, temp.path(), "queued-timeout");
-        let (status, output) = queued.wait(Duration::from_secs(8));
+        let (status, output) = queued.wait();
         assert!(
             !status.success(),
             "queued test unexpectedly passed: {output}"
@@ -1316,9 +1289,12 @@ pub fn observe(name: &str, heavy: bool) {
             "-E",
             "test(signal_hold)",
         ]);
-        signal.process_group(0);
-        let mut signal = signal.spawn().unwrap();
-        wait_for(&signal_started, Duration::from_secs(5));
+        let mut signal = support::WatchedChild::spawn_group(&mut signal).unwrap();
+        support::wait_for_path_or_exit(
+            &signal_started,
+            &mut signal,
+            "nextest exited before signal_hold started",
+        );
         let active_leases = locked_lease_files(&cache);
         assert_eq!(active_leases.len(), 1, "expected one active test lease");
         let test_runner = active_leases[0]
@@ -1336,49 +1312,28 @@ pub fn observe(name: &str, heavy: bool) {
             test_group, test_runner,
             "unexpected Nextest test process group"
         );
+        struct KillGroupOnDrop(Option<libc::pid_t>);
+        impl Drop for KillGroupOnDrop {
+            fn drop(&mut self) {
+                if let Some(group) = self.0 {
+                    // SAFETY: signals only the isolated Nextest test group.
+                    unsafe { libc::kill(-group, libc::SIGKILL) };
+                }
+            }
+        }
+        let mut cleanup_test_group = KillGroupOnDrop(Some(test_group));
         let result = unsafe { libc::kill(-test_group, libc::SIGTERM) };
         assert_eq!(
             result, 0,
             "failed to send SIGTERM to the Nextest test group"
         );
-        let deadline = Instant::now() + Duration::from_secs(4);
-        let status = loop {
-            if let Some(status) = signal.try_wait().unwrap() {
-                break Some(status);
-            }
-            if Instant::now() >= deadline {
-                break None;
-            }
-            thread::sleep(Duration::from_millis(20));
-        };
-        let lease_deadline = Instant::now() + Duration::from_secs(2);
-        while Instant::now() < lease_deadline && !all_leases_are_lockable(&cache) {
-            thread::sleep(Duration::from_millis(25));
-        }
-        let leases_clear_after_signal = all_leases_are_lockable(&cache);
-        let live_after_signal = locked_lease_files(&cache);
-
-        // If cancellation failed, terminate the isolated fixture groups after
-        // saving the state the regression assertion needs to report.
-        if status.is_none() || !leases_clear_after_signal {
-            unsafe {
-                libc::kill(-test_group, libc::SIGKILL);
-                libc::kill(-(signal.id() as i32), libc::SIGKILL);
-            }
-            if let Ok(pid) = fs::read_to_string(&signal_started)
-                .and_then(|pid| pid.trim().parse::<i32>().map_err(std::io::Error::other))
-            {
-                unsafe { libc::kill(pid, libc::SIGKILL) };
-            }
-            let _ = signal.kill();
-            let _ = signal.wait();
-        }
-        let status = status.expect("SIGTERM did not stop nextest within four seconds");
-        assert!(!status.success(), "SIGTERM did not interrupt nextest");
+        let output = signal.wait_with_output().unwrap();
         assert!(
-            leases_clear_after_signal,
-            "SIGTERM left live scheduler leases: {live_after_signal:?}"
+            !output.status.success(),
+            "SIGTERM did not interrupt nextest"
         );
+        assert_no_live_leases(&cache, "after SIGTERM");
+        cleanup_test_group.0 = None;
     }
 
     #[test]

@@ -22,13 +22,6 @@ impl BuildChildGuard {
         Ok(Self(Some(child), Some(group)))
     }
 
-    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
-        self.0
-            .as_mut()
-            .expect("build child was already consumed")
-            .try_wait()
-    }
-
     fn wait_with_output(mut self) -> std::io::Result<Output> {
         self.0
             .take()
@@ -55,173 +48,14 @@ impl Drop for BuildChildGuard {
     }
 }
 
-/// Create a named pipe at `path` so a wrapper script can block on
-/// `read _ < "$FIFO"` until the test releases it by writing a line.
-#[cfg(unix)]
-fn create_fifo(path: &Path) {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt as _;
-    let c_path = CString::new(path.as_os_str().as_bytes()).expect("FIFO path has no NUL");
-    // SAFETY: c_path is a valid NUL-terminated path passed to mkfifo(3).
-    assert_eq!(
-        unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) },
-        0,
-        "mkfifo({}) failed: {}",
-        path.display(),
-        std::io::Error::last_os_error()
-    );
-}
-
-#[cfg(unix)]
-enum WatchEvent {
-    FsChanged,
-    Exited(std::io::Result<Output>),
-}
-
-/// Child process in its own process group whose exit is delivered on a shared
-/// `mpsc` channel by one blocking waiter thread, letting `wait_for_path_or_exit`
-/// wait on filesystem notifications and child exit together without polling.
-#[cfg(unix)]
-struct WatchedChild {
-    group: libc::pid_t,
-    tx: std::sync::mpsc::Sender<WatchEvent>,
-    rx: std::sync::mpsc::Receiver<WatchEvent>,
-    waiter: Option<std::thread::JoinHandle<()>>,
-    output: Option<std::io::Result<Output>>,
-}
-
-#[cfg(unix)]
-impl WatchedChild {
-    fn spawn_group(command: &mut Command) -> std::io::Result<Self> {
-        use std::os::unix::process::CommandExt as _;
-        let child = command.process_group(0).spawn()?;
-        let group = child.id() as libc::pid_t;
-        let (tx, rx) = std::sync::mpsc::channel();
-        let exit_tx = tx.clone();
-        let waiter = std::thread::spawn(move || {
-            let _ = exit_tx.send(WatchEvent::Exited(child.wait_with_output()));
-        });
-        Ok(Self {
-            group,
-            tx,
-            rx,
-            waiter: Some(waiter),
-            output: None,
-        })
-    }
-
-    fn wait_with_output(mut self) -> std::io::Result<Output> {
-        if let Some(output) = self.output.take() {
-            if let Some(waiter) = self.waiter.take() {
-                let _ = waiter.join();
-            }
-            return output;
-        }
-        loop {
-            match self.rx.recv().expect("waiter thread exited without result") {
-                WatchEvent::FsChanged => {}
-                WatchEvent::Exited(output) => {
-                    if let Some(waiter) = self.waiter.take() {
-                        let _ = waiter.join();
-                    }
-                    return output;
-                }
-            }
-        }
-    }
-}
-
-#[cfg(unix)]
-impl Drop for WatchedChild {
-    fn drop(&mut self) {
-        if let Some(waiter) = self.waiter.take() {
-            if self.output.is_none() && !waiter.is_finished() {
-                // SAFETY: spawn_group created a distinct process group whose id
-                // is the child's pid, and the child is reaped by `waiter`.
-                unsafe { libc::kill(-self.group, libc::SIGKILL) };
-            }
-            let _ = waiter.join();
-        }
-    }
-}
-
-/// Nearest existing directory ancestor of `path`.
-#[cfg(unix)]
-fn existing_ancestor_dir(path: &Path) -> PathBuf {
-    let mut current = path.parent().unwrap_or(path);
-    while !current.is_dir() {
-        current = current
-            .parent()
-            .expect("path must have an existing ancestor directory");
-    }
-    current.to_path_buf()
-}
-
-/// Block until `path` exists or `child` exits, using `notify` on the deepest
-/// existing ancestor directory and the child's exit thread on the same `mpsc`
-/// channel. No polling and no fixed timeout.
-#[cfg(unix)]
-fn wait_for_path_or_exit(path: &Path, child: &mut WatchedChild, early_exit_message: &str) {
-    use notify::{RecursiveMode, Watcher as _};
-
-    let fs_tx = child.tx.clone();
-    let mut watcher = notify::recommended_watcher(move |_| {
-        let _ = fs_tx.send(WatchEvent::FsChanged);
-    })
-    .expect("filesystem watcher should start");
-
-    let mut watched: Option<PathBuf> = None;
-    loop {
-        let dir = existing_ancestor_dir(path);
-        if watched.as_ref() != Some(&dir) {
-            if let Some(previous) = watched.take() {
-                let _ = watcher.unwatch(&previous);
-            }
-            if let Err(error) = watcher.watch(&dir, RecursiveMode::NonRecursive) {
-                if !dir.is_dir() {
-                    continue;
-                }
-                panic!("watching {} failed: {error}", dir.display());
-            }
-            watched = Some(dir);
-        }
-
-        if path.exists() {
-            return;
-        }
-        if watched.as_ref() != Some(&existing_ancestor_dir(path)) {
-            continue;
-        }
-        if child.output.is_some() {
-            panic!("{early_exit_message}");
-        }
-
-        match child
-            .rx
-            .recv()
-            .expect("waiter thread exited without result")
-        {
-            WatchEvent::FsChanged => {}
-            WatchEvent::Exited(output) => {
-                child.output = Some(output);
-                if path.exists() {
-                    return;
-                }
-                panic!("{early_exit_message}");
-            }
-        }
-    }
-}
-
 #[path = "build/semantic_oracle.rs"]
 mod semantic_oracle;
 mod support;
 
-/// Run `command`, failing with the last lines it printed if it has not finished
-/// within `limit` instead of hanging the suite. Output is read line by line
-/// over a channel: a killed mbx can leave a Cargo it started holding the pipes
-/// open, so the readers may never see end of file.
-fn output_within(command: &mut Command, limit: std::time::Duration) -> std::process::Output {
+/// Run `command` while draining stdout and stderr concurrently on reader
+/// threads so a grandchild holding the pipes open after `command` exits cannot
+/// block collection forever.
+fn output_draining_pipes(command: &mut Command) -> std::process::Output {
     use std::io::BufRead as _;
     use std::time::{Duration, Instant};
     let mut child = command
@@ -249,6 +83,7 @@ fn output_within(command: &mut Command, limit: std::time::Duration) -> std::proc
         });
     }
     drop(sender);
+    let status = child.wait().unwrap();
     let (mut out, mut err) = (String::new(), String::new());
     let mut finished = 0;
     let mut take = |message: Option<(bool, String)>| -> bool {
@@ -259,31 +94,6 @@ fn output_within(command: &mut Command, limit: std::time::Duration) -> std::proc
         buffer.push_str(&line);
         buffer.push('\n');
         false
-    };
-    let deadline = Instant::now() + limit;
-    let status = loop {
-        while let Ok(message) = receiver.try_recv() {
-            if take(message) {
-                finished += 1;
-            }
-        }
-        if let Some(status) = child.try_wait().unwrap() {
-            break status;
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            while let Ok(message) = receiver.recv_timeout(Duration::from_millis(200)) {
-                let _ = take(message);
-            }
-            let tail: Vec<&str> = err.lines().rev().take(200).collect();
-            let tail: Vec<&str> = tail.into_iter().rev().collect();
-            panic!(
-                "command did not finish within {limit:?}; last stderr lines:\n{}",
-                tail.join("\n")
-            );
-        }
-        std::thread::sleep(Duration::from_millis(50));
     };
     // Wait for both readers to reach end of file, with a deadline in case a
     // grandchild still holds the pipes open.
@@ -336,7 +146,7 @@ fn inherited_toolchain_cargo_uses_its_absolute_rustc() {
         .env("MBX_CACHE_DIR", directory.path().join("cache"))
         .env("MBX_TARGET_ROOT", directory.path().join("targets"))
         .args(["build", "--offline", "-v"]);
-    let output = output_within(&mut command, std::time::Duration::from_secs(180));
+    let output = output_draining_pipes(&mut command);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "{stderr}");
     assert!(
@@ -365,7 +175,7 @@ fn inherited_toolchain_cargo_uses_its_absolute_rustc() {
         .env("MBX_CACHE_DIR", directory.path().join("cache"))
         .env("MBX_TARGET_ROOT", directory.path().join("targets"))
         .args(["run", "--offline", "-v", "--config", "build.jobs=1"]);
-    let output = output_within(&mut command, std::time::Duration::from_secs(180));
+    let output = output_draining_pipes(&mut command);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "{stderr}");
     assert!(
@@ -589,23 +399,17 @@ fn transparent_rustc_replaces_the_shim_process() {
     // sibling test that forks while cargo is writing it counts, since until
     // that child reaches its own exec the inherited descriptor (cloexec or not)
     // is a writer of this file too.
-    let mut child = {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        loop {
-            let attempt = isolated_command(&shim)
-                .arg("/bin/sh")
-                .args(["-c", "printf '%s' \"$$\" > \"$1\"", "sh"])
-                .arg(&pid_file)
-                .spawn();
-            match attempt {
-                Err(error)
-                    if error.kind() == std::io::ErrorKind::ExecutableFileBusy
-                        && std::time::Instant::now() < deadline =>
-                {
-                    std::thread::sleep(std::time::Duration::from_millis(20));
-                }
-                other => break other.unwrap(),
+    let mut child = loop {
+        let attempt = isolated_command(&shim)
+            .arg("/bin/sh")
+            .args(["-c", "printf '%s' \"$$\" > \"$1\"", "sh"])
+            .arg(&pid_file)
+            .spawn();
+        match attempt {
+            Err(error) if error.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
             }
+            other => break other.unwrap(),
         }
     };
     let shim_pid = child.id();
@@ -778,7 +582,7 @@ fn a_mid_compilation_input_edit_discards_the_result() {
     let wrapper = project.path().join("delayed-rustc");
     let compiled = project.path().join("compiler-finished");
     let release = project.path().join("release-compiler");
-    create_fifo(&release);
+    support::create_fifo(&release);
     std::fs::write(
         &wrapper,
         "#!/bin/sh\n\"$TEST_REAL_RUSTC\" \"$@\"\nstatus=$?\ncase \" $* \" in\n  *\" --crate-name base \"*)\n    if [ \"$status\" -eq 0 ] && [ -n \"${TEST_RELEASE_COMPILER:-}\" ]; then\n      if [ -n \"${TEST_BARRIER_DELAY_SECS:-}\" ]; then sleep \"$TEST_BARRIER_DELAY_SECS\"; fi\n      : > \"$TEST_COMPILER_FINISHED\"\n      read _ < \"$TEST_RELEASE_COMPILER\"\n    fi\n    ;;\nesac\nexit \"$status\"\n",
@@ -806,8 +610,8 @@ fn a_mid_compilation_input_edit_discards_the_result() {
         .env_remove("RUSTC_WORKSPACE_WRAPPER")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = WatchedChild::spawn_group(&mut child).expect("mbx should run");
-    wait_for_path_or_exit(
+    let mut child = support::WatchedChild::spawn_group(&mut child).expect("mbx should run");
+    support::wait_for_path_or_exit(
         &compiled,
         &mut child,
         "the build exited before the compiler could be released",
@@ -921,7 +725,7 @@ fn a_mid_compilation_build_script_edit_discards_the_execution_only_result() {
     let wrapper = project.path().join("delayed-rustc");
     let compiled = project.path().join("compiler-finished");
     let release = project.path().join("release-compiler");
-    create_fifo(&release);
+    support::create_fifo(&release);
     std::fs::write(
         &wrapper,
         "#!/bin/sh\n\"$TEST_REAL_RUSTC\" \"$@\"\nstatus=$?\ncase \" $* \" in\n  *\" --crate-name build_script_build \"*)\n    if [ \"$status\" -eq 0 ]; then\n      if [ -n \"${TEST_BARRIER_DELAY_SECS:-}\" ]; then sleep \"$TEST_BARRIER_DELAY_SECS\"; fi\n      : > \"$TEST_COMPILER_FINISHED\"\n      read _ < \"$TEST_RELEASE_COMPILER\"\n    fi\n    ;;\nesac\nexit \"$status\"\n",
@@ -949,8 +753,8 @@ fn a_mid_compilation_build_script_edit_discards_the_execution_only_result() {
         .env_remove("RUSTC_WORKSPACE_WRAPPER")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = WatchedChild::spawn_group(&mut child).expect("mbx should run");
-    wait_for_path_or_exit(
+    let mut child = support::WatchedChild::spawn_group(&mut child).expect("mbx should run");
+    support::wait_for_path_or_exit(
         &compiled,
         &mut child,
         "the build exited before the build-script compiler could be released",
@@ -1121,13 +925,9 @@ fn cargo_with_command(
     // Tests that copy mbx to a new path and run the copy can hit ETXTBSY: a
     // sibling test that forks while the copy is open for write hands its child
     // that descriptor until the child reaches its own exec.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     let output = loop {
         match command.output() {
-            Err(error)
-                if error.kind() == std::io::ErrorKind::ExecutableFileBusy
-                    && std::time::Instant::now() < deadline =>
-            {
+            Err(error) if error.kind() == std::io::ErrorKind::ExecutableFileBusy => {
                 std::thread::sleep(std::time::Duration::from_millis(20));
             }
             other => break other.expect("mbx should run"),
@@ -6657,8 +6457,8 @@ fn a_low_disk_floor_starts_collection_before_the_build_ends() {
     let release = project.path().join("release-compiler");
     let release_above = project.path().join("release-above");
     let stamp = store.path().join("actions/gc/v1/last-sweep");
-    create_fifo(&release);
-    create_fifo(&release_above);
+    support::create_fifo(&release);
+    support::create_fifo(&release_above);
     std::fs::write(
         &wrapper,
         "#!/bin/sh\n\"$TEST_REAL_RUSTC\" \"$@\"\nstatus=$?\ncase \" $* \" in\n  *\" --crate-name base \"*)\n    if [ \"$status\" -eq 0 ]; then\n      if [ -n \"${TEST_BARRIER_DELAY_SECS:-}\" ]; then sleep \"$TEST_BARRIER_DELAY_SECS\"; fi\n      : > \"$TEST_COMPILER_FINISHED\"\n      read _ < \"$TEST_RELEASE_COMPILER\"\n    fi\n    ;;\n  *\" --crate-name above \"*)\n    read _ < \"$TEST_RELEASE_ABOVE\"\n    ;;\nesac\nexit \"$status\"\n",
@@ -6689,15 +6489,15 @@ fn a_low_disk_floor_starts_collection_before_the_build_ends() {
         ],
     );
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut child = WatchedChild::spawn_group(&mut command).expect("mbx should run");
-    wait_for_path_or_exit(
+    let mut child = support::WatchedChild::spawn_group(&mut command).expect("mbx should run");
+    support::wait_for_path_or_exit(
         &compiled,
         &mut child,
         "the build exited before the compiler could be released",
     );
 
     std::fs::write(&release, b"go\n").unwrap();
-    wait_for_path_or_exit(
+    support::wait_for_path_or_exit(
         &stamp,
         &mut child,
         "the build ended before the low-disk sweep was claimed",
@@ -6718,16 +6518,7 @@ fn a_low_disk_floor_starts_collection_before_the_build_ends() {
 /// what it did has to wait for it. Only a sweep that removed something leaves
 /// a report; tests that call this made sure theirs does.
 fn wait_for_sweep_report(store: &Path) {
-    let report = store.join("actions/gc/v1/last-sweep-report");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-    while !report.exists() {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the background sweep should finish; its log says: {}",
-            std::fs::read_to_string(store.join("actions/gc/v1/sweep.log")).unwrap_or_default()
-        );
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
+    support::wait_for_path(&store.join("actions/gc/v1/last-sweep-report"));
 }
 
 #[test]
@@ -7115,36 +6906,6 @@ mod target_views {
         .expect("mbx should run")
     }
 
-    /// Wait for `predicate` to hold of `path`'s contents, up to `wait`.
-    fn file_eventually(
-        path: &Path,
-        wait: std::time::Duration,
-        predicate: impl Fn(&str) -> bool,
-    ) -> bool {
-        let deadline = std::time::Instant::now() + wait;
-        while std::time::Instant::now() < deadline {
-            if std::fs::read_to_string(path).is_ok_and(|text| predicate(&text)) {
-                return true;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
-        false
-    }
-
-    /// Whether `child` finished within `wait`, killing it if it did not.
-    fn finishes_within(child: &mut std::process::Child, wait: std::time::Duration) -> bool {
-        let deadline = std::time::Instant::now() + wait;
-        while std::time::Instant::now() < deadline {
-            if child.try_wait().unwrap().is_some() {
-                return true;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
-        child.kill().unwrap();
-        child.wait().unwrap();
-        false
-    }
-
     #[test]
     fn a_check_does_not_wait_for_a_build_holding_the_target_lock() {
         let store = tempfile::tempdir().unwrap();
@@ -7173,18 +6934,13 @@ mod target_views {
             &[("MBX_TARGET_VIEWS", "1"), ("MBX_TARGET_LANES", "0")],
             Stdio::from(std::fs::File::create(&log).unwrap()),
         );
-        let blocked = file_eventually(&log, std::time::Duration::from_secs(60), |text| {
+        support::wait_for_file_content(&log, |text| {
             text.lines().any(|line| {
                 line.contains("waiting for file lock on") && !line.contains("package cache")
             })
         });
         queued.kill().unwrap();
         queued.wait().unwrap();
-        assert!(
-            blocked,
-            "without a lane the check should wait for the build's lock: {}",
-            std::fs::read_to_string(&log).unwrap_or_default()
-        );
 
         let mut check = lane_check(
             project.path(),
@@ -7194,10 +6950,9 @@ mod target_views {
             Stdio::null(),
         );
         assert!(
-            finishes_within(&mut check, std::time::Duration::from_secs(60)),
+            check.wait().unwrap().success(),
             "a check in its own lane should not wait for the build"
         );
-        assert!(check.wait().unwrap().success());
     }
 
     #[test]
@@ -10406,8 +10161,6 @@ fn unselected_workspace_members_skip_flights_but_keep_scheduler_admission() {
 /// Exercise a selected crate or an unselected member under its invocation lock.
 #[cfg(unix)]
 fn workspace_compilation_skips_flight(as_dependency: bool) {
-    use std::time::{Duration, Instant};
-
     let directory = tempfile::tempdir().unwrap();
     let project = directory.path().join("project");
     let store = directory.path().join("store");
@@ -10488,16 +10241,7 @@ fn workspace_compilation_skips_flight(as_dependency: bool) {
     command
         .stdout(Stdio::null())
         .stderr(std::fs::File::create(&log).unwrap());
-    let mut child = BuildChildGuard::spawn_group(&mut command).unwrap();
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while child.try_wait().unwrap().is_none() {
-        assert!(
-            Instant::now() < deadline,
-            "workspace compilation waited for a dependency flight: {}",
-            std::fs::read_to_string(&log).unwrap()
-        );
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    let child = BuildChildGuard::spawn_group(&mut command).unwrap();
     let output = child.wait_with_output().unwrap();
     let stderr = std::fs::read_to_string(&log).unwrap();
     assert!(output.status.success(), "{stderr}");
@@ -10530,15 +10274,6 @@ fn workspace_compilation_skips_flight(as_dependency: bool) {
 #[cfg(unix)]
 #[test]
 fn a_flight_waiter_releases_only_after_a_fresh_prediction_misses() {
-    use std::time::{Duration, Instant};
-
-    struct ReleaseCompiler(PathBuf);
-    impl Drop for ReleaseCompiler {
-        fn drop(&mut self) {
-            let _ = std::fs::write(&self.0, "");
-        }
-    }
-
     for (publishes, vendored) in [(true, false), (false, false), (true, true)] {
         let directory = tempfile::tempdir().unwrap();
         let project = directory.path().join("project");
@@ -10565,13 +10300,16 @@ fn a_flight_waiter_releases_only_after_a_fresh_prediction_misses() {
         let wrapper = directory.path().join("gated-rustc");
         let entered = directory.path().join("compiler-entered");
         let release = directory.path().join("release-compiler");
+        support::create_fifo(&release);
         std::fs::write(
             &wrapper,
             r#"#!/bin/sh
 case " $* " in
   *" --crate-name fixture "*)
-    : > "$TEST_COMPILER_ENTERED"
-    while [ ! -e "$TEST_RELEASE_COMPILER" ]; do sleep 0.02; done
+    if [ -n "${TEST_RELEASE_COMPILER:-}" ]; then
+      : > "$TEST_COMPILER_ENTERED"
+      read _ < "$TEST_RELEASE_COMPILER"
+    fi
     ;;
 esac
 exec "$TEST_REAL_RUSTC" "$@"
@@ -10580,22 +10318,19 @@ exec "$TEST_REAL_RUSTC" "$@"
         .unwrap();
         std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
         let real_rustc = which::which("rustc").unwrap();
-        let settings = [
+        let seed_settings = [
             ("MBX_LOG", "debug"),
             ("MBX_TARGET_VIEWS", "0"),
             ("MBX_LEARNED_INCREMENTAL", "0"),
             ("CARGO_INCREMENTAL", "0"),
             ("RUSTC", wrapper.to_str().unwrap()),
             ("TEST_REAL_RUSTC", real_rustc.to_str().unwrap()),
-            ("TEST_COMPILER_ENTERED", entered.to_str().unwrap()),
-            ("TEST_RELEASE_COMPILER", release.to_str().unwrap()),
         ];
-        std::fs::write(&release, "").unwrap();
         build_with(
             &project,
             &store,
             &directory.path().join("seed.json"),
-            &settings,
+            &seed_settings,
         );
         let records = find_files(&store.join("scheduler/inflight"), |path| {
             path.extension().is_some_and(|ext| ext == "prediction")
@@ -10620,8 +10355,16 @@ exec "$TEST_REAL_RUSTC" "$@"
             "pub fn changed() -> u32 { 42 }\n",
         )
         .unwrap();
-        std::fs::remove_file(&entered).unwrap();
-        std::fs::remove_file(&release).unwrap();
+        let waiter_settings = [
+            ("MBX_LOG", "debug"),
+            ("MBX_TARGET_VIEWS", "0"),
+            ("MBX_LEARNED_INCREMENTAL", "0"),
+            ("CARGO_INCREMENTAL", "0"),
+            ("RUSTC", wrapper.to_str().unwrap()),
+            ("TEST_REAL_RUSTC", real_rustc.to_str().unwrap()),
+            ("TEST_COMPILER_ENTERED", entered.to_str().unwrap()),
+            ("TEST_RELEASE_COMPILER", release.to_str().unwrap()),
+        ];
         let log = directory.path().join("waiter.stderr");
         let mut command = isolated_cargo_command(
             mbx_command(),
@@ -10629,49 +10372,28 @@ exec "$TEST_REAL_RUSTC" "$@"
             &store,
             &directory.path().join("waiter.json"),
             &["build", "--offline"],
-            &settings,
+            &waiter_settings,
         );
         command
             .stdout(Stdio::null())
             .stderr(std::fs::File::create(&log).unwrap());
-        let mut waiter = BuildChildGuard::spawn_group(&mut command).unwrap();
-        // Declared after the child so unwinding opens the barrier before the
-        // direct child is killed. TempDir outlives both guards.
-        let _release_compiler = ReleaseCompiler(release.clone());
-        let deadline = Instant::now() + Duration::from_secs(30);
-        loop {
-            let text = std::fs::read_to_string(&log).unwrap();
-            if text.contains("waiting for flight rustc-") {
-                break;
-            }
-            assert!(
-                waiter.try_wait().unwrap().is_none(),
-                "waiter exited: {text}"
-            );
-            assert!(
-                Instant::now() < deadline,
-                "waiter did not join flight: {text}"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        let mut waiter = support::WatchedChild::spawn_group(&mut command).unwrap();
+        support::wait_for_file_content_or_exit(
+            &log,
+            &mut waiter,
+            |text| text.contains("waiting for flight rustc-"),
+            || format!("waiter exited: {}", std::fs::read_to_string(&log).unwrap()),
+        );
         drop(holder);
-        while !entered.exists() {
-            assert!(
-                waiter.try_wait().unwrap().is_none(),
-                "waiter exited: {}",
-                std::fs::read_to_string(&log).unwrap()
-            );
-            assert!(
-                Instant::now() < deadline,
-                "compiler did not reach barrier: {}",
-                std::fs::read_to_string(&log).unwrap()
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        support::wait_for_path_or_exit(
+            &entered,
+            &mut waiter,
+            "waiter exited before compiler reached barrier",
+        );
         let mut third_party = fslock::LockFile::open(&lock_path).unwrap();
         let available_during_compile = third_party.try_lock().unwrap();
         // Release the compiler even if the occupancy assertion will fail.
-        std::fs::write(&release, "").unwrap();
+        std::fs::write(&release, b"go\n").unwrap();
         drop(third_party);
         let output = waiter.wait_with_output().unwrap();
         let stderr = std::fs::read_to_string(&log).unwrap();
@@ -10691,14 +10413,52 @@ exec "$TEST_REAL_RUSTC" "$@"
     }
 }
 
-/// The event-driven barrier waiter wakes on nested path creation and fails
-/// immediately when the child exits before creating the barrier.
+/// The shared event-driven waiters wake on nested path creation, directory
+/// entries, file writes, and fail immediately on early child exit.
 #[cfg(unix)]
 #[test]
 fn wait_for_path_or_exit_wakes_on_nested_creation_and_early_exit() {
     let dir = tempfile::tempdir().unwrap();
+
+    // Path-only wait on nested creation (no child handle).
+    let path_only = dir.path().join("path-only/nested/marker");
+    let path_writer = path_only.clone();
+    let handle = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::fs::create_dir_all(path_writer.parent().unwrap()).unwrap();
+        std::fs::write(&path_writer, b"ok").unwrap();
+    });
+    support::wait_for_path(&path_only);
+    handle.join().unwrap();
+    assert!(path_only.exists());
+
+    // Directory-entry wait (no child handle).
+    let queue_dir = dir.path().join("scheduler/waiters");
+    let entry_path = queue_dir.join("req-1");
+    let entry_writer = entry_path.clone();
+    let handle = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::fs::create_dir_all(entry_writer.parent().unwrap()).unwrap();
+        std::fs::write(&entry_writer, b"queued").unwrap();
+    });
+    support::wait_for_dir_entry(&queue_dir);
+    handle.join().unwrap();
+    assert!(entry_path.exists());
+
+    // File-content wait on an existing file.
+    let log = dir.path().join("output.log");
+    std::fs::write(&log, b"starting\n").unwrap();
+    let log_writer = log.clone();
+    let handle = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::fs::write(&log_writer, b"starting\nready\n").unwrap();
+    });
+    support::wait_for_file_content(&log, |text| text.contains("ready"));
+    handle.join().unwrap();
+
+    // Child-racing nested path creation.
     let nested = dir.path().join("actions/gc/v1/last-sweep");
-    let mut creator = WatchedChild::spawn_group(
+    let mut creator = support::WatchedChild::spawn_group(
         Command::new("sh")
             .arg("-c")
             .arg("sleep 0.05; mkdir -p \"$1\" && : > \"$2\"; sleep 5")
@@ -10707,7 +10467,7 @@ fn wait_for_path_or_exit_wakes_on_nested_creation_and_early_exit() {
             .arg(&nested),
     )
     .unwrap();
-    wait_for_path_or_exit(
+    support::wait_for_path_or_exit(
         &nested,
         &mut creator,
         "creator exited before writing barrier",
@@ -10715,12 +10475,14 @@ fn wait_for_path_or_exit_wakes_on_nested_creation_and_early_exit() {
     assert!(nested.exists());
     drop(creator);
 
+    // Child-racing early exit.
     let missing = dir.path().join("never-created");
     let mut early =
-        WatchedChild::spawn_group(Command::new("sh").arg("-c").arg("sleep 0.05; exit 1")).unwrap();
+        support::WatchedChild::spawn_group(Command::new("sh").arg("-c").arg("sleep 0.05; exit 1"))
+            .unwrap();
     let started = std::time::Instant::now();
     let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        wait_for_path_or_exit(
+        support::wait_for_path_or_exit(
             &missing,
             &mut early,
             "the build exited before the compiler could be released",

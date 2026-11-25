@@ -9,9 +9,9 @@ mod unix {
     use std::fs;
     use std::os::unix::process::{CommandExt, ExitStatusExt};
     use std::path::Path;
-    use std::process::{Child, Command, ExitStatus, Stdio};
+    use std::process::{Child, Command, Stdio};
     use std::thread;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     use super::support;
 
@@ -112,32 +112,6 @@ while :; do sleep 0.05; done
         (receive, writer)
     }
 
-    fn wait_for(path: &Path) {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while Instant::now() < deadline {
-            if path.exists() {
-                return;
-            }
-            thread::sleep(Duration::from_millis(10));
-        }
-        panic!("{} was not created", path.display());
-    }
-
-    fn wait_child(child: &mut Child) -> ExitStatus {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            if let Some(status) = child.try_wait().unwrap() {
-                return status;
-            }
-            if Instant::now() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
-                panic!("child did not exit");
-            }
-            thread::sleep(Duration::from_millis(20));
-        }
-    }
-
     #[test]
     fn group_signals_keep_the_lease_until_the_command_exits() {
         for signal in [libc::SIGHUP, libc::SIGINT, libc::SIGQUIT, libc::SIGTERM] {
@@ -149,16 +123,16 @@ while :; do sleep 0.05; done
                     .args(["reserve", "--cpus", "2", "--", "sh", "-c", SLOW_STOP, "sh"])
                     .arg(root),
             );
-            wait_for(&root.join("ready"));
+            support::wait_for_path(&root.join("ready"));
 
             job.signal(signal);
-            let status = wait_child(&mut job);
+            let status = job.wait().unwrap();
             assert_eq!(
                 status.signal(),
                 Some(signal),
                 "signal {signal}: the invoker ends by the signal, got {status}"
             );
-            wait_for(&root.join("stopping"));
+            support::wait_for_path(&root.join("stopping"));
             let mut probe = Group::spawn(
                 mbx(root).args(["reserve", "--name", "probe", "--cpus", "2", "--", "true"]),
             );
@@ -177,7 +151,7 @@ while :; do sleep 0.05; done
                 events.recv_timeout(Duration::from_secs(10)).unwrap(),
                 "admitted"
             );
-            assert!(wait_child(&mut probe).success());
+            assert!(probe.wait().unwrap().success());
         }
     }
 
@@ -250,7 +224,7 @@ while :; do sleep 0.05; done
                     }
                 })
             };
-            let status = wait_child(&mut job);
+            let status = job.wait().unwrap();
             done.store(true, std::sync::atomic::Ordering::SeqCst);
             sender.join().unwrap();
             assert!(status.success(), "round {round}: got {status}");
@@ -268,7 +242,7 @@ while :; do sleep 0.05; done
                 .args(["reserve", "--cpus", "2", "--", "sh", "-c", SLOW_STOP, "sh"])
                 .arg(root),
         );
-        wait_for(&root.join("ready"));
+        support::wait_for_path(&root.join("ready"));
 
         let mut waiter = Group::spawn(
             mbx(root)
@@ -280,7 +254,7 @@ while :; do sleep 0.05; done
             "enqueued"
         );
         waiter.signal(libc::SIGTERM);
-        let status = wait_child(&mut waiter);
+        let status = waiter.wait().unwrap();
         assert_eq!(status.signal(), Some(libc::SIGTERM), "got {status}");
         // The waiter's own worker must be gone too, or it would run the
         // command once the holder lets go.

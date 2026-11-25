@@ -79,3 +79,278 @@ fn isolated_home() -> &'static std::path::Path {
         home
     })
 }
+
+/// Nearest existing directory ancestor of `path`.
+#[allow(dead_code)]
+pub fn existing_ancestor_dir(path: &std::path::Path) -> std::path::PathBuf {
+    let mut current = path.parent().unwrap_or(path);
+    while !current.is_dir() {
+        current = current
+            .parent()
+            .expect("path must have an existing ancestor directory");
+    }
+    current.to_path_buf()
+}
+
+#[allow(dead_code)]
+fn watch_target(path: &std::path::Path, watch_self: bool) -> std::path::PathBuf {
+    if watch_self && path.exists() {
+        path.to_path_buf()
+    } else {
+        existing_ancestor_dir(path)
+    }
+}
+
+#[allow(dead_code)]
+fn watch_until(path: &std::path::Path, watch_self: bool, ready: impl Fn() -> bool) {
+    use notify::{RecursiveMode, Watcher as _};
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut watcher = notify::recommended_watcher(move |_| {
+        let _ = tx.send(());
+    })
+    .expect("filesystem watcher should start");
+
+    let mut watched: Option<std::path::PathBuf> = None;
+    loop {
+        let next = watch_target(path, watch_self);
+        if watched.as_ref() != Some(&next) {
+            if let Some(previous) = watched.take() {
+                let _ = watcher.unwatch(&previous);
+            }
+            if let Err(error) = watcher.watch(&next, RecursiveMode::NonRecursive) {
+                if !next.exists() {
+                    continue;
+                }
+                panic!("watching {} failed: {error}", next.display());
+            }
+            watched = Some(next);
+        }
+
+        if ready() {
+            return;
+        }
+        if watched.as_ref() != Some(&watch_target(path, watch_self)) {
+            continue;
+        }
+
+        rx.recv().expect("filesystem watcher stopped unexpectedly");
+    }
+}
+
+/// Block until `path` exists using `notify` on its deepest existing ancestor
+/// directory, advancing into subdirectories as they appear. No fixed timeout.
+#[allow(dead_code)]
+pub fn wait_for_path(path: &std::path::Path) {
+    watch_until(path, false, || path.exists());
+}
+
+/// Block until `dir` exists and contains at least one entry, using `notify`.
+/// No fixed timeout.
+#[allow(dead_code)]
+pub fn wait_for_dir_entry(dir: &std::path::Path) {
+    watch_until(dir, true, || {
+        std::fs::read_dir(dir).is_ok_and(|mut entries| entries.next().is_some())
+    });
+}
+
+/// Block until `path` exists and its contents satisfy `predicate`, using
+/// `notify` on `path` itself once it exists. No fixed timeout.
+#[allow(dead_code)]
+pub fn wait_for_file_content(path: &std::path::Path, predicate: impl Fn(&str) -> bool) {
+    watch_until(path, true, || {
+        std::fs::read_to_string(path).is_ok_and(|text| predicate(&text))
+    });
+}
+
+/// Create a named pipe at `path` so a wrapper script can block on
+/// `read _ < "$FIFO"` until the test releases it by writing a line.
+#[cfg(unix)]
+#[allow(dead_code)]
+pub fn create_fifo(path: &std::path::Path) {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt as _;
+    let c_path = CString::new(path.as_os_str().as_bytes()).expect("FIFO path has no NUL");
+    // SAFETY: c_path is a valid NUL-terminated path passed to mkfifo(3).
+    assert_eq!(
+        unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) },
+        0,
+        "mkfifo({}) failed: {}",
+        path.display(),
+        std::io::Error::last_os_error()
+    );
+}
+
+#[cfg(unix)]
+#[allow(dead_code)]
+enum WatchEvent {
+    FsChanged,
+    Exited(std::io::Result<std::process::Output>),
+}
+
+/// Child process in its own process group whose exit is delivered on a shared
+/// `mpsc` channel by one blocking waiter thread, letting `wait_for_path_or_exit`
+/// wait on filesystem notifications and child exit together without polling.
+#[cfg(unix)]
+#[allow(dead_code)]
+pub struct WatchedChild {
+    group: libc::pid_t,
+    tx: std::sync::mpsc::Sender<WatchEvent>,
+    rx: std::sync::mpsc::Receiver<WatchEvent>,
+    waiter: Option<std::thread::JoinHandle<()>>,
+    output: Option<std::io::Result<std::process::Output>>,
+}
+
+#[cfg(unix)]
+#[allow(dead_code)]
+impl WatchedChild {
+    pub fn spawn_group(command: &mut Command) -> std::io::Result<Self> {
+        use std::os::unix::process::CommandExt as _;
+        let child = command.process_group(0).spawn()?;
+        let group = child.id() as libc::pid_t;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let exit_tx = tx.clone();
+        let waiter = std::thread::spawn(move || {
+            let _ = exit_tx.send(WatchEvent::Exited(child.wait_with_output()));
+        });
+        Ok(Self {
+            group,
+            tx,
+            rx,
+            waiter: Some(waiter),
+            output: None,
+        })
+    }
+
+    pub fn wait_with_output(mut self) -> std::io::Result<std::process::Output> {
+        if let Some(output) = self.output.take() {
+            if let Some(waiter) = self.waiter.take() {
+                let _ = waiter.join();
+            }
+            return output;
+        }
+        loop {
+            match self.rx.recv().expect("waiter thread exited without result") {
+                WatchEvent::FsChanged => {}
+                WatchEvent::Exited(output) => {
+                    if let Some(waiter) = self.waiter.take() {
+                        let _ = waiter.join();
+                    }
+                    return output;
+                }
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for WatchedChild {
+    fn drop(&mut self) {
+        if let Some(waiter) = self.waiter.take() {
+            if self.output.is_none() && !waiter.is_finished() {
+                // SAFETY: spawn_group created a distinct process group whose id
+                // is the child's pid, and the child is reaped by `waiter`.
+                unsafe { libc::kill(-self.group, libc::SIGKILL) };
+            }
+            let _ = waiter.join();
+        }
+    }
+}
+
+#[cfg(unix)]
+#[allow(dead_code)]
+fn watch_until_or_exit(
+    path: &std::path::Path,
+    watch_self: bool,
+    child: &mut WatchedChild,
+    ready: impl Fn() -> bool,
+    early_exit_message: impl FnOnce() -> String,
+) {
+    use notify::{RecursiveMode, Watcher as _};
+
+    let fs_tx = child.tx.clone();
+    let mut watcher = notify::recommended_watcher(move |_| {
+        let _ = fs_tx.send(WatchEvent::FsChanged);
+    })
+    .expect("filesystem watcher should start");
+
+    let mut watched: Option<std::path::PathBuf> = None;
+    loop {
+        let next = watch_target(path, watch_self);
+        if watched.as_ref() != Some(&next) {
+            if let Some(previous) = watched.take() {
+                let _ = watcher.unwatch(&previous);
+            }
+            if let Err(error) = watcher.watch(&next, RecursiveMode::NonRecursive) {
+                if !next.exists() {
+                    continue;
+                }
+                panic!("watching {} failed: {error}", next.display());
+            }
+            watched = Some(next);
+        }
+
+        if ready() {
+            return;
+        }
+        if watched.as_ref() != Some(&watch_target(path, watch_self)) {
+            continue;
+        }
+        if child.output.is_some() {
+            panic!("{}", early_exit_message());
+        }
+
+        match child
+            .rx
+            .recv()
+            .expect("waiter thread exited without result")
+        {
+            WatchEvent::FsChanged => {}
+            WatchEvent::Exited(output) => {
+                child.output = Some(output);
+                if ready() {
+                    return;
+                }
+                panic!("{}", early_exit_message());
+            }
+        }
+    }
+}
+
+/// Block until `path` exists or `child` exits, using `notify` on the deepest
+/// existing ancestor directory and the child's exit thread on the same `mpsc`
+/// channel. No polling and no fixed timeout.
+#[cfg(unix)]
+#[allow(dead_code)]
+pub fn wait_for_path_or_exit(
+    path: &std::path::Path,
+    child: &mut WatchedChild,
+    early_exit_message: &str,
+) {
+    watch_until_or_exit(
+        path,
+        false,
+        child,
+        || path.exists(),
+        || early_exit_message.to_owned(),
+    );
+}
+
+/// Block until `path` exists and its contents satisfy `predicate`, or `child`
+/// exits early. No polling and no fixed timeout.
+#[cfg(unix)]
+#[allow(dead_code)]
+pub fn wait_for_file_content_or_exit(
+    path: &std::path::Path,
+    child: &mut WatchedChild,
+    predicate: impl Fn(&str) -> bool,
+    early_exit_message: impl FnOnce() -> String,
+) {
+    watch_until_or_exit(
+        path,
+        true,
+        child,
+        || std::fs::read_to_string(path).is_ok_and(|text| predicate(&text)),
+        early_exit_message,
+    );
+}
