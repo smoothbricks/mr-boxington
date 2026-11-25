@@ -67,11 +67,13 @@ def terminal_run(root, env, args, *, respond=None, limit=90):
         assert before == after, f'terminal mode was not restored: {args}: {before!r} != {after!r}'
         return code, bytes(data)
     finally:
+        # Close the terminal before waiting on a child the bound killed: mbx is its session leader, and a leader's
+        # exit waits for the terminal's output to drain, which a held, unread master never does.
+        os.close(master)
+        os.close(slave)
         if child.poll() is None:
             child.kill()
             child.wait()
-        os.close(master)
-        os.close(slave)
 
 
 def environment(root):
