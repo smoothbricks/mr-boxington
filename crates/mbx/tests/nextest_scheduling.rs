@@ -1238,6 +1238,12 @@ pub fn observe(name: &str, heavy: bool) {
     std::thread::sleep(std::time::Duration::from_secs(60));
 }
 #[test] fn signal_hold() {
+    if let Some(delay) = std::env::var("TEST_BARRIER_DELAY_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        std::thread::sleep(std::time::Duration::from_secs(delay));
+    }
     let marker = std::env::var_os("TEST_STARTED").unwrap();
     std::fs::write(marker, std::process::id().to_string()).unwrap();
     loop { std::thread::sleep(std::time::Duration::from_secs(1)); }
@@ -1301,6 +1307,9 @@ pub fn observe(name: &str, heavy: bool) {
         .unwrap();
         let signal_started = temp.path().join("signal-started");
         let mut signal = nextest(&root, &cache);
+        if let Some(delay) = std::env::var_os("TEST_BARRIER_DELAY_SECS") {
+            signal.env("TEST_BARRIER_DELAY_SECS", delay);
+        }
         signal.env("TEST_STARTED", &signal_started).args([
             "run",
             "--offline",
