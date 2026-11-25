@@ -26,11 +26,12 @@ impl BuildChildGuard {
         Ok(Self(Some(child), Some(group)))
     }
 
+    fn child_mut(&mut self) -> &mut Child {
+        self.0.as_mut().expect("build child was already consumed")
+    }
+
     fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
-        self.0
-            .as_mut()
-            .expect("build child was already consumed")
-            .try_wait()
+        self.child_mut().try_wait()
     }
 
     fn wait_with_output(mut self) -> std::io::Result<Output> {
@@ -56,6 +57,295 @@ impl Drop for BuildChildGuard {
             let _ = child.kill();
         }
         let _ = child.wait();
+    }
+}
+
+/// Nearest existing directory ancestor of `path`.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn existing_ancestor_dir(path: &Path) -> PathBuf {
+    let mut current = path.parent().unwrap_or(path);
+    while !current.is_dir() {
+        current = current
+            .parent()
+            .expect("path must have an existing ancestor directory");
+    }
+    current.to_path_buf()
+}
+
+/// Block until `path` exists or `child` exits, using kqueue `EVFILT_VNODE` on
+/// the deepest existing ancestor directory and `EVFILT_PROC` (`NOTE_EXIT`) on
+/// `child` so there is neither polling nor a fixed timeout.
+#[cfg(target_os = "macos")]
+fn wait_for_path_or_exit(path: &Path, child: &mut Child, early_exit_message: &str) {
+    use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+
+    // SAFETY: kqueue takes no arguments and returns a new file descriptor or -1.
+    let kq = unsafe { libc::kqueue() };
+    assert!(
+        kq != -1,
+        "kqueue failed: {}",
+        std::io::Error::last_os_error()
+    );
+    // SAFETY: kq is a newly created descriptor owned exclusively here.
+    let queue = unsafe { OwnedFd::from_raw_fd(kq) };
+    // SAFETY: F_SETFD updates only the valid descriptor's close-on-exec flag.
+    assert!(
+        unsafe { libc::fcntl(queue.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } != -1,
+        "fcntl(FD_CLOEXEC) on kqueue failed: {}",
+        std::io::Error::last_os_error()
+    );
+
+    let proc_change = libc::kevent {
+        ident: usize::try_from(child.id()).expect("pid fits in usize"),
+        filter: libc::EVFILT_PROC,
+        flags: libc::EV_ADD | libc::EV_ONESHOT,
+        fflags: libc::NOTE_EXIT,
+        data: 0,
+        udata: std::ptr::null_mut(),
+    };
+    // SAFETY: proc_change is one initialized kevent registration; no event
+    // buffer or timeout is passed.
+    if unsafe {
+        libc::kevent(
+            queue.as_raw_fd(),
+            &proc_change,
+            1,
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null(),
+        )
+    } == -1
+    {
+        let error = std::io::Error::last_os_error();
+        // ESRCH means the child already exited before we attached; the check
+        // below verifies path existence first, then reports the early exit.
+        assert_eq!(
+            error.raw_os_error(),
+            Some(libc::ESRCH),
+            "registering EVFILT_PROC failed: {error}"
+        );
+    }
+
+    let mut watched: Option<(PathBuf, std::fs::File)> = None;
+    loop {
+        let dir = existing_ancestor_dir(path);
+        if watched.as_ref().is_none_or(|(current, _)| current != &dir) {
+            let Ok(file) = std::fs::File::open(&dir) else {
+                continue;
+            };
+            let vnode_change = libc::kevent {
+                ident: usize::try_from(file.as_raw_fd()).expect("fd fits in usize"),
+                filter: libc::EVFILT_VNODE,
+                flags: libc::EV_ADD | libc::EV_CLEAR,
+                fflags: libc::NOTE_WRITE
+                    | libc::NOTE_DELETE
+                    | libc::NOTE_RENAME
+                    | libc::NOTE_EXTEND
+                    | libc::NOTE_ATTRIB,
+                data: 0,
+                udata: std::ptr::null_mut(),
+            };
+            // SAFETY: vnode_change is one initialized kevent registration; the
+            // watched directory File is retained in `watched` while active.
+            let registered = unsafe {
+                libc::kevent(
+                    queue.as_raw_fd(),
+                    &vnode_change,
+                    1,
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null(),
+                )
+            };
+            assert!(
+                registered != -1,
+                "registering EVFILT_VNODE on {} failed: {}",
+                dir.display(),
+                std::io::Error::last_os_error()
+            );
+            // Replacing `watched` closes any previous directory fd, removing
+            // its old EVFILT_VNODE registration from the kqueue automatically.
+            watched = Some((dir, file));
+        }
+
+        if path.exists() {
+            return;
+        }
+        if watched
+            .as_ref()
+            .is_some_and(|(current, _)| current != &existing_ancestor_dir(path))
+        {
+            continue;
+        }
+        assert!(child.try_wait().unwrap().is_none(), "{early_exit_message}");
+
+        let mut event = std::mem::MaybeUninit::<libc::kevent>::uninit();
+        // SAFETY: queue is open, event has space for one kevent, and a null
+        // timeout blocks until either EVFILT_VNODE or EVFILT_PROC fires.
+        let count = unsafe {
+            libc::kevent(
+                queue.as_raw_fd(),
+                std::ptr::null(),
+                0,
+                event.as_mut_ptr(),
+                1,
+                std::ptr::null(),
+            )
+        };
+        if count == -1 {
+            let error = std::io::Error::last_os_error();
+            assert_eq!(
+                error.kind(),
+                std::io::ErrorKind::Interrupted,
+                "kevent wait failed: {error}"
+            );
+            continue;
+        }
+        if count > 0 {
+            // SAFETY: a positive count initialized the sole event slot.
+            let event = unsafe { event.assume_init() };
+            if event.filter == libc::EVFILT_PROC {
+                if path.exists() {
+                    return;
+                }
+                let _ = child.wait();
+                panic!("{early_exit_message}");
+            }
+        }
+    }
+}
+
+/// Block until `path` exists or `child` exits, using inotify on the deepest
+/// existing ancestor directory and `pidfd_open` + `poll` on `child` so there
+/// is neither polling nor a fixed timeout.
+#[cfg(target_os = "linux")]
+fn wait_for_path_or_exit(path: &Path, child: &mut Child, early_exit_message: &str) {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+    use std::os::unix::ffi::OsStrExt as _;
+
+    // SAFETY: inotify_init1 takes only flags and returns a new fd or -1.
+    let fd = unsafe { libc::inotify_init1(libc::IN_CLOEXEC | libc::IN_NONBLOCK) };
+    assert!(
+        fd != -1,
+        "inotify_init1 failed: {}",
+        std::io::Error::last_os_error()
+    );
+    // SAFETY: fd is a newly created descriptor owned exclusively here.
+    let inotify = unsafe { OwnedFd::from_raw_fd(fd) };
+
+    // SAFETY: pidfd_open takes a pid and flags (0) and returns a new fd or -1.
+    let pidfd_raw = unsafe { libc::syscall(libc::SYS_pidfd_open, child.id(), 0 as libc::c_uint) };
+    let pidfd = if pidfd_raw >= 0 {
+        let fd = libc::c_int::try_from(pidfd_raw).expect("pidfd fits in c_int");
+        // SAFETY: fd is a newly created descriptor owned exclusively here.
+        Some(unsafe { OwnedFd::from_raw_fd(fd) })
+    } else {
+        let error = std::io::Error::last_os_error();
+        // ESRCH means the child already exited; ENOSYS means an older kernel
+        // without pidfd_open (fall back to a periodic poll wakeup below).
+        assert!(
+            matches!(error.raw_os_error(), Some(libc::ESRCH | libc::ENOSYS)),
+            "pidfd_open failed: {error}"
+        );
+        None
+    };
+
+    let mut watched: Option<(PathBuf, libc::c_int)> = None;
+    let mask = libc::IN_CREATE
+        | libc::IN_MOVED_TO
+        | libc::IN_CLOSE_WRITE
+        | libc::IN_DELETE_SELF
+        | libc::IN_MOVE_SELF;
+    loop {
+        let dir = existing_ancestor_dir(path);
+        if watched.as_ref().is_none_or(|(current, _)| current != &dir) {
+            if let Some((_, old_wd)) = watched.take() {
+                // SAFETY: inotify is open and old_wd came from inotify_add_watch.
+                unsafe { libc::inotify_rm_watch(inotify.as_raw_fd(), old_wd) };
+            }
+            let c_dir = CString::new(dir.as_os_str().as_bytes()).expect("dir has no NUL");
+            // SAFETY: inotify is open and c_dir is NUL-terminated.
+            let wd = unsafe { libc::inotify_add_watch(inotify.as_raw_fd(), c_dir.as_ptr(), mask) };
+            if wd == -1 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    continue;
+                }
+                panic!("inotify_add_watch on {} failed: {error}", dir.display());
+            }
+            watched = Some((dir, wd));
+        }
+
+        if path.exists() {
+            return;
+        }
+        if watched
+            .as_ref()
+            .is_some_and(|(current, _)| current != &existing_ancestor_dir(path))
+        {
+            continue;
+        }
+        assert!(child.try_wait().unwrap().is_none(), "{early_exit_message}");
+
+        let mut fds = [
+            libc::pollfd {
+                fd: inotify.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: pidfd.as_ref().map_or(-1, AsRawFd::as_raw_fd),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        let nfds = if pidfd.is_some() { 2 } else { 1 };
+        let timeout = if pidfd.is_some() { -1 } else { 100 };
+        // SAFETY: fds has `nfds` valid pollfd entries retained only for this call.
+        let count = unsafe { libc::poll(fds.as_mut_ptr(), nfds, timeout) };
+        if count == -1 {
+            let error = std::io::Error::last_os_error();
+            assert_eq!(
+                error.kind(),
+                std::io::ErrorKind::Interrupted,
+                "poll failed: {error}"
+            );
+            continue;
+        }
+        if fds[0].revents & libc::POLLIN != 0 {
+            let mut buffer = [0_u8; 4096];
+            loop {
+                // SAFETY: inotify is open and nonblocking; buffer is writable.
+                let read = unsafe {
+                    libc::read(
+                        inotify.as_raw_fd(),
+                        buffer.as_mut_ptr().cast(),
+                        buffer.len(),
+                    )
+                };
+                if read <= 0 {
+                    break;
+                }
+            }
+        }
+        if pidfd.is_some() && fds[1].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
+            if path.exists() {
+                return;
+            }
+            let _ = child.wait();
+            panic!("{early_exit_message}");
+        }
+    }
+}
+
+/// Fallback for Unix targets without kqueue or inotify: no fixed timeout,
+/// bounded by the test runner.
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
+fn wait_for_path_or_exit(path: &Path, child: &mut Child, early_exit_message: &str) {
+    while !path.exists() {
+        assert!(child.try_wait().unwrap().is_none(), "{early_exit_message}");
+        std::thread::sleep(std::time::Duration::from_millis(20));
     }
 }
 
@@ -626,7 +916,7 @@ fn a_mid_compilation_input_edit_discards_the_result() {
     let release = project.path().join("release-compiler");
     std::fs::write(
         &wrapper,
-        "#!/bin/sh\n\"$TEST_REAL_RUSTC\" \"$@\"\nstatus=$?\ncase \" $* \" in\n  *\" --crate-name base \"*)\n    if [ \"$status\" -eq 0 ]; then\n      : > \"$TEST_COMPILER_FINISHED\"\n      while [ ! -e \"$TEST_RELEASE_COMPILER\" ]; do sleep 0.02; done\n    fi\n    ;;\nesac\nexit \"$status\"\n",
+        "#!/bin/sh\n\"$TEST_REAL_RUSTC\" \"$@\"\nstatus=$?\ncase \" $* \" in\n  *\" --crate-name base \"*)\n    if [ \"$status\" -eq 0 ]; then\n      if [ -n \"${TEST_BARRIER_DELAY_SECS:-}\" ]; then sleep \"$TEST_BARRIER_DELAY_SECS\"; fi\n      : > \"$TEST_COMPILER_FINISHED\"\n      while [ ! -e \"$TEST_RELEASE_COMPILER\" ]; do sleep 0.02; done\n    fi\n    ;;\nesac\nexit \"$status\"\n",
     )
     .unwrap();
     let mut permissions = std::fs::metadata(&wrapper).unwrap().permissions();
@@ -651,19 +941,11 @@ fn a_mid_compilation_input_edit_discards_the_result() {
         .env_remove("RUSTC_WORKSPACE_WRAPPER")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = child.spawn().expect("mbx should run");
-
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while !compiled.exists() && std::time::Instant::now() < deadline {
-        assert!(
-            child.try_wait().unwrap().is_none(),
-            "the build exited before the compiler could be released"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
-    assert!(
-        compiled.exists(),
-        "the compiler did not reach the test barrier"
+    let mut child = BuildChildGuard::spawn_group(&mut child).expect("mbx should run");
+    wait_for_path_or_exit(
+        &compiled,
+        child.child_mut(),
+        "the build exited before the compiler could be released",
     );
 
     std::fs::write(
@@ -776,7 +1058,7 @@ fn a_mid_compilation_build_script_edit_discards_the_execution_only_result() {
     let release = project.path().join("release-compiler");
     std::fs::write(
         &wrapper,
-        "#!/bin/sh\n\"$TEST_REAL_RUSTC\" \"$@\"\nstatus=$?\ncase \" $* \" in\n  *\" --crate-name build_script_build \"*)\n    if [ \"$status\" -eq 0 ]; then\n      : > \"$TEST_COMPILER_FINISHED\"\n      while [ ! -e \"$TEST_RELEASE_COMPILER\" ]; do sleep 0.02; done\n    fi\n    ;;\nesac\nexit \"$status\"\n",
+        "#!/bin/sh\n\"$TEST_REAL_RUSTC\" \"$@\"\nstatus=$?\ncase \" $* \" in\n  *\" --crate-name build_script_build \"*)\n    if [ \"$status\" -eq 0 ]; then\n      if [ -n \"${TEST_BARRIER_DELAY_SECS:-}\" ]; then sleep \"$TEST_BARRIER_DELAY_SECS\"; fi\n      : > \"$TEST_COMPILER_FINISHED\"\n      while [ ! -e \"$TEST_RELEASE_COMPILER\" ]; do sleep 0.02; done\n    fi\n    ;;\nesac\nexit \"$status\"\n",
     )
     .unwrap();
     let mut permissions = std::fs::metadata(&wrapper).unwrap().permissions();
@@ -801,19 +1083,11 @@ fn a_mid_compilation_build_script_edit_discards_the_execution_only_result() {
         .env_remove("RUSTC_WORKSPACE_WRAPPER")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = child.spawn().expect("mbx should run");
-
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while !compiled.exists() && std::time::Instant::now() < deadline {
-        assert!(
-            child.try_wait().unwrap().is_none(),
-            "the build exited before the build-script compiler could be released"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
-    assert!(
-        compiled.exists(),
-        "the build-script compiler did not reach the test barrier"
+    let mut child = BuildChildGuard::spawn_group(&mut child).expect("mbx should run");
+    wait_for_path_or_exit(
+        &compiled,
+        child.child_mut(),
+        "the build exited before the build-script compiler could be released",
     );
 
     let build_script = project.path().join("build.rs");
@@ -6122,10 +6396,7 @@ fn binary_dep_info_compilations_store_and_restore_across_checkouts() {
             .filter(|(kind, _)| {
                 !matches!(
                     kind.as_str(),
-                    "compiler-query"
-                        | "standard-input"
-                        | "cc-compiler-query"
-                        | "cc-standard-input"
+                    "compiler-query" | "standard-input" | "cc-compiler-query" | "cc-standard-input"
                 )
             })
             .collect();
@@ -6521,7 +6792,7 @@ fn a_low_disk_floor_starts_collection_before_the_build_ends() {
     let stamp = store.path().join("actions/gc/v1/last-sweep");
     std::fs::write(
         &wrapper,
-        "#!/bin/sh\n\"$TEST_REAL_RUSTC\" \"$@\"\nstatus=$?\ncase \" $* \" in\n  *\" --crate-name base \"*)\n    if [ \"$status\" -eq 0 ]; then\n      : > \"$TEST_COMPILER_FINISHED\"\n      while [ ! -e \"$TEST_RELEASE_COMPILER\" ]; do sleep 0.02; done\n    fi\n    ;;\n  *\" --crate-name above \"*)\n    if [ \"$status\" -eq 0 ]; then\n      attempts=0\n      while [ ! -e \"$TEST_SWEEP_STAMP\" ] && [ \"$attempts\" -lt 1500 ]; do\n        sleep 0.02\n        attempts=$((attempts + 1))\n      done\n    fi\n    ;;\nesac\nexit \"$status\"\n",
+        "#!/bin/sh\n\"$TEST_REAL_RUSTC\" \"$@\"\nstatus=$?\ncase \" $* \" in\n  *\" --crate-name base \"*)\n    if [ \"$status\" -eq 0 ]; then\n      if [ -n \"${TEST_BARRIER_DELAY_SECS:-}\" ]; then sleep \"$TEST_BARRIER_DELAY_SECS\"; fi\n      : > \"$TEST_COMPILER_FINISHED\"\n      while [ ! -e \"$TEST_RELEASE_COMPILER\" ]; do sleep 0.02; done\n    fi\n    ;;\n  *\" --crate-name above \"*)\n    if [ \"$status\" -eq 0 ]; then\n      attempts=0\n      while [ ! -e \"$TEST_SWEEP_STAMP\" ] && [ \"$attempts\" -lt 1500 ]; do\n        sleep 0.02\n        attempts=$((attempts + 1))\n      done\n    fi\n    ;;\nesac\nexit \"$status\"\n",
     )
     .unwrap();
     let mut permissions = std::fs::metadata(&wrapper).unwrap().permissions();
@@ -6550,32 +6821,17 @@ fn a_low_disk_floor_starts_collection_before_the_build_ends() {
     );
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = BuildChildGuard::new(command.spawn().expect("mbx should run"));
-
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while !compiled.exists() && std::time::Instant::now() < deadline {
-        assert!(
-            child.try_wait().unwrap().is_none(),
-            "the build exited before the compiler could be released"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
-    assert!(
-        compiled.exists(),
-        "the compiler did not reach the test barrier"
+    wait_for_path_or_exit(
+        &compiled,
+        child.child_mut(),
+        "the build exited before the compiler could be released",
     );
 
     std::fs::write(&release, b"").unwrap();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while !stamp.exists() && std::time::Instant::now() < deadline {
-        assert!(
-            child.try_wait().unwrap().is_none(),
-            "the build ended before the low-disk sweep was claimed"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
-    assert!(
-        stamp.exists(),
-        "the low-disk collector was not claimed while the build was running"
+    wait_for_path_or_exit(
+        &stamp,
+        child.child_mut(),
+        "the build ended before the low-disk sweep was claimed",
     );
 
     let output = child.wait_with_output().unwrap();
@@ -10563,6 +10819,59 @@ exec "$TEST_REAL_RUSTC" "$@"
             "{stderr}"
         );
     }
+}
+
+/// The event-driven barrier waiter wakes on nested path creation and fails
+/// immediately when the child exits before creating the barrier.
+#[cfg(unix)]
+#[test]
+fn wait_for_path_or_exit_wakes_on_nested_creation_and_early_exit() {
+    let dir = tempfile::tempdir().unwrap();
+    let nested = dir.path().join("actions/gc/v1/last-sweep");
+    let mut creator = BuildChildGuard::spawn_group(
+        Command::new("sh")
+            .arg("-c")
+            .arg("sleep 0.05; mkdir -p \"$1\" && : > \"$2\"; sleep 5")
+            .arg("sh")
+            .arg(nested.parent().unwrap())
+            .arg(&nested),
+    )
+    .unwrap();
+    wait_for_path_or_exit(
+        &nested,
+        creator.child_mut(),
+        "creator exited before writing barrier",
+    );
+    assert!(nested.exists());
+    drop(creator);
+
+    let missing = dir.path().join("never-created");
+    let mut early =
+        BuildChildGuard::spawn_group(Command::new("sh").arg("-c").arg("sleep 0.05; exit 1"))
+            .unwrap();
+    let started = std::time::Instant::now();
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        wait_for_path_or_exit(
+            &missing,
+            early.child_mut(),
+            "the build exited before the compiler could be released",
+        );
+    }))
+    .expect_err("early exit must panic immediately");
+    let message = panic
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| panic.downcast_ref::<&str>().copied())
+        .unwrap_or("");
+    assert_eq!(
+        message,
+        "the build exited before the compiler could be released"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "early exit waited {:?}",
+        started.elapsed()
+    );
 }
 
 /// Cleanup must close pipes inherited by grandchildren, even after a panic.
