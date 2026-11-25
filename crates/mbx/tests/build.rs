@@ -15,10 +15,6 @@ struct BuildChildGuard(Option<Child>, Option<libc::pid_t>);
 
 #[cfg(unix)]
 impl BuildChildGuard {
-    fn new(child: Child) -> Self {
-        Self(Some(child), None)
-    }
-
     fn spawn_group(command: &mut Command) -> std::io::Result<Self> {
         use std::os::unix::process::CommandExt as _;
         let child = command.process_group(0).spawn()?;
@@ -26,12 +22,11 @@ impl BuildChildGuard {
         Ok(Self(Some(child), Some(group)))
     }
 
-    fn child_mut(&mut self) -> &mut Child {
-        self.0.as_mut().expect("build child was already consumed")
-    }
-
     fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
-        self.child_mut().try_wait()
+        self.0
+            .as_mut()
+            .expect("build child was already consumed")
+            .try_wait()
     }
 
     fn wait_with_output(mut self) -> std::io::Result<Output> {
@@ -60,8 +55,98 @@ impl Drop for BuildChildGuard {
     }
 }
 
+/// Create a named pipe at `path` so a wrapper script can block on
+/// `read _ < "$FIFO"` until the test releases it by writing a line.
+#[cfg(unix)]
+fn create_fifo(path: &Path) {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt as _;
+    let c_path = CString::new(path.as_os_str().as_bytes()).expect("FIFO path has no NUL");
+    // SAFETY: c_path is a valid NUL-terminated path passed to mkfifo(3).
+    assert_eq!(
+        unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) },
+        0,
+        "mkfifo({}) failed: {}",
+        path.display(),
+        std::io::Error::last_os_error()
+    );
+}
+
+#[cfg(unix)]
+enum WatchEvent {
+    FsChanged,
+    Exited(std::io::Result<Output>),
+}
+
+/// Child process in its own process group whose exit is delivered on a shared
+/// `mpsc` channel by one blocking waiter thread, letting `wait_for_path_or_exit`
+/// wait on filesystem notifications and child exit together without polling.
+#[cfg(unix)]
+struct WatchedChild {
+    group: libc::pid_t,
+    tx: std::sync::mpsc::Sender<WatchEvent>,
+    rx: std::sync::mpsc::Receiver<WatchEvent>,
+    waiter: Option<std::thread::JoinHandle<()>>,
+    output: Option<std::io::Result<Output>>,
+}
+
+#[cfg(unix)]
+impl WatchedChild {
+    fn spawn_group(command: &mut Command) -> std::io::Result<Self> {
+        use std::os::unix::process::CommandExt as _;
+        let child = command.process_group(0).spawn()?;
+        let group = child.id() as libc::pid_t;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let exit_tx = tx.clone();
+        let waiter = std::thread::spawn(move || {
+            let _ = exit_tx.send(WatchEvent::Exited(child.wait_with_output()));
+        });
+        Ok(Self {
+            group,
+            tx,
+            rx,
+            waiter: Some(waiter),
+            output: None,
+        })
+    }
+
+    fn wait_with_output(mut self) -> std::io::Result<Output> {
+        if let Some(output) = self.output.take() {
+            if let Some(waiter) = self.waiter.take() {
+                let _ = waiter.join();
+            }
+            return output;
+        }
+        loop {
+            match self.rx.recv().expect("waiter thread exited without result") {
+                WatchEvent::FsChanged => {}
+                WatchEvent::Exited(output) => {
+                    if let Some(waiter) = self.waiter.take() {
+                        let _ = waiter.join();
+                    }
+                    return output;
+                }
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for WatchedChild {
+    fn drop(&mut self) {
+        if let Some(waiter) = self.waiter.take() {
+            if self.output.is_none() && !waiter.is_finished() {
+                // SAFETY: spawn_group created a distinct process group whose id
+                // is the child's pid, and the child is reaped by `waiter`.
+                unsafe { libc::kill(-self.group, libc::SIGKILL) };
+            }
+            let _ = waiter.join();
+        }
+    }
+}
+
 /// Nearest existing directory ancestor of `path`.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(unix)]
 fn existing_ancestor_dir(path: &Path) -> PathBuf {
     let mut current = path.parent().unwrap_or(path);
     while !current.is_dir() {
@@ -72,280 +157,59 @@ fn existing_ancestor_dir(path: &Path) -> PathBuf {
     current.to_path_buf()
 }
 
-/// Block until `path` exists or `child` exits, using kqueue `EVFILT_VNODE` on
-/// the deepest existing ancestor directory and `EVFILT_PROC` (`NOTE_EXIT`) on
-/// `child` so there is neither polling nor a fixed timeout.
-#[cfg(target_os = "macos")]
-fn wait_for_path_or_exit(path: &Path, child: &mut Child, early_exit_message: &str) {
-    use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+/// Block until `path` exists or `child` exits, using `notify` on the deepest
+/// existing ancestor directory and the child's exit thread on the same `mpsc`
+/// channel. No polling and no fixed timeout.
+#[cfg(unix)]
+fn wait_for_path_or_exit(path: &Path, child: &mut WatchedChild, early_exit_message: &str) {
+    use notify::{RecursiveMode, Watcher as _};
 
-    // SAFETY: kqueue takes no arguments and returns a new file descriptor or -1.
-    let kq = unsafe { libc::kqueue() };
-    assert!(
-        kq != -1,
-        "kqueue failed: {}",
-        std::io::Error::last_os_error()
-    );
-    // SAFETY: kq is a newly created descriptor owned exclusively here.
-    let queue = unsafe { OwnedFd::from_raw_fd(kq) };
-    // SAFETY: F_SETFD updates only the valid descriptor's close-on-exec flag.
-    assert!(
-        unsafe { libc::fcntl(queue.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } != -1,
-        "fcntl(FD_CLOEXEC) on kqueue failed: {}",
-        std::io::Error::last_os_error()
-    );
+    let fs_tx = child.tx.clone();
+    let mut watcher = notify::recommended_watcher(move |_| {
+        let _ = fs_tx.send(WatchEvent::FsChanged);
+    })
+    .expect("filesystem watcher should start");
 
-    let proc_change = libc::kevent {
-        ident: usize::try_from(child.id()).expect("pid fits in usize"),
-        filter: libc::EVFILT_PROC,
-        flags: libc::EV_ADD | libc::EV_ONESHOT,
-        fflags: libc::NOTE_EXIT,
-        data: 0,
-        udata: std::ptr::null_mut(),
-    };
-    // SAFETY: proc_change is one initialized kevent registration; no event
-    // buffer or timeout is passed.
-    if unsafe {
-        libc::kevent(
-            queue.as_raw_fd(),
-            &proc_change,
-            1,
-            std::ptr::null_mut(),
-            0,
-            std::ptr::null(),
-        )
-    } == -1
-    {
-        let error = std::io::Error::last_os_error();
-        // ESRCH means the child already exited before we attached; the check
-        // below verifies path existence first, then reports the early exit.
-        assert_eq!(
-            error.raw_os_error(),
-            Some(libc::ESRCH),
-            "registering EVFILT_PROC failed: {error}"
-        );
-    }
-
-    let mut watched: Option<(PathBuf, std::fs::File)> = None;
+    let mut watched: Option<PathBuf> = None;
     loop {
         let dir = existing_ancestor_dir(path);
-        if watched.as_ref().is_none_or(|(current, _)| current != &dir) {
-            let Ok(file) = std::fs::File::open(&dir) else {
-                continue;
-            };
-            let vnode_change = libc::kevent {
-                ident: usize::try_from(file.as_raw_fd()).expect("fd fits in usize"),
-                filter: libc::EVFILT_VNODE,
-                flags: libc::EV_ADD | libc::EV_CLEAR,
-                fflags: libc::NOTE_WRITE
-                    | libc::NOTE_DELETE
-                    | libc::NOTE_RENAME
-                    | libc::NOTE_EXTEND
-                    | libc::NOTE_ATTRIB,
-                data: 0,
-                udata: std::ptr::null_mut(),
-            };
-            // SAFETY: vnode_change is one initialized kevent registration; the
-            // watched directory File is retained in `watched` while active.
-            let registered = unsafe {
-                libc::kevent(
-                    queue.as_raw_fd(),
-                    &vnode_change,
-                    1,
-                    std::ptr::null_mut(),
-                    0,
-                    std::ptr::null(),
-                )
-            };
-            assert!(
-                registered != -1,
-                "registering EVFILT_VNODE on {} failed: {}",
-                dir.display(),
-                std::io::Error::last_os_error()
-            );
-            // Replacing `watched` closes any previous directory fd, removing
-            // its old EVFILT_VNODE registration from the kqueue automatically.
-            watched = Some((dir, file));
+        if watched.as_ref() != Some(&dir) {
+            if let Some(previous) = watched.take() {
+                let _ = watcher.unwatch(&previous);
+            }
+            if let Err(error) = watcher.watch(&dir, RecursiveMode::NonRecursive) {
+                if !dir.is_dir() {
+                    continue;
+                }
+                panic!("watching {} failed: {error}", dir.display());
+            }
+            watched = Some(dir);
         }
 
         if path.exists() {
             return;
         }
-        if watched
-            .as_ref()
-            .is_some_and(|(current, _)| current != &existing_ancestor_dir(path))
-        {
+        if watched.as_ref() != Some(&existing_ancestor_dir(path)) {
             continue;
         }
-        assert!(child.try_wait().unwrap().is_none(), "{early_exit_message}");
+        if child.output.is_some() {
+            panic!("{early_exit_message}");
+        }
 
-        let mut event = std::mem::MaybeUninit::<libc::kevent>::uninit();
-        // SAFETY: queue is open, event has space for one kevent, and a null
-        // timeout blocks until either EVFILT_VNODE or EVFILT_PROC fires.
-        let count = unsafe {
-            libc::kevent(
-                queue.as_raw_fd(),
-                std::ptr::null(),
-                0,
-                event.as_mut_ptr(),
-                1,
-                std::ptr::null(),
-            )
-        };
-        if count == -1 {
-            let error = std::io::Error::last_os_error();
-            assert_eq!(
-                error.kind(),
-                std::io::ErrorKind::Interrupted,
-                "kevent wait failed: {error}"
-            );
-            continue;
-        }
-        if count > 0 {
-            // SAFETY: a positive count initialized the sole event slot.
-            let event = unsafe { event.assume_init() };
-            if event.filter == libc::EVFILT_PROC {
+        match child
+            .rx
+            .recv()
+            .expect("waiter thread exited without result")
+        {
+            WatchEvent::FsChanged => {}
+            WatchEvent::Exited(output) => {
+                child.output = Some(output);
                 if path.exists() {
                     return;
                 }
-                let _ = child.wait();
                 panic!("{early_exit_message}");
             }
         }
-    }
-}
-
-/// Block until `path` exists or `child` exits, using inotify on the deepest
-/// existing ancestor directory and `pidfd_open` + `poll` on `child` so there
-/// is neither polling nor a fixed timeout.
-#[cfg(target_os = "linux")]
-fn wait_for_path_or_exit(path: &Path, child: &mut Child, early_exit_message: &str) {
-    use std::ffi::CString;
-    use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
-    use std::os::unix::ffi::OsStrExt as _;
-
-    // SAFETY: inotify_init1 takes only flags and returns a new fd or -1.
-    let fd = unsafe { libc::inotify_init1(libc::IN_CLOEXEC | libc::IN_NONBLOCK) };
-    assert!(
-        fd != -1,
-        "inotify_init1 failed: {}",
-        std::io::Error::last_os_error()
-    );
-    // SAFETY: fd is a newly created descriptor owned exclusively here.
-    let inotify = unsafe { OwnedFd::from_raw_fd(fd) };
-
-    // SAFETY: pidfd_open takes a pid and flags (0) and returns a new fd or -1.
-    let pidfd_raw = unsafe { libc::syscall(libc::SYS_pidfd_open, child.id(), 0 as libc::c_uint) };
-    let pidfd = if pidfd_raw >= 0 {
-        let fd = libc::c_int::try_from(pidfd_raw).expect("pidfd fits in c_int");
-        // SAFETY: fd is a newly created descriptor owned exclusively here.
-        Some(unsafe { OwnedFd::from_raw_fd(fd) })
-    } else {
-        let error = std::io::Error::last_os_error();
-        // ESRCH means the child already exited; ENOSYS means an older kernel
-        // without pidfd_open (fall back to a periodic poll wakeup below).
-        assert!(
-            matches!(error.raw_os_error(), Some(libc::ESRCH | libc::ENOSYS)),
-            "pidfd_open failed: {error}"
-        );
-        None
-    };
-
-    let mut watched: Option<(PathBuf, libc::c_int)> = None;
-    let mask = libc::IN_CREATE
-        | libc::IN_MOVED_TO
-        | libc::IN_CLOSE_WRITE
-        | libc::IN_DELETE_SELF
-        | libc::IN_MOVE_SELF;
-    loop {
-        let dir = existing_ancestor_dir(path);
-        if watched.as_ref().is_none_or(|(current, _)| current != &dir) {
-            if let Some((_, old_wd)) = watched.take() {
-                // SAFETY: inotify is open and old_wd came from inotify_add_watch.
-                unsafe { libc::inotify_rm_watch(inotify.as_raw_fd(), old_wd) };
-            }
-            let c_dir = CString::new(dir.as_os_str().as_bytes()).expect("dir has no NUL");
-            // SAFETY: inotify is open and c_dir is NUL-terminated.
-            let wd = unsafe { libc::inotify_add_watch(inotify.as_raw_fd(), c_dir.as_ptr(), mask) };
-            if wd == -1 {
-                let error = std::io::Error::last_os_error();
-                if error.kind() == std::io::ErrorKind::NotFound {
-                    continue;
-                }
-                panic!("inotify_add_watch on {} failed: {error}", dir.display());
-            }
-            watched = Some((dir, wd));
-        }
-
-        if path.exists() {
-            return;
-        }
-        if watched
-            .as_ref()
-            .is_some_and(|(current, _)| current != &existing_ancestor_dir(path))
-        {
-            continue;
-        }
-        assert!(child.try_wait().unwrap().is_none(), "{early_exit_message}");
-
-        let mut fds = [
-            libc::pollfd {
-                fd: inotify.as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            },
-            libc::pollfd {
-                fd: pidfd.as_ref().map_or(-1, AsRawFd::as_raw_fd),
-                events: libc::POLLIN,
-                revents: 0,
-            },
-        ];
-        let nfds = if pidfd.is_some() { 2 } else { 1 };
-        let timeout = if pidfd.is_some() { -1 } else { 100 };
-        // SAFETY: fds has `nfds` valid pollfd entries retained only for this call.
-        let count = unsafe { libc::poll(fds.as_mut_ptr(), nfds, timeout) };
-        if count == -1 {
-            let error = std::io::Error::last_os_error();
-            assert_eq!(
-                error.kind(),
-                std::io::ErrorKind::Interrupted,
-                "poll failed: {error}"
-            );
-            continue;
-        }
-        if fds[0].revents & libc::POLLIN != 0 {
-            let mut buffer = [0_u8; 4096];
-            loop {
-                // SAFETY: inotify is open and nonblocking; buffer is writable.
-                let read = unsafe {
-                    libc::read(
-                        inotify.as_raw_fd(),
-                        buffer.as_mut_ptr().cast(),
-                        buffer.len(),
-                    )
-                };
-                if read <= 0 {
-                    break;
-                }
-            }
-        }
-        if pidfd.is_some() && fds[1].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
-            if path.exists() {
-                return;
-            }
-            let _ = child.wait();
-            panic!("{early_exit_message}");
-        }
-    }
-}
-
-/// Fallback for Unix targets without kqueue or inotify: no fixed timeout,
-/// bounded by the test runner.
-#[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
-fn wait_for_path_or_exit(path: &Path, child: &mut Child, early_exit_message: &str) {
-    while !path.exists() {
-        assert!(child.try_wait().unwrap().is_none(), "{early_exit_message}");
-        std::thread::sleep(std::time::Duration::from_millis(20));
     }
 }
 
@@ -914,9 +778,10 @@ fn a_mid_compilation_input_edit_discards_the_result() {
     let wrapper = project.path().join("delayed-rustc");
     let compiled = project.path().join("compiler-finished");
     let release = project.path().join("release-compiler");
+    create_fifo(&release);
     std::fs::write(
         &wrapper,
-        "#!/bin/sh\n\"$TEST_REAL_RUSTC\" \"$@\"\nstatus=$?\ncase \" $* \" in\n  *\" --crate-name base \"*)\n    if [ \"$status\" -eq 0 ]; then\n      if [ -n \"${TEST_BARRIER_DELAY_SECS:-}\" ]; then sleep \"$TEST_BARRIER_DELAY_SECS\"; fi\n      : > \"$TEST_COMPILER_FINISHED\"\n      while [ ! -e \"$TEST_RELEASE_COMPILER\" ]; do sleep 0.02; done\n    fi\n    ;;\nesac\nexit \"$status\"\n",
+        "#!/bin/sh\n\"$TEST_REAL_RUSTC\" \"$@\"\nstatus=$?\ncase \" $* \" in\n  *\" --crate-name base \"*)\n    if [ \"$status\" -eq 0 ] && [ -n \"${TEST_RELEASE_COMPILER:-}\" ]; then\n      if [ -n \"${TEST_BARRIER_DELAY_SECS:-}\" ]; then sleep \"$TEST_BARRIER_DELAY_SECS\"; fi\n      : > \"$TEST_COMPILER_FINISHED\"\n      read _ < \"$TEST_RELEASE_COMPILER\"\n    fi\n    ;;\nesac\nexit \"$status\"\n",
     )
     .unwrap();
     let mut permissions = std::fs::metadata(&wrapper).unwrap().permissions();
@@ -941,10 +806,10 @@ fn a_mid_compilation_input_edit_discards_the_result() {
         .env_remove("RUSTC_WORKSPACE_WRAPPER")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = BuildChildGuard::spawn_group(&mut child).expect("mbx should run");
+    let mut child = WatchedChild::spawn_group(&mut child).expect("mbx should run");
     wait_for_path_or_exit(
         &compiled,
-        child.child_mut(),
+        &mut child,
         "the build exited before the compiler could be released",
     );
 
@@ -958,7 +823,7 @@ fn a_mid_compilation_input_edit_discards_the_result() {
         "pub fn value() -> u32 { base::added() }\n",
     )
     .unwrap();
-    std::fs::write(&release, b"").unwrap();
+    std::fs::write(&release, b"go\n").unwrap();
 
     let output = child.wait_with_output().unwrap();
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1025,8 +890,8 @@ fn a_mid_compilation_input_edit_discards_the_result() {
         .env("CARGO_INCREMENTAL", "0")
         .env("RUSTC", &wrapper)
         .env("TEST_REAL_RUSTC", which::which("rustc").unwrap())
-        .env("TEST_COMPILER_FINISHED", &compiled)
-        .env("TEST_RELEASE_COMPILER", &release)
+        .env_remove("TEST_COMPILER_FINISHED")
+        .env_remove("TEST_RELEASE_COMPILER")
         .env_remove("MBX_SOCKET")
         .env_remove("CARGO_TARGET_DIR")
         .env_remove("RUSTC_WRAPPER")
@@ -1056,9 +921,10 @@ fn a_mid_compilation_build_script_edit_discards_the_execution_only_result() {
     let wrapper = project.path().join("delayed-rustc");
     let compiled = project.path().join("compiler-finished");
     let release = project.path().join("release-compiler");
+    create_fifo(&release);
     std::fs::write(
         &wrapper,
-        "#!/bin/sh\n\"$TEST_REAL_RUSTC\" \"$@\"\nstatus=$?\ncase \" $* \" in\n  *\" --crate-name build_script_build \"*)\n    if [ \"$status\" -eq 0 ]; then\n      if [ -n \"${TEST_BARRIER_DELAY_SECS:-}\" ]; then sleep \"$TEST_BARRIER_DELAY_SECS\"; fi\n      : > \"$TEST_COMPILER_FINISHED\"\n      while [ ! -e \"$TEST_RELEASE_COMPILER\" ]; do sleep 0.02; done\n    fi\n    ;;\nesac\nexit \"$status\"\n",
+        "#!/bin/sh\n\"$TEST_REAL_RUSTC\" \"$@\"\nstatus=$?\ncase \" $* \" in\n  *\" --crate-name build_script_build \"*)\n    if [ \"$status\" -eq 0 ]; then\n      if [ -n \"${TEST_BARRIER_DELAY_SECS:-}\" ]; then sleep \"$TEST_BARRIER_DELAY_SECS\"; fi\n      : > \"$TEST_COMPILER_FINISHED\"\n      read _ < \"$TEST_RELEASE_COMPILER\"\n    fi\n    ;;\nesac\nexit \"$status\"\n",
     )
     .unwrap();
     let mut permissions = std::fs::metadata(&wrapper).unwrap().permissions();
@@ -1083,10 +949,10 @@ fn a_mid_compilation_build_script_edit_discards_the_execution_only_result() {
         .env_remove("RUSTC_WORKSPACE_WRAPPER")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = BuildChildGuard::spawn_group(&mut child).expect("mbx should run");
+    let mut child = WatchedChild::spawn_group(&mut child).expect("mbx should run");
     wait_for_path_or_exit(
         &compiled,
-        child.child_mut(),
+        &mut child,
         "the build exited before the build-script compiler could be released",
     );
 
@@ -1094,7 +960,7 @@ fn a_mid_compilation_build_script_edit_discards_the_execution_only_result() {
     let mut source = std::fs::read_to_string(&build_script).unwrap();
     source.push_str("\n// edited while rustc was running\n");
     std::fs::write(build_script, source).unwrap();
-    std::fs::write(&release, b"").unwrap();
+    std::fs::write(&release, b"go\n").unwrap();
 
     let output = child.wait_with_output().unwrap();
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -6789,10 +6655,13 @@ fn a_low_disk_floor_starts_collection_before_the_build_ends() {
     let wrapper = project.path().join("delayed-rustc");
     let compiled = project.path().join("compiler-finished");
     let release = project.path().join("release-compiler");
+    let release_above = project.path().join("release-above");
     let stamp = store.path().join("actions/gc/v1/last-sweep");
+    create_fifo(&release);
+    create_fifo(&release_above);
     std::fs::write(
         &wrapper,
-        "#!/bin/sh\n\"$TEST_REAL_RUSTC\" \"$@\"\nstatus=$?\ncase \" $* \" in\n  *\" --crate-name base \"*)\n    if [ \"$status\" -eq 0 ]; then\n      if [ -n \"${TEST_BARRIER_DELAY_SECS:-}\" ]; then sleep \"$TEST_BARRIER_DELAY_SECS\"; fi\n      : > \"$TEST_COMPILER_FINISHED\"\n      while [ ! -e \"$TEST_RELEASE_COMPILER\" ]; do sleep 0.02; done\n    fi\n    ;;\n  *\" --crate-name above \"*)\n    if [ \"$status\" -eq 0 ]; then\n      attempts=0\n      while [ ! -e \"$TEST_SWEEP_STAMP\" ] && [ \"$attempts\" -lt 1500 ]; do\n        sleep 0.02\n        attempts=$((attempts + 1))\n      done\n    fi\n    ;;\nesac\nexit \"$status\"\n",
+        "#!/bin/sh\n\"$TEST_REAL_RUSTC\" \"$@\"\nstatus=$?\ncase \" $* \" in\n  *\" --crate-name base \"*)\n    if [ \"$status\" -eq 0 ]; then\n      if [ -n \"${TEST_BARRIER_DELAY_SECS:-}\" ]; then sleep \"$TEST_BARRIER_DELAY_SECS\"; fi\n      : > \"$TEST_COMPILER_FINISHED\"\n      read _ < \"$TEST_RELEASE_COMPILER\"\n    fi\n    ;;\n  *\" --crate-name above \"*)\n    read _ < \"$TEST_RELEASE_ABOVE\"\n    ;;\nesac\nexit \"$status\"\n",
     )
     .unwrap();
     let mut permissions = std::fs::metadata(&wrapper).unwrap().permissions();
@@ -6816,23 +6685,24 @@ fn a_low_disk_floor_starts_collection_before_the_build_ends() {
             ("TEST_REAL_RUSTC", real_rustc.to_str().unwrap()),
             ("TEST_COMPILER_FINISHED", compiled.to_str().unwrap()),
             ("TEST_RELEASE_COMPILER", release.to_str().unwrap()),
-            ("TEST_SWEEP_STAMP", stamp.to_str().unwrap()),
+            ("TEST_RELEASE_ABOVE", release_above.to_str().unwrap()),
         ],
     );
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut child = BuildChildGuard::new(command.spawn().expect("mbx should run"));
+    let mut child = WatchedChild::spawn_group(&mut command).expect("mbx should run");
     wait_for_path_or_exit(
         &compiled,
-        child.child_mut(),
+        &mut child,
         "the build exited before the compiler could be released",
     );
 
-    std::fs::write(&release, b"").unwrap();
+    std::fs::write(&release, b"go\n").unwrap();
     wait_for_path_or_exit(
         &stamp,
-        child.child_mut(),
+        &mut child,
         "the build ended before the low-disk sweep was claimed",
     );
+    std::fs::write(&release_above, b"go\n").unwrap();
 
     let output = child.wait_with_output().unwrap();
     assert!(
@@ -10828,7 +10698,7 @@ exec "$TEST_REAL_RUSTC" "$@"
 fn wait_for_path_or_exit_wakes_on_nested_creation_and_early_exit() {
     let dir = tempfile::tempdir().unwrap();
     let nested = dir.path().join("actions/gc/v1/last-sweep");
-    let mut creator = BuildChildGuard::spawn_group(
+    let mut creator = WatchedChild::spawn_group(
         Command::new("sh")
             .arg("-c")
             .arg("sleep 0.05; mkdir -p \"$1\" && : > \"$2\"; sleep 5")
@@ -10839,7 +10709,7 @@ fn wait_for_path_or_exit_wakes_on_nested_creation_and_early_exit() {
     .unwrap();
     wait_for_path_or_exit(
         &nested,
-        creator.child_mut(),
+        &mut creator,
         "creator exited before writing barrier",
     );
     assert!(nested.exists());
@@ -10847,13 +10717,12 @@ fn wait_for_path_or_exit_wakes_on_nested_creation_and_early_exit() {
 
     let missing = dir.path().join("never-created");
     let mut early =
-        BuildChildGuard::spawn_group(Command::new("sh").arg("-c").arg("sleep 0.05; exit 1"))
-            .unwrap();
+        WatchedChild::spawn_group(Command::new("sh").arg("-c").arg("sleep 0.05; exit 1")).unwrap();
     let started = std::time::Instant::now();
     let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         wait_for_path_or_exit(
             &missing,
-            early.child_mut(),
+            &mut early,
             "the build exited before the compiler could be released",
         );
     }))

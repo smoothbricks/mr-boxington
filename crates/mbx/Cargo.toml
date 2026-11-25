@@ -57,6 +57,7 @@ which = "8"
 [dev-dependencies]
 filetime = "0.2"
 mockito = "1"
+notify = { version = "9", default-features = false, features = ["macos_kqueue"] }
 serde_json = "1"
 tempfile = "3"
 
