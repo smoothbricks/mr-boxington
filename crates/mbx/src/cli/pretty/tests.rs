@@ -874,3 +874,72 @@ fn block_height_stays_within_half_the_terminal() {
     assert_eq!(block_height(42), 21);
     assert_eq!(block_height(200), 27);
 }
+
+#[test]
+fn passed_through_harness_output_is_not_amplified_by_per_chunk_panel_redraws() {
+    const LINES: usize = 100_000;
+    const LINE: &[u8] = b"TRAILING_HARNESS_OUTPUT\n";
+    // macOS/Unix PTYs typically deliver small (~1 KiB) chunks under load.
+    const CHUNK_SIZE: usize = 1024;
+    const STEP: Duration = Duration::from_micros(250);
+    assert_eq!(LINE.len(), 24);
+
+    let args = vec!["test".into(), "--test".into(), "custom".into()];
+    let mut renderer = Renderer::new(&args, Screen::with_output(Vec::new()), 110, 36);
+    let stats = AgentStats::default;
+    let start = Instant::now();
+    let mut now = start;
+
+    // Populate a realistic completed-build panel (compiled rows + mascot) and
+    // draw the initial live panel so we measure one panel's exact byte size.
+    for artifact in [
+        r#"{"reason":"compiler-artifact","package_id":"path+file:///tmp/dep#dep@0.1.0","target":{"name":"dep"},"fresh":false}"#,
+        r#"{"reason":"compiler-artifact","package_id":"path+file:///tmp/app#pretty-check@0.1.0","target":{"name":"pretty_check"},"fresh":false}"#,
+        r#"{"reason":"compiler-artifact","package_id":"path+file:///tmp/app#pretty-check@0.1.0","target":{"name":"pretty-check"},"fresh":false}"#,
+        r#"{"reason":"compiler-artifact","package_id":"path+file:///tmp/app#pretty-check@0.1.0","target":{"name":"custom"},"fresh":false}"#,
+        r#"{"reason":"build-finished","success":true}"#,
+    ] {
+        renderer
+            .feed_bytes(format!("{artifact}\r\n").as_bytes(), &stats)
+            .unwrap();
+    }
+    renderer.present(now, &stats).unwrap();
+    let panel_bytes = renderer.screen.output.len();
+    assert!(panel_bytes > 0, "initial panel should be drawn");
+
+    let harness_output = LINE.repeat(LINES);
+    let harness_bytes = harness_output.len();
+    for chunk in harness_output.chunks(CHUNK_SIZE) {
+        now += STEP;
+        renderer.feed_bytes(chunk, &stats).unwrap();
+        renderer.present(now, &stats).unwrap();
+    }
+    renderer.finish_stream().unwrap();
+    renderer.draw_summary(true, &stats).unwrap();
+
+    let output = &renderer.screen.output;
+    let total_written = output.len();
+    let elapsed = now.saturating_duration_since(start);
+    // Initial panel + one panel per elapsed frame interval + final summary.
+    let expected_frames = 1 + (elapsed.as_nanos() / FRAME_INTERVAL.as_nanos()) as usize + 1;
+    let ratio = total_written as f64 / harness_bytes as f64;
+    let max_ratio = 1.0 + (panel_bytes * expected_frames) as f64 / harness_bytes as f64;
+    let sync_begins = output
+        .windows(b"\x1b[?2026h".len())
+        .filter(|w| *w == b"\x1b[?2026h")
+        .count();
+    let sync_ends = output
+        .windows(b"\x1b[?2026l".len())
+        .filter(|w| *w == b"\x1b[?2026l")
+        .count();
+    assert_eq!(
+        sync_begins, sync_ends,
+        "DEC 2026 updates must stay balanced"
+    );
+    assert!(
+        ratio <= max_ratio && ratio <= 1.1,
+        "renderer wrote {total_written} bytes for {harness_bytes} harness bytes \
+         (ratio {ratio:.2}x, max {max_ratio:.3}x; one panel = {panel_bytes} bytes, \
+         {expected_frames} frames over {elapsed:?}, {sync_begins} sync updates)"
+    );
+}

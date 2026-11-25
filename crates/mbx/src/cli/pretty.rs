@@ -158,7 +158,8 @@ fn run_inner(
     command.cwd(std::env::current_dir()?);
     let mut reader = pair.master.try_clone_reader().map_err(|e| eyre::eyre!(e))?;
     let mut input = pair.master.take_writer().map_err(|e| eyre::eyre!(e))?;
-    let mut screen = Screen::new()?;
+    let _terminal = TerminalGuard::enter()?;
+    let screen = Screen::stderr()?;
     let mut child = pair
         .slave
         .spawn_command(command)
@@ -184,16 +185,8 @@ fn run_inner(
             }
         }
     });
-    let mut model = Model::new(arguments);
-    let mode = match cargo_verb(arguments) {
-        Some("run" | "r") => Mode::Run,
-        Some("test" | "t") => Mode::Test,
-        _ => Mode::Build,
-    };
-    let mut decoder = Decoder::default();
+    let mut renderer = Renderer::new(arguments, screen, cols, rows);
     let mut cursor_query = CursorQuery::default();
-    let mut proxy = false;
-    let mut last_frame = Instant::now() - Duration::from_secs(1);
     let result = (|| -> Result<portable_pty::ExitStatus> {
         let mut exit_seen = false;
         let mut last_output = Instant::now();
@@ -202,7 +195,7 @@ fn run_inner(
                 exit_seen = true;
                 last_output = Instant::now();
             }
-            match receive.recv_timeout(Duration::from_millis(20)) {
+            match receive.recv_timeout(POLL_INTERVAL) {
                 Ok(Ok(bytes)) => {
                     last_output = Instant::now();
                     let bytes = if cfg!(windows) {
@@ -210,7 +203,7 @@ fn run_inner(
                     } else {
                         bytes
                     };
-                    decoder.feed(&bytes, &mut model, &mut screen, mode, &mut proxy, &stats)?
+                    renderer.feed_bytes(&bytes, &stats)?;
                 }
                 Ok(Err(error)) => return Err(error.into()),
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -220,7 +213,7 @@ fn run_inner(
                     if exit_seen && last_output.elapsed() >= Duration::from_secs(1) {
                         break;
                     }
-                    decoder.flush_partial(&mut screen, model.build_finished)?;
+                    renderer.flush_partial()?;
                 }
             }
             forward_input(&mut input)?;
@@ -228,33 +221,16 @@ fn run_inner(
                 let size = pty_size(cols, rows);
                 if pair.master.get_size().map_err(|e| eyre::eyre!(e))? != size {
                     pair.master.resize(size).map_err(|e| eyre::eyre!(e))?;
-                    screen.clear()?;
+                    renderer.resize(cols, rows)?;
                 }
             }
-            let awaiting_lf = screen.awaiting_lf();
-            if !proxy
-                && decoder.pending.is_empty()
-                && !decoder.partial
-                && !awaiting_lf
-                && last_frame.elapsed() >= Duration::from_millis(80)
-            {
-                model.update_stats(stats());
-                screen.draw(view::render(
-                    &mut model,
-                    None,
-                    screen.width(),
-                    screen.height(),
-                ))?;
-                last_frame = Instant::now();
-            } else {
-                screen.repaint()?;
-            }
+            renderer.present(Instant::now(), &stats)?;
         }
         let held = cursor_query.take();
         if !held.is_empty() {
-            decoder.feed(&held, &mut model, &mut screen, mode, &mut proxy, &stats)?;
+            renderer.feed_bytes(&held, &stats)?;
         }
-        decoder.finish(&mut screen)?;
+        renderer.finish_stream()?;
         child.wait().map_err(|e| eyre::eyre!(e))
     })();
     if result.is_err() {
@@ -262,32 +238,19 @@ fn run_inner(
         let _ = child.wait();
     }
     let status = result.wrap_err("running Cargo with the pretty display")?;
-    model.update_stats(stats());
-    model.finished = Some((status.success(), model.started.elapsed()));
-    if !proxy {
-        screen.draw(view::render(
-            &mut model,
-            None,
-            screen.width(),
-            screen.height(),
-        ))?;
-        // Full diagnostic text remains in scrollback even if the user dismisses
-        // the optional browser, and the child's failure status stays authoritative.
-        screen.commit();
-        for error in &model.errors {
-            screen.diagnostic(error)?;
-            screen.write(b"\r\n")?;
-        }
-        let count = model.warnings.len() + model.failures.len();
+    renderer.draw_summary(status.success(), &stats)?;
+    if !renderer.proxy {
+        let count = renderer.model.warnings.len() + renderer.model.failures.len();
         if count > 0 && (!status.success() || inspect_warnings) {
             let mut browser = view::Browser::default();
             loop {
-                screen.draw(view::render(
-                    &mut model,
+                let block = view::render(
+                    &mut renderer.model,
                     Some(&mut browser),
-                    screen.width(),
-                    screen.height(),
-                ))?;
+                    renderer.width,
+                    renderer.height,
+                );
+                renderer.screen.draw(block)?;
                 if let Event::Key(key) = event::read()?
                     && key.kind != event::KeyEventKind::Release
                 {
@@ -320,13 +283,13 @@ fn run_inner(
                     }
                 }
             }
-            screen.clear()?;
+            renderer.screen.clear()?;
         }
-        for warning in &model.warnings {
-            screen.diagnostic(&warning.rendered)?;
-            screen.write(b"\r\n")?;
+        for warning in &renderer.model.warnings {
+            renderer.screen.diagnostic(&warning.rendered)?;
+            renderer.screen.write(b"\r\n")?;
         }
-        screen.commit();
+        renderer.screen.commit();
     }
     Ok(ExitCode::from(status_code(&status)))
 }
@@ -505,11 +468,11 @@ struct Decoder {
 }
 
 impl Decoder {
-    fn feed(
+    fn feed<O: Output>(
         &mut self,
         bytes: &[u8],
         model: &mut Model,
-        screen: &mut Screen,
+        screen: &mut Screen<O>,
         mode: Mode,
         proxy: &mut bool,
         stats: &impl Fn() -> AgentStats,
@@ -554,7 +517,7 @@ impl Decoder {
                         screen.write(b"\r\n")?;
                     }
                     *proxy = true;
-                    execute!(io::stderr(), cursor::Show)?;
+                    screen.show_cursor()?;
                 }
             } else if self.pending.len() >= 1024 * 1024 {
                 self.partial = true;
@@ -564,7 +527,11 @@ impl Decoder {
         Ok(())
     }
 
-    fn flush_partial(&mut self, screen: &mut Screen, native_output: bool) -> io::Result<()> {
+    fn flush_partial<O: Output>(
+        &mut self,
+        screen: &mut Screen<O>,
+        native_output: bool,
+    ) -> io::Result<()> {
         // Compiler JSON may be emitted in many writes; retain a bounded record.
         // Ordinary partial output (prompts, custom harnesses) is forwarded now.
         if !self.pending.is_empty()
@@ -577,7 +544,7 @@ impl Decoder {
         Ok(())
     }
 
-    fn finish(&mut self, screen: &mut Screen) -> io::Result<()> {
+    fn finish<O: Output>(&mut self, screen: &mut Screen<O>) -> io::Result<()> {
         if !self.pending.is_empty() {
             screen.write(&self.pending)?;
             self.pending.clear();
@@ -722,70 +689,145 @@ impl Frame {
     }
 }
 
+/// Animation and redraw cadence for the inline progress panel.
+const FRAME_INTERVAL: Duration = Duration::from_millis(80);
+
+/// Maximum wait between channel polls so input forwarding, terminal resize, and
+/// partial-line prompt flushing stay responsive.
+const POLL_INTERVAL: Duration = Duration::from_millis(20);
+
 /// How long a trailing CR may wait for its LF before it is taken as a line
 /// that rewrites itself. A CRLF split by a read boundary completes far sooner.
 const CR_GRACE: Duration = Duration::from_millis(250);
 
-struct Screen {
-    frame: Frame,
-    diagnostics: crate::logging::Capture,
+/// Output sink for [`Screen`], allowing unit tests to capture the exact bytes
+/// (including DEC 2026 synchronized update sequences) written to the terminal.
+trait Output {
+    fn emit(&mut self, bytes: &[u8], synchronized: bool) -> io::Result<()>;
+    fn show_cursor(&mut self) -> io::Result<()>;
 }
-impl Screen {
-    fn new() -> io::Result<Self> {
-        let diagnostics = crate::logging::Capture::start();
+
+fn emit_to(output: &mut impl Write, bytes: &[u8], synchronized: bool) -> io::Result<()> {
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    if synchronized {
+        output.sync_update(|out| out.write_all(bytes))??;
+    } else {
+        output.write_all(bytes)?;
+        output.flush()?;
+    }
+    Ok(())
+}
+
+struct StderrOutput;
+
+impl Output for StderrOutput {
+    fn emit(&mut self, bytes: &[u8], synchronized: bool) -> io::Result<()> {
+        emit_to(&mut io::stderr().lock(), bytes, synchronized)
+    }
+
+    fn show_cursor(&mut self) -> io::Result<()> {
+        execute!(io::stderr(), cursor::Show)
+    }
+}
+
+#[cfg(test)]
+impl Output for Vec<u8> {
+    fn emit(&mut self, bytes: &[u8], synchronized: bool) -> io::Result<()> {
+        emit_to(self, bytes, synchronized)
+    }
+
+    fn show_cursor(&mut self) -> io::Result<()> {
+        execute!(self, cursor::Show)
+    }
+}
+
+/// Restores terminal raw mode, synchronized-update state, and cursor visibility
+/// when the pretty display exits or unwinds.
+struct TerminalGuard;
+
+impl TerminalGuard {
+    fn enter() -> io::Result<Self> {
         terminal::enable_raw_mode()?;
-        let mut screen = Self {
-            frame: Frame::default(),
-            diagnostics,
-        };
         if let Err(error) = execute!(io::stderr(), cursor::Hide) {
             let _ = terminal::disable_raw_mode();
             return Err(error);
         }
+        Ok(Self)
+    }
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        let _ = execute!(io::stderr(), terminal::EndSynchronizedUpdate, cursor::Show);
+        let _ = terminal::disable_raw_mode();
+    }
+}
+
+struct Screen<O: Output> {
+    frame: Frame,
+    diagnostics: Option<crate::logging::Capture>,
+    output: O,
+}
+
+impl Screen<StderrOutput> {
+    fn stderr() -> io::Result<Self> {
+        let mut screen = Self {
+            frame: Frame::default(),
+            diagnostics: Some(crate::logging::Capture::start()),
+            output: StderrOutput,
+        };
         screen.clear()?;
         Ok(screen)
     }
-    fn width(&self) -> u16 {
-        terminal::size()
-            .map_or(80, |s| s.0.max(2))
-            .saturating_sub(1)
+}
+
+impl<O: Output> Screen<O> {
+    #[cfg(test)]
+    fn with_output(output: O) -> Self {
+        Self {
+            frame: Frame::default(),
+            diagnostics: None,
+            output,
+        }
     }
-    fn height(&self) -> u16 {
-        block_height(terminal::size().map_or(24, |s| s.1))
-    }
+
     /// Write one composed frame. A block that is erased or repainted goes out in
     /// a single DEC 2026 synchronized update, which unsupported terminals ignore.
     fn emit(&mut self, bytes: &[u8], synchronized: bool) -> io::Result<()> {
-        if bytes.is_empty() {
-            return Ok(());
-        }
-        let mut stderr = io::stderr().lock();
-        if synchronized {
-            stderr.sync_update(|output| output.write_all(bytes))??;
-        } else {
-            stderr.write_all(bytes)?;
-            stderr.flush()?;
-        }
-        Ok(())
+        self.output.emit(bytes, synchronized)
     }
+
+    fn show_cursor(&mut self) -> io::Result<()> {
+        self.output.show_cursor()
+    }
+
     /// Whether a frame should wait for what follows a trailing CR.
-    fn awaiting_lf(&mut self) -> bool {
-        self.frame.awaiting_lf(Instant::now())
+    fn awaiting_lf(&mut self, now: Instant) -> bool {
+        self.frame.awaiting_lf(now)
     }
+
     fn clear(&mut self) -> io::Result<()> {
         let synchronized = self.frame.drawn > 0;
         let bytes = self.frame.clear();
         self.emit(&bytes, synchronized)
     }
+
     fn draw(&mut self, block: norimel::Block) -> io::Result<()> {
         // Compose before touching the terminal, then present the erase, held
         // output, diagnostics and replacement together.
-        let diagnostics = self.diagnostics.drain();
+        let diagnostics = self
+            .diagnostics
+            .as_ref()
+            .map(crate::logging::Capture::drain)
+            .unwrap_or_default();
         let rows = block.size().1;
         let text = block.to_string().replace('\n', "\r\n") + "\r\n";
         let bytes = self.frame.draw(&diagnostics, text, rows);
         self.emit(&bytes, true)
     }
+
     /// Show output held since the last frame, with the block repainted below it.
     fn repaint(&mut self) -> io::Result<()> {
         let bytes = self.frame.present(true);
@@ -797,21 +839,121 @@ impl Screen {
         let bytes = self.frame.write(bytes);
         self.emit(&bytes, synchronized)
     }
+
     // Cargo JSON contains LF-delimited diagnostic text, unlike bytes read
     // from the child PTY. Raw mode requires explicit carriage returns here.
     fn diagnostic(&mut self, text: &str) -> io::Result<()> {
         self.write(text.replace("\r\n", "\n").replace('\n', "\r\n").as_bytes())
     }
+
     fn commit(&mut self) {
         self.frame.commit();
     }
 }
-impl Drop for Screen {
+
+impl<O: Output> Drop for Screen<O> {
     fn drop(&mut self) {
         let _ = self.clear();
-        let _ = execute!(io::stderr(), terminal::EndSynchronizedUpdate, cursor::Show);
-        let _ = terminal::disable_raw_mode();
     }
+}
+
+struct Renderer<O: Output> {
+    model: Model,
+    mode: Mode,
+    decoder: Decoder,
+    screen: Screen<O>,
+    proxy: bool,
+    last_frame: Option<Instant>,
+    width: u16,
+    height: u16,
+}
+
+impl<O: Output> Renderer<O> {
+    fn new(arguments: &[String], screen: Screen<O>, cols: u16, rows: u16) -> Self {
+        let mode = match cargo_verb(arguments) {
+            Some("run" | "r") => Mode::Run,
+            Some("test" | "t") => Mode::Test,
+            _ => Mode::Build,
+        };
+        Self {
+            model: Model::new(arguments),
+            mode,
+            decoder: Decoder::default(),
+            screen,
+            proxy: false,
+            last_frame: None,
+            width: block_width(cols),
+            height: block_height(rows),
+        }
+    }
+
+    fn resize(&mut self, cols: u16, rows: u16) -> io::Result<()> {
+        self.width = block_width(cols);
+        self.height = block_height(rows);
+        self.screen.clear()
+    }
+
+    fn feed_bytes(&mut self, bytes: &[u8], stats: &impl Fn() -> AgentStats) -> io::Result<()> {
+        self.decoder.feed(
+            bytes,
+            &mut self.model,
+            &mut self.screen,
+            self.mode,
+            &mut self.proxy,
+            stats,
+        )
+    }
+
+    fn flush_partial(&mut self) -> io::Result<()> {
+        self.decoder
+            .flush_partial(&mut self.screen, self.model.build_finished)
+    }
+
+    fn present(&mut self, now: Instant, stats: &impl Fn() -> AgentStats) -> io::Result<()> {
+        let awaiting_lf = self.screen.awaiting_lf(now);
+        let frame_due = self
+            .last_frame
+            .is_none_or(|last| now.saturating_duration_since(last) >= FRAME_INTERVAL);
+        if !self.proxy
+            && self.decoder.pending.is_empty()
+            && !self.decoder.partial
+            && !awaiting_lf
+            && frame_due
+        {
+            self.model.update_stats(stats());
+            self.screen
+                .draw(view::render(&mut self.model, None, self.width, self.height))?;
+            self.last_frame = Some(now);
+        } else {
+            self.screen.repaint()?;
+        }
+        Ok(())
+    }
+
+    fn finish_stream(&mut self) -> io::Result<()> {
+        self.decoder.finish(&mut self.screen)
+    }
+
+    fn draw_summary(&mut self, success: bool, stats: &impl Fn() -> AgentStats) -> io::Result<()> {
+        self.model.update_stats(stats());
+        self.model.finished = Some((success, self.model.started.elapsed()));
+        if !self.proxy {
+            self.screen
+                .draw(view::render(&mut self.model, None, self.width, self.height))?;
+            // Full diagnostic text remains in scrollback even if the user dismisses
+            // the optional browser, and the child's failure status stays authoritative.
+            self.screen.commit();
+            for error in &self.model.errors {
+                self.screen.diagnostic(error)?;
+                self.screen.write(b"\r\n")?;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn block_width(cols: u16) -> u16 {
+    cols.max(2).saturating_sub(1)
 }
 
 /// Rows for the progress block in a terminal `rows` tall.
