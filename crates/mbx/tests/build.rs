@@ -6109,16 +6109,44 @@ fn binary_dep_info_compilations_store_and_restore_across_checkouts() {
     for name in ["first", "second"] {
         let checkout = tempfile::tempdir().unwrap();
         write_dependent_project(checkout.path());
-        let (_, stderr) = build_with(
+        let (stats, stderr) = build_with(
             checkout.path(),
             store.path(),
             &reports.path().join(format!("{name}.json")),
             &settings,
         );
+        let unexpected_bypasses: Vec<_> = stats["bypasses"]
+            .as_object()
+            .expect("bypasses should be an object")
+            .iter()
+            .filter(|(kind, _)| {
+                !matches!(
+                    kind.as_str(),
+                    "compiler-query"
+                        | "standard-input"
+                        | "cc-compiler-query"
+                        | "cc-standard-input"
+                )
+            })
+            .collect();
         assert!(
-            !stderr.contains("not stored") && !stderr.contains("bypassed"),
-            "{name}: {stderr}"
+            unexpected_bypasses.is_empty(),
+            "{name}: unexpected bypasses {unexpected_bypasses:?} in {stats}"
         );
+        assert_eq!(
+            count(&stats, "incremental_compilations"),
+            0,
+            "{name}: incremental compilations were not stored: {stats}"
+        );
+        if name == "first" {
+            assert!(
+                count(&stats, "stored_bytes") > 0,
+                "{name}: expected compiled artifacts to be stored: {stats}"
+            );
+        }
+        // `result was not stored:` is emitted as a shim warning rather than a
+        // separate report counter, and cannot appear in `mbx[progress]:`.
+        assert!(!stderr.contains("not stored"), "{name}: {stderr}");
     }
     let outcomes = second_build_outcomes(store.path());
     for crate_name in ["base", "above"] {
