@@ -919,7 +919,7 @@ pub fn observe(name: &str, heavy: bool) {
         .unwrap();
         prepare_nextest(&root, &cache);
         let memory_path = cache.join("scheduler/memory.json");
-        let suite_ledger_before = fs::read(&memory_path).ok();
+        let suite_ledger_before = suite_history(&memory_path);
         let first = nextest(&root, &cache)
             .env("MBX_SCHEDULER_CPUS", "1")
             .env("MBX_TEST_WEIGHT_LOG", &history_log)
@@ -1002,11 +1002,26 @@ pub fn observe(name: &str, heavy: bool) {
             heavy_weight > light_weight,
             "heavy={heavy_weight}, light={light_weight}"
         );
+        // The suite's memory history (peaks, CPU, samples) is cargo test's; a
+        // nextest run leaves it alone. Its run times are the pool's ordering
+        // history (docs/scheduling.md), kept per nextest test under `run_ms`.
         assert_eq!(
             suite_ledger_before,
-            fs::read(&memory_path).ok(),
-            "nextest runs must not update the suite ledger"
+            suite_history(&memory_path),
+            "nextest runs must not update the suite's memory history"
         );
+        let ledger: Value = serde_json::from_slice(&fs::read(&memory_path).unwrap()).unwrap();
+        let test_runs = ledger["run_ms"]["test"]
+            .as_object()
+            .unwrap_or_else(|| panic!("nextest recorded no test run times: {ledger}"));
+        for name in ["unit_heavy", "unit_light", "integration_light"] {
+            assert!(
+                test_runs
+                    .keys()
+                    .any(|class| class.contains(name) && class.ends_with("[nextest]")),
+                "no run time for nextest test {name}: {ledger}"
+            );
+        }
 
         let before_suite = history_files(&cache);
         let suite = mbx(&root)
@@ -1041,6 +1056,13 @@ pub fn observe(name: &str, heavy: bool) {
         weight: u64,
     }
 
+    /// The memory ledger without its run times: the suite history a nextest
+    /// run must leave as it found it.
+    fn suite_history(path: &Path) -> Option<Value> {
+        let mut ledger: Value = serde_json::from_slice(&fs::read(path).ok()?).ok()?;
+        ledger.as_object_mut()?.remove("run_ms");
+        Some(ledger)
+    }
     fn read_observations(path: &Path) -> Vec<Observation> {
         fs::read_to_string(path)
             .unwrap()
