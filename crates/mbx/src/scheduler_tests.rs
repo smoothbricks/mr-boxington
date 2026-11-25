@@ -3199,7 +3199,9 @@ fn scheduler_stats_activity_only_excludes_history_and_full_report_fields() {
     );
     assert_eq!(json.as_object().unwrap().len(), 2);
     assert_eq!(json["version"], 2);
-    assert_eq!(json["scheduler"].as_object().unwrap().len(), 1);
+    let scheduler_keys: Vec<_> = json["scheduler"].as_object().unwrap().keys().collect();
+    assert_eq!(scheduler_keys, ["activity", "first_admitted"]);
+    assert_eq!(json["scheduler"]["first_admitted"], serde_json::json!([]));
     let activity = json["scheduler"]["activity"].as_array().unwrap();
     assert_eq!(activity.len(), 2);
     let waiter = activity.iter().find(|row| row["kind"] == "waiter").unwrap();

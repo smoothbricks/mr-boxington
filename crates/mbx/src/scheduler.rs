@@ -4304,6 +4304,7 @@ pub(crate) struct SchedulerReport {
     entries: Vec<SchedulerEntry>,
     memory_calibration: Vec<MemoryCalibration>,
     activity: Vec<SchedulerActivity>,
+    first_admitted: Vec<FirstAdmittedEntry>,
     accuracy: accuracy::Summary,
     decisions: decisions::Summary,
 }
@@ -4318,6 +4319,7 @@ pub(crate) struct SchedulerActivityReport {
 #[derive(Debug, Serialize)]
 struct SchedulerActivitySnapshot {
     activity: Vec<SchedulerActivity>,
+    first_admitted: Vec<FirstAdmittedEntry>,
 }
 
 #[derive(Debug, Serialize)]
@@ -4390,10 +4392,12 @@ pub(crate) fn scheduler_report(config: &Config) -> SchedulerReport {
 
 /// Collect only current activity, without store statistics or scheduler histories.
 pub(crate) fn scheduler_activity_report(config: &Config) -> SchedulerActivityReport {
+    let dir = config.cache_dir.join(SCHEDULER_DIR);
     SchedulerActivityReport {
         version: 2,
         scheduler: SchedulerActivitySnapshot {
-            activity: activity_snapshot(&config.cache_dir.join(SCHEDULER_DIR)),
+            activity: activity_snapshot(&dir),
+            first_admitted: first_admitted_snapshot(&dir),
         },
     }
 }
@@ -4504,6 +4508,7 @@ fn scheduler_snapshot(
         entries,
         memory_calibration,
         activity,
+        first_admitted: first_admitted_snapshot(dir),
         accuracy: accuracy::Summary::read(dir),
         decisions: decisions::Summary::read(dir),
     }
@@ -5368,6 +5373,18 @@ fn activity_snapshot(dir: &Path) -> Vec<SchedulerActivity> {
         }
     }
     activity
+}
+
+fn first_admitted_snapshot(dir: &Path) -> Vec<FirstAdmittedEntry> {
+    FirstAdmitted::read(&dir.join(FIRST_ADMITTED_FILE))
+        .entries
+        .into_iter()
+        .map(|(key, first_admitted_ms)| FirstAdmittedEntry {
+            job_id: key.job_id,
+            job_started_ms: key.job_started_ms,
+            first_admitted_ms,
+        })
+        .collect()
 }
 
 #[cfg(test)]

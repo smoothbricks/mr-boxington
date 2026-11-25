@@ -93,10 +93,11 @@ For repeated scheduler admission observation, request the activity-only projecti
 mbx stats --scheduler --json --activity
 ```
 
-This version 2 report contains only `version` and `scheduler.activity`; it omits
-store, savings, cache, sharing, memory estimates, calibration and historical
-summaries. It reads the same current lease and waiter records as the full
-report, without collecting store statistics or loading scheduler histories.
+This version 2 report contains only `version`, `scheduler.activity`, and
+`scheduler.first_admitted`; it omits store, savings, cache, sharing, memory
+estimates, calibration and historical summaries. It reads the same current
+lease, waiter, and first-admission records as the full report, without
+collecting store statistics or loading scheduler histories.
 The [activity fields and their evidence limits](/scheduling#machine-wide-compile-scheduling)
 are identical in both projections. `--activity` without both `--scheduler` and
 `--json` is a usage error. The existing full report remains version 1.

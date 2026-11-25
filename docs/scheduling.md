@@ -158,8 +158,9 @@ For repeated admission observation, use the lightweight activity-only projection
 mbx stats --scheduler --json --activity
 ```
 
-Its version 2 JSON contains only `version` and `scheduler.activity`, using the
-same activity scan as the full report. It does not collect store, target or
+Its version 2 JSON contains only `version`, `scheduler.activity`, and
+`scheduler.first_admitted`, using the same read-only activity and
+first-admission reads as the full report. It does not collect store, target or
 sharing statistics, or read the memory ledger, accuracy observations or decision
 histories. `--activity` requires both `--scheduler` and `--json`; other
 combinations are usage errors. Full statistics keep their version 1 format.
@@ -173,6 +174,10 @@ waiters without a recorded PID expose `pid: null`; their ticket is still shown.
 Leases expose all four fields as null rather than reconstructing identity from
 filenames. A waiter rewritten as a lease before being moved out of the queue
 is no longer pending and is omitted from the waiter snapshot.
+`scheduler.first_admitted` lists each active keyed interactive job's `job_id`,
+`job_started_ms`, and `first_admitted_ms` on the pool clock (read-only, without
+pruning), so an external supervisor can tell whether a job has been admitted and
+when its interactive band expires.
 
 Publishers take their record's exclusive lifetime lock while the newly created
 file is still empty, then write the record without releasing that lock. Empty
