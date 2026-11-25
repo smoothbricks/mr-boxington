@@ -82,9 +82,12 @@ fn nested_test_builds_match_plain_cargo_target_directories() {
             project(
                 &root_path,
                 r#"
-fn main() {}
+fn main() {
+    let _ = scope_fixture::helper();
+}
 #[test]
 fn nested_build() {
+    assert_eq!(scope_fixture::helper(), 1);
     use std::{path::PathBuf, process::Command};
     let guest = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("guest");
     let target = std::env::var_os("CARGO_TARGET_DIR");
@@ -104,6 +107,14 @@ fn nested_build() {
 }
 "#,
             );
+            // A library crate gives pass 2 a non-linking rlib compile to hit
+            // even on hosts whose system linker is a Nix cc-wrapper that mbx
+            // deliberately refuses to cache.
+            std::fs::write(
+                root_path.join("src/lib.rs"),
+                "pub fn helper() -> usize { 1 }\n",
+            )
+            .unwrap();
             let guest = root_path.join("guest");
             std::fs::create_dir_all(guest.join("src")).unwrap();
             std::fs::write(
