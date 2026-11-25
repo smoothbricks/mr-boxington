@@ -122,12 +122,17 @@ test_binary() {
   assert_success
 }
 
-@test "a Nix wrapper's link variables keep a linked test binary out of the cache" {
-  # A Nix cc-wrapper's link reads NIX_LDFLAGS and its other link families,
-  # under role and target spellings, and none of them shows on the command
-  # line mbx sees or in its linker identity. Two links that differ only there
-  # must not share a key, so neither is cached. Two copies of the project,
-  # since the two links run in two checkouts.
+@test "Nix link variables reach no link without a Nix wrapper, which restores across checkouts" {
+  # A Nix cc-wrapper's link reads NIX_LDFLAGS and its other link families, so
+  # mbx refuses to identify a link a wrapper drives. A link with no wrapper in
+  # it, a system driver running its own ld, reads none of them: two checkouts
+  # whose NIX_LDFLAGS differ share its key, and the second restores it. That a
+  # wrapper in the link does refuse it (the driver, a bintools-wrapper ld, or
+  # -fuse-ld) is linker_tests.rs a_link_a_nix_wrapper_shapes_is_not_identified,
+  # over a fake store root: an end-to-end case would need a real Nix wrapper,
+  # which a host without Nix has none of. It runs on the host's own driver,
+  # ld and xcrun, which ci's check:shell (scripts/check-shell.sh) asserts no
+  # Nix wrapper replaces before any test runs.
   local second_project="$BATS_TEST_TMPDIR/second-project"
   local warm_report="$BATS_TEST_TMPDIR/nix-warm.json"
   cp -R "$PROJECT" "$second_project"
@@ -144,11 +149,11 @@ test_binary() {
     MBX_STATS_REPORT="$warm_report" \
     "$MBX_BIN" test --offline --no-run --manifest-path "$second_project/Cargo.toml"
   assert_success
-  # The library restores; the link is not looked up.
-  run grep -E '"hits"[[:space:]]*:[[:space:]]*1[^0-9]' "$warm_report"
+  # The library and the link both restore; nothing bypasses as unportable.
+  run grep -E '"hits"[[:space:]]*:[[:space:]]*2[^0-9]' "$warm_report"
   assert_success
   run grep -E '"unportable-native-link"' "$warm_report"
-  assert_success
+  assert_failure
 }
 
 @test "a -fuse-ld selection restores a linked test binary" {
