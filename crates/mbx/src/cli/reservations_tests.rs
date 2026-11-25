@@ -425,3 +425,22 @@ async fn a_named_reservation_names_its_class_and_prediction_in_its_decisions() {
         admitted[1]
     );
 }
+
+#[tokio::test]
+async fn a_reservation_accepts_job_id_alongside_job_started_ms() {
+    let dir = tempfile::tempdir().unwrap();
+    let pools = pools(dir.path(), 2);
+    let mut client = Client::connect(&pools);
+    client
+        .send(json!({
+            "type": "reserve",
+            "id": 1,
+            "cpus": 1,
+            "priority": "interactive",
+            "job_id": "job-274",
+            "job_started_ms": 1_700_000_000_000_u64,
+        }))
+        .await;
+    assert_eq!(client.reply().await, granted(1, 1));
+    client.close().await;
+}

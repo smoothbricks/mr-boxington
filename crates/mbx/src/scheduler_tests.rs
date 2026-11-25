@@ -5913,6 +5913,113 @@ fn an_interactive_request_decays_by_its_jobs_age_when_it_asks() {
 }
 
 #[test]
+fn an_interactive_job_decays_from_its_first_admitted_ask() {
+    // Config::load reads process environment, so run in a child process of its own.
+    const CHILD_ENV: &str = "MBX_TEST_DECAY_FIRST_ADMIT";
+    const NAME: &str = "scheduler::tests::an_interactive_job_decays_from_its_first_admitted_ask";
+    if std::env::var_os(CHILD_ENV).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([NAME, "--exact"])
+            .env(CHILD_ENV, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout).contains("test result: ok. 1 passed"),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        return;
+    }
+
+    static CLOCK: AtomicU64 = AtomicU64::new(0);
+    const START: u64 = 1_000_000;
+    const FIRST_ASK: u64 = START + 274_000;
+
+    let home = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let pool_for = |job_id: Option<&str>, job_started_ms: u64| -> Pool {
+        // SAFETY: this test runs alone in its own child process.
+        unsafe {
+            std::env::set_var("HOME", home.path());
+            std::env::set_var("XDG_CONFIG_HOME", home.path());
+            std::env::set_var("MBX_CACHE_DIR", cache.path());
+            std::env::set_var("MBX_SCHEDULER", "true");
+            std::env::set_var("MBX_SCHEDULER_CPUS", "4");
+            std::env::set_var("MBX_SCHEDULER_RESERVE_CPUS", "0");
+            std::env::set_var("MBX_SCHEDULER_MEMORY", "none");
+            std::env::set_var("MBX_SCHEDULER_PRESSURE", "false");
+            std::env::set_var("MBX_SCHEDULER_PRIORITY", "interactive");
+            std::env::set_var("MBX_SCHEDULER_JOB_STARTED_MS", job_started_ms.to_string());
+            match job_id {
+                Some(id) => std::env::set_var("MBX_SCHEDULER_JOB_ID", id),
+                None => std::env::set_var("MBX_SCHEDULER_JOB_ID", ""),
+            }
+        }
+        let config = crate::config::Config::load().unwrap();
+        let mut pool = Pool::from_config(&config).unwrap();
+        pool.domain_capacity = 4;
+        pool.legacy_domain_capacity = 4;
+        pool.available_memory = || None;
+        pool.pressure = false;
+        pool.events = true;
+        pool.clock = || CLOCK.load(Ordering::SeqCst);
+        pool
+    };
+
+    let keyed = pool_for(Some("job-274"), START);
+
+    // 1. A job whose first ask comes 274 s after its start enters at interactive.
+    CLOCK.store(FIRST_ASK, Ordering::SeqCst);
+    let first = keyed.admit(&Demand::new("first-at-274s", false)).unwrap();
+
+    // 2. While its lease is live, asks 130 s and 250 s after first grant decay to normal and low.
+    CLOCK.store(FIRST_ASK + 130_000, Ordering::SeqCst);
+    let at_130 = keyed.admit(&Demand::new("at-130s", false)).unwrap();
+    CLOCK.store(FIRST_ASK + 250_000, Ordering::SeqCst);
+    let at_250 = keyed.admit(&Demand::new("at-250s", false)).unwrap();
+
+    // 3. After its last lease ends and the record expires, the next ask restarts the clock.
+    drop(first);
+    drop(at_130);
+    drop(at_250);
+    CLOCK.store(FIRST_ASK + 300_000, Ordering::SeqCst);
+    let restarted = keyed.admit(&Demand::new("after-expiry", false)).unwrap();
+    CLOCK.store(FIRST_ASK + 300_000 + 130_000, Ordering::SeqCst);
+    let after_restart_130 = keyed
+        .admit(&Demand::new("after-restart-130s", false))
+        .unwrap();
+    drop(restarted);
+    drop(after_restart_130);
+
+    // 4. Without job_id, decay by start is unchanged.
+    let unkeyed = pool_for(None, START);
+    CLOCK.store(FIRST_ASK, Ordering::SeqCst);
+    drop(unkeyed.admit(&Demand::new("without-job-id", false)).unwrap());
+
+    let decayed = |to: &str, elapsed_ms: u64| {
+        Some(serde_json::json!({"from": "interactive", "to": to, "elapsed_ms": elapsed_ms}))
+    };
+    let admitted = admitted_bands(&cache.path().join(SCHEDULER_DIR));
+    let admitted: Vec<(&str, &str, Option<serde_json::Value>)> = admitted
+        .iter()
+        .map(|(name, priority, decayed)| (name.as_str(), priority.as_str(), decayed.clone()))
+        .collect();
+    assert_eq!(
+        admitted,
+        [
+            ("first-at-274s", "interactive", None),
+            ("at-130s", "normal", decayed("normal", 130_000)),
+            ("at-250s", "low", decayed("low", 250_000)),
+            ("after-expiry", "interactive", None),
+            ("after-restart-130s", "normal", decayed("normal", 130_000)),
+            ("without-job-id", "low", decayed("low", 274_000)),
+        ]
+    );
+}
+
+#[test]
 fn a_release_is_granted_to_the_queue_head_by_whoever_polls_next() {
     let directory = tempfile::tempdir().unwrap();
     let leases = directory.path().join(LEASES_DIR);
