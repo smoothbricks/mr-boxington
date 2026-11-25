@@ -1042,3 +1042,137 @@ fn state_change_is_drawn_within_one_frame_interval_without_early_redraws() {
         "expected updated test state at next frame: {tail}"
     );
 }
+
+#[test]
+fn child_line_split_across_a_frame_boundary_reaches_the_terminal_whole_above_the_next_panel() {
+    let args = vec!["test".into(), "--test".into(), "custom".into()];
+    let mut renderer = Renderer::new(&args, Screen::with_output(Vec::new()), 110, 36);
+    let stats = AgentStats::default;
+    let start = Instant::now();
+
+    renderer
+        .feed_bytes(
+            b"{\"reason\":\"build-finished\",\"success\":true}\r\n",
+            &stats,
+        )
+        .unwrap();
+    renderer.present(start, &stats).unwrap();
+    let after_initial = renderer.screen.output.len();
+    assert!(after_initial > 0);
+
+    // Chunk 1 delivers a finished line plus the first half of the next line.
+    // Then the frame interval elapses and the panel draws while the first half
+    // is still in decoder.pending.
+    let frame1 = start + FRAME_INTERVAL;
+    renderer
+        .feed_bytes(b"before-line\nfirst-half ", &stats)
+        .unwrap();
+    renderer.present(frame1, &stats).unwrap();
+    let after_frame1 = renderer.screen.output.len();
+    assert!(
+        after_frame1 > after_initial,
+        "panel should draw at frame1 even while an incomplete line sits in decoder.pending"
+    );
+
+    let frame1_bytes = &renderer.screen.output[after_initial..after_frame1];
+    let frame1_text = strip_ansi(&String::from_utf8_lossy(frame1_bytes));
+    let before_pos = frame1_text
+        .find("before-line\n")
+        .expect("before-line should be emitted at frame1");
+    let frame1_panel_pos = frame1_text
+        .find("Build / cache")
+        .expect("frame1 should draw the panel");
+    assert!(
+        before_pos < frame1_panel_pos,
+        "before-line must appear above the frame1 panel"
+    );
+    assert!(
+        !frame1_bytes
+            .windows(b"first-half".len())
+            .any(|w| w == b"first-half"),
+        "incomplete first half must not leak into frame1 before its LF arrives"
+    );
+
+    // Chunk 2 arrives mid-frame with the rest of the split line and a following
+    // line. Neither should trigger an early redraw before frame2.
+    let mid = frame1 + FRAME_INTERVAL / 2;
+    renderer
+        .feed_bytes(b"second-half\nafter-line\n", &stats)
+        .unwrap();
+    renderer.present(mid, &stats).unwrap();
+    assert_eq!(
+        renderer.screen.output.len(),
+        after_frame1,
+        "completed line should wait for the next frame rather than repainting early"
+    );
+
+    // At frame2, the previous panel is erased, the reassembled line and the
+    // following line go out whole and in order, and the new panel sits below.
+    let frame2 = frame1 + FRAME_INTERVAL;
+    renderer.present(frame2, &stats).unwrap();
+    let frame2_bytes = &renderer.screen.output[after_frame1..];
+    assert!(
+        frame2_bytes.starts_with(b"\x1b[?2026h\r\x1b["),
+        "frame2 must begin with a synchronized erase of the frame1 panel"
+    );
+
+    let whole_line = b"first-half second-half\n";
+    let erase_end = frame2_bytes
+        .windows(b"\x1b[J".len())
+        .position(|w| w == b"\x1b[J")
+        .map(|pos| pos + b"\x1b[J".len())
+        .expect("frame2 must erase the frame1 panel before writing held output");
+    let whole_pos = frame2_bytes
+        .windows(whole_line.len())
+        .position(|w| w == whole_line)
+        .expect("split child line must reach the terminal whole, unbroken by panel bytes");
+    let after_pos = frame2_bytes
+        .windows(b"after-line\n".len())
+        .position(|w| w == b"after-line\n")
+        .expect("following line must appear in frame2");
+    let frame2_panel_pos = frame2_bytes
+        .windows(b"Build / cache".len())
+        .position(|w| w == b"Build / cache")
+        .expect("frame2 must redraw the panel below the output");
+
+    assert_eq!(
+        whole_pos, erase_end,
+        "reassembled line must immediately follow the panel erase with no stray bytes"
+    );
+    assert_eq!(
+        after_pos,
+        whole_pos + whole_line.len(),
+        "following line must immediately follow the reassembled line in order"
+    );
+    assert!(
+        after_pos + b"after-line\n".len() < frame2_panel_pos,
+        "frame2 panel must be drawn below the child output"
+    );
+
+    // Across the entire transcript, the first half appears exactly once, only as
+    // part of the whole line, and DEC 2026 synchronized updates stay balanced.
+    let output = &renderer.screen.output;
+    assert_eq!(
+        output
+            .windows(b"first-half".len())
+            .filter(|w| *w == b"first-half")
+            .count(),
+        1
+    );
+    assert_eq!(
+        output
+            .windows(whole_line.len())
+            .filter(|w| *w == whole_line)
+            .count(),
+        1
+    );
+    let sync_begins = output
+        .windows(b"\x1b[?2026h".len())
+        .filter(|w| *w == b"\x1b[?2026h")
+        .count();
+    let sync_ends = output
+        .windows(b"\x1b[?2026l".len())
+        .filter(|w| *w == b"\x1b[?2026l")
+        .count();
+    assert_eq!(sync_begins, sync_ends);
+}
