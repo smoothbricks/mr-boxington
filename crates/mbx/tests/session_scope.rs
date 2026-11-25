@@ -130,6 +130,7 @@ fn nested_build() {
                     value.into()
                 }
             });
+            let mut cold_report: Option<serde_json::Value> = None;
             for pass in 0..3 {
                 if pass == 2 {
                     let target = root_path.join(if setting == Some("flag") {
@@ -166,12 +167,92 @@ fn nested_build() {
                     String::from_utf8_lossy(&output.stdout),
                     String::from_utf8_lossy(&output.stderr)
                 );
+                if managed && pass == 0 {
+                    cold_report = Some(
+                        serde_json::from_slice(
+                            &std::fs::read(root_path.join("stats.json")).unwrap(),
+                        )
+                        .unwrap(),
+                    );
+                }
                 if managed && pass == 2 {
+                    let cold = cold_report.as_ref().expect("pass 0 recorded stats");
                     let report: serde_json::Value = serde_json::from_slice(
                         &std::fs::read(root_path.join("stats.json")).unwrap(),
                     )
                     .unwrap();
-                    assert!(report["hits"].as_u64().unwrap() > 0, "{report}");
+                    fn bypass_counts(
+                        stats: &serde_json::Value,
+                    ) -> std::collections::BTreeMap<&str, u64> {
+                        stats["bypasses"]
+                            .as_object()
+                            .expect("bypasses object")
+                            .iter()
+                            .map(|(reason, count)| (reason.as_str(), count.as_u64().unwrap()))
+                            .collect()
+                    }
+                    let cold_bypasses = bypass_counts(cold);
+                    let pass2_bypasses = bypass_counts(&report);
+                    for (reason, &count) in &pass2_bypasses {
+                        assert!(
+                            matches!(
+                                *reason,
+                                "unportable-native-link"
+                                    | "compiler-query"
+                                    | "standard-input"
+                                    | "rustdoc"
+                            ),
+                            "unexpected bypass {reason}={count} on pass 2: {report}"
+                        );
+                    }
+                    let hits = report["hits"].as_u64().unwrap();
+                    let misses = report["misses"].as_u64().unwrap();
+                    let unconsulted = report["unconsulted"].as_u64().unwrap();
+                    let unportable_links = pass2_bypasses
+                        .get("unportable-native-link")
+                        .copied()
+                        .unwrap_or(0);
+                    let cold_cacheable =
+                        cold["misses"].as_u64().unwrap() + cold["unconsulted"].as_u64().unwrap();
+                    let cold_unportable_links = cold_bypasses
+                        .get("unportable-native-link")
+                        .copied()
+                        .unwrap_or(0);
+
+                    // `cargo test` compiles 3 units for scope_fixture (lib rlib +
+                    // lib test binary + bin test binary), and nested_build builds
+                    // 1 unit for nested_guest (lib rlib) on pass 0. On pass 2,
+                    // wiping `target/debug` always rebuilds scope_fixture's 3
+                    // units, and also rebuilds nested_guest's rlib when both
+                    // share the same absolute CARGO_TARGET_DIR.
+                    const LINK_UNITS: u64 = 2;
+                    const COLD_UNITS: u64 = 4;
+                    let expected_rlibs: u64 = if setting == Some("absolute") { 2 } else { 1 };
+                    let expected_total = expected_rlibs + LINK_UNITS;
+
+                    assert_eq!(
+                        cold_cacheable + cold_unportable_links,
+                        COLD_UNITS,
+                        "pass 0 must account for all 4 cold units: {cold}"
+                    );
+                    assert_eq!(misses, 0, "pass 2 must have zero misses: {report}");
+                    assert_eq!(
+                        unconsulted, 0,
+                        "pass 2 must consult every cacheable unit: {report}"
+                    );
+                    assert!(
+                        unportable_links == 0 || unportable_links == LINK_UNITS,
+                        "only the {LINK_UNITS} test-binary links may bypass as unportable-native-link: {report}"
+                    );
+                    assert_eq!(
+                        unportable_links, cold_unportable_links,
+                        "pass 2 link bypasses must match pass 0: pass0={cold}, pass2={report}"
+                    );
+                    assert_eq!(
+                        hits,
+                        expected_total - unportable_links,
+                        "pass 2 must hit every cacheable unit (and links on a cacheable linker): setting={setting:?}, pass0={cold}, pass2={report}"
+                    );
                 }
             }
         }
