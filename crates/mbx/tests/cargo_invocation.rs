@@ -77,7 +77,6 @@ touch "$EXTERNAL_MARKER"
 
     fn command(&self, shim: bool) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_mbx"));
-        support::isolate_host(&mut command);
         let real = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
         let real = which::which(real).unwrap();
         let path = std::env::join_paths(
@@ -92,6 +91,10 @@ touch "$EXTERNAL_MARKER"
                 command.env_remove(key);
             }
         }
+        // After the scrub: isolate_host keeps the host's short MBX_SESSION_ROOT
+        // (cowshed's runtime alias beside a long TMPDIR), which the scrub of
+        // every inherited MBX_ variable would otherwise remove.
+        support::isolate_host(&mut command);
         command
             .current_dir(&self.outside)
             .env("PATH", path)
