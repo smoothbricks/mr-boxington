@@ -116,9 +116,21 @@ pub fn answer() -> u32 { dep::value() }
 ''')
         (root/'tests/custom.rs').write_text('fn main() { println!("CUSTOM_HARNESS_OUTPUT"); }\n')
         env = environment(root)
-        toolchain = subprocess.check_output(['rustup', 'show', 'active-toolchain'], text=True).split()[0]
-        for args in [['build'], ['check'], ['clippy'], ['+' + toolchain, 'build']]:
-            code, output = terminal_run(root, env, args)
+        toolchain = subprocess.check_output(
+            ["rustup", "show", "active-toolchain"], text=True
+        ).split()[0]
+        # `+toolchain` is a rustup proxy directive. Where cargo on PATH is not rustup's proxy (a cowshed shed puts its
+        # mbx shim first), put rustup's proxy directory first, so the case runs there too, never skipped. The
+        # toolchain's own cargo (`rustup which`) rejects the directive as cargo does; only the proxy resolves it.
+        rustup_proxies = str(Path(shutil.which("rustup")).parent)
+        toolchain_env = {
+            **env,
+            "PATH": os.pathsep.join([rustup_proxies, env.get("PATH", "")]),
+        }
+        for args in [["build"], ["check"], ["clippy"], ["+" + toolchain, "build"]]:
+            code, output = terminal_run(
+                root, toolchain_env if args[0].startswith("+") else env, args
+            )
             assert code == 0, output[-3000:]
             assert b'Build / cache' in output, output[-3000:]
             assert b'\x1b[?2026h' in output
