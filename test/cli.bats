@@ -431,6 +431,9 @@ global_config_file() {
 
 @test "the first build explains what mbx set up, once" {
   export CI=false GITHUB_ACTIONS=false
+  # An unconfigured machine collects automatically; a caller's environment (cowshed's canonical mbx environment sets
+  # MBX_GC_AUTO=0) must not decide what the first build explains.
+  unset MBX_GC_AUTO
   local project="$BATS_TEST_TMPDIR/first-run"
   mkdir -p "$project/src"
   cat >"$project/Cargo.toml" <<'EOF'
