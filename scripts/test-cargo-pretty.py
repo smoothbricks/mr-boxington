@@ -146,6 +146,24 @@ pub fn answer() -> u32 { dep::value() }
         assert code == 0 and b'ARG:argument with spaces' in output and b'INPUT:hello' in output, output[-3000:]
         code, output = terminal_run(root, env, ['test'])
         assert code == 0 and b'CUSTOM_HARNESS_OUTPUT' in output and b'Doc-tests' in output, output[-3000:]
+        # A run that outlives its bound while its harness floods the terminal fails with its transcript. The bound
+        # kills mbx, the session leader, whose exit waits for the terminal to drain, so the harness must not block on
+        # that exit while it holds the terminal undrained.
+        (root / "tests/flood.rs").write_text(
+            '#[test] fn flood() { loop { println!("FLOOD"); } }\n'
+        )
+        code, output = terminal_run(root, env, ["test", "--test", "flood", "--no-run"])
+        assert code == 0, output[-3000:]
+        try:
+            terminal_run(
+                root, env, ["test", "--test", "flood", "--", "--nocapture"], limit=5
+            )
+        except AssertionError as timed_out:
+            assert "Timed out" in str(timed_out), timed_out
+        else:
+            raise AssertionError("an endless harness finished inside its bound")
+        finally:
+            (root / "tests/flood.rs").unlink()
         # A custom harness may leave a descendant holding Cargo's PTY open.
         # It must not hold mbx in raw mode, and the harness tail must survive.
         (root/'tests/custom.rs').write_text('''fn main() {
