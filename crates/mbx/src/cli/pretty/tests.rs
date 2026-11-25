@@ -700,17 +700,16 @@ fn drawn_frame() -> Frame {
 }
 
 #[test]
-fn finished_lines_wait_and_reach_the_terminal_with_the_block_repainted() {
+fn finished_lines_wait_and_reach_the_terminal_with_the_next_frame() {
     let mut frame = drawn_frame();
-    // Nothing is erased until the replacement is ready to go out with it.
+    // Small bursts wait until the next frame so the panel does not blink.
     assert!(frame.write(b"warning: one\r\n").is_empty());
     assert!(frame.write(b"warning: two\r\n").is_empty());
     assert_eq!(
-        String::from_utf8(frame.present(true)).unwrap(),
+        String::from_utf8(frame.draw(b"", "block\r\nrows\r\n".into(), 2)).unwrap(),
         format!("{ERASE}warning: one\r\nwarning: two\r\nblock\r\nrows\r\n")
     );
     assert_eq!(frame.drawn, 2);
-    assert!(frame.present(true).is_empty(), "nothing left to repaint");
 }
 
 #[test]
@@ -722,7 +721,6 @@ fn partial_lines_are_shown_at_once_and_keep_the_block_away() {
         format!("{ERASE}held\r\nPassword: ")
     );
     assert_eq!(frame.drawn, 0);
-    assert!(frame.present(true).is_empty(), "no block to repaint");
 }
 
 #[test]
@@ -741,7 +739,6 @@ fn output_after_the_block_is_committed_passes_through_untouched() {
     let mut frame = drawn_frame();
     frame.commit();
     assert_eq!(frame.write(b"output\r\n"), b"output\r\n");
-    assert!(frame.present(true).is_empty());
 }
 
 #[test]
@@ -751,21 +748,23 @@ fn a_crlf_split_across_chunks_is_written_together() {
     assert!(frame.write(b"Finished\r").is_empty());
     assert!(frame.write(b"\n").is_empty());
     assert_eq!(
-        String::from_utf8(frame.present(true)).unwrap(),
+        String::from_utf8(frame.draw(b"", "block\r\nrows\r\n".into(), 2)).unwrap(),
         format!("{ERASE}Finished\r\nblock\r\nrows\r\n")
     );
 }
 
 #[test]
 fn a_crlf_split_across_reads_keeps_the_block_until_the_lf_arrives() {
+    let start = Instant::now();
     let mut frame = drawn_frame();
     assert!(frame.write(b"Finished\r").is_empty());
-    // The read ended between CR and LF: nothing is erased yet.
-    assert!(frame.present(true).is_empty());
+    // The read ended between CR and LF: the next frame waits for the LF.
+    assert!(frame.awaiting_lf(start));
     assert_eq!(frame.drawn, 2);
     assert!(frame.write(b"\n").is_empty());
+    assert!(!frame.awaiting_lf(start));
     assert_eq!(
-        String::from_utf8(frame.present(true)).unwrap(),
+        String::from_utf8(frame.draw(b"", "block\r\nrows\r\n".into(), 2)).unwrap(),
         format!("{ERASE}Finished\r\nblock\r\nrows\r\n")
     );
 }
@@ -774,7 +773,6 @@ fn a_crlf_split_across_reads_keeps_the_block_until_the_lf_arrives() {
 fn a_bare_carriage_return_is_shown_above_the_next_frame_not_overwritten_by_it() {
     let mut frame = drawn_frame();
     assert!(frame.write(b"progress\r").is_empty());
-    assert!(frame.present(true).is_empty());
     assert_eq!(
         String::from_utf8(frame.draw(b"", "next\r\n".into(), 1)).unwrap(),
         format!("{ERASE}progress\r\nnext\r\n")
@@ -801,11 +799,15 @@ fn the_lf_after_a_bare_cr_that_a_frame_already_ended_is_not_written_twice() {
     );
     // The child's LF arrives after the grace period, once the line has ended.
     assert!(frame.write(b"\n").is_empty());
-    assert!(frame.present(true).is_empty(), "no blank row");
+    assert_eq!(
+        String::from_utf8(frame.draw(b"", "next\r\n".into(), 1)).unwrap(),
+        "\r\x1b[1A\x1b[Jnext\r\n",
+        "no blank row"
+    );
     // Only one LF is owed; the next is ordinary output.
     assert!(frame.write(b"\n").is_empty());
     assert_eq!(
-        String::from_utf8(frame.present(true)).unwrap(),
+        String::from_utf8(frame.draw(b"", "next\r\n".into(), 1)).unwrap(),
         "\r\x1b[1A\x1b[J\nnext\r\n"
     );
 }
@@ -941,5 +943,102 @@ fn passed_through_harness_output_is_not_amplified_by_per_chunk_panel_redraws() {
         "renderer wrote {total_written} bytes for {harness_bytes} harness bytes \
          (ratio {ratio:.2}x, max {max_ratio:.3}x; one panel = {panel_bytes} bytes, \
          {expected_frames} frames over {elapsed:?}, {sync_begins} sync updates)"
+    );
+    // Every harness line must survive in order.
+    let harness_lines = output.windows(LINE.len()).filter(|w| *w == LINE).count();
+    assert_eq!(
+        harness_lines, LINES,
+        "all harness output lines must survive"
+    );
+    println!(
+        "pretty amplification: {total_written} / {harness_bytes} bytes = {ratio:.4}x \
+         (max {max_ratio:.4}x; panel = {panel_bytes} bytes, {expected_frames} frames, \
+         {sync_begins} sync updates)"
+    );
+}
+
+#[test]
+fn mid_frame_burst_erases_panel_once_and_passes_through_until_next_frame() {
+    let mut frame = drawn_frame();
+    let burst = b"0123456789abcdef\n".repeat(HELD_LIMIT / 17 + 1);
+    let first = frame.write(&burst);
+    assert_eq!(first, [ERASE.as_bytes(), burst.as_slice()].concat());
+    assert_eq!(
+        frame.drawn, 0,
+        "panel stays off while mid-frame output streams"
+    );
+
+    // Subsequent mid-frame chunks pass straight through without erase or panel.
+    assert_eq!(frame.write(b"more output\n"), b"more output\n");
+    assert_eq!(frame.drawn, 0);
+
+    // At the next frame, the panel returns below all output that passed through.
+    assert_eq!(
+        String::from_utf8(frame.draw(b"", "next\r\n".into(), 1)).unwrap(),
+        "next\r\n"
+    );
+    assert_eq!(frame.drawn, 1);
+}
+
+#[test]
+fn passed_through_trailing_cr_waits_for_lf_or_terminates_before_next_frame() {
+    let start = Instant::now();
+    let mut frame = Frame::default();
+    assert_eq!(frame.write(b"50%\r"), b"50%\r");
+    assert!(frame.awaiting_lf(start));
+    assert_eq!(frame.write(b"\n"), b"\n");
+    assert!(!frame.awaiting_lf(start));
+
+    // A bare CR that never gets an LF terminates with LF before the next panel.
+    assert_eq!(frame.write(b"60%\r"), b"60%\r");
+    assert!(frame.awaiting_lf(start));
+    assert!(!frame.awaiting_lf(start + CR_GRACE));
+    assert_eq!(
+        String::from_utf8(frame.draw(b"", "panel\r\n".into(), 1)).unwrap(),
+        "\npanel\r\n"
+    );
+    // A late LF after the frame already ended the bare CR is swallowed.
+    assert!(frame.write(b"\n").is_empty());
+}
+
+#[test]
+fn state_change_is_drawn_within_one_frame_interval_without_early_redraws() {
+    let args = vec!["test".into()];
+    let mut renderer = Renderer::new(&args, Screen::with_output(Vec::new()), 110, 36);
+    let stats = AgentStats::default;
+    let start = Instant::now();
+
+    renderer
+        .feed_bytes(
+            b"{\"reason\":\"build-finished\",\"success\":true}\r\n",
+            &stats,
+        )
+        .unwrap();
+    renderer.present(start, &stats).unwrap();
+    let after_initial = renderer.screen.output.len();
+    assert!(after_initial > 0);
+
+    // Mid-frame state change + incomplete trailing line: no redraw before FRAME_INTERVAL.
+    let mid = start + FRAME_INTERVAL / 2;
+    renderer
+        .feed_bytes(b"running 2 tests\r\ntest alpha ... ok\r\npartial", &stats)
+        .unwrap();
+    renderer.present(mid, &stats).unwrap();
+    assert_eq!(
+        renderer.screen.output.len(),
+        after_initial,
+        "panel must not redraw before the frame interval elapses"
+    );
+
+    // At one frame interval, the updated state is drawn even while an unrelated
+    // incomplete line sits in decoder.pending.
+    let next = start + FRAME_INTERVAL;
+    renderer.present(next, &stats).unwrap();
+    let tail = strip_ansi(&String::from_utf8_lossy(
+        &renderer.screen.output[after_initial..],
+    ));
+    assert!(
+        tail.contains("Tests (1/2)") && tail.contains("alpha"),
+        "expected updated test state at next frame: {tail}"
     );
 }

@@ -195,7 +195,7 @@ fn run_inner(
                 exit_seen = true;
                 last_output = Instant::now();
             }
-            match receive.recv_timeout(POLL_INTERVAL) {
+            match receive.recv_timeout(renderer.poll_timeout(Instant::now())) {
                 Ok(Ok(bytes)) => {
                     last_output = Instant::now();
                     let bytes = if cfg!(windows) {
@@ -480,6 +480,7 @@ impl Decoder {
         if *proxy {
             return screen.write(bytes);
         }
+        let mut passthrough = Vec::new();
         for chunk in bytes.split_inclusive(|byte| matches!(byte, b'\n' | b'\r')) {
             if *proxy {
                 screen.write(chunk)?;
@@ -502,12 +503,16 @@ impl Decoder {
                         || (matches!(mode, Mode::Test) && model.test_line(line)));
                 self.swallow_lf = handled && chunk.ends_with(b"\r");
                 if !handled {
-                    screen.write(&self.pending)?;
+                    passthrough.extend_from_slice(&self.pending);
                 }
                 self.pending.clear();
                 self.partial = false;
                 if matches!(mode, Mode::Run) && model.build_finished && model.build_ok == Some(true)
                 {
+                    if !passthrough.is_empty() {
+                        screen.write(&passthrough)?;
+                        passthrough.clear();
+                    }
                     model.update_stats(stats());
                     model.finished = Some((true, model.started.elapsed()));
                     screen.draw(view::summary(model))?;
@@ -520,9 +525,16 @@ impl Decoder {
                     screen.show_cursor()?;
                 }
             } else if self.pending.len() >= 1024 * 1024 {
+                if !passthrough.is_empty() {
+                    screen.write(&passthrough)?;
+                    passthrough.clear();
+                }
                 self.partial = true;
                 self.flush_partial(screen, true)?;
             }
+        }
+        if !passthrough.is_empty() {
+            screen.write(&passthrough)?;
         }
         Ok(())
     }
@@ -561,16 +573,16 @@ impl Decoder {
 struct Frame {
     /// Rows of the block above the cursor, zero once it is erased or committed.
     drawn: u16,
-    /// The last block drawn, repainted below output that arrives between frames.
-    block: String,
-    rows: u16,
     /// Complete lines of child output not yet shown, in arrival order.
     held: Vec<u8>,
+    /// Passed-through output (written while `drawn == 0`) ended in a bare CR,
+    /// so the next draw must wait for its LF or terminate the line first.
+    unterminated_cr: bool,
     /// A held CR was ended with an LF of our own, so the child's LF, if it
     /// arrives, must not end the line a second time.
     lf_owed: bool,
-    /// When a frame first found the held CR waiting. Cleared when held output is
-    /// shown, so the next CR gets a full grace period of its own.
+    /// When a frame first found a trailing CR waiting. Cleared when the line
+    /// ends or is shown, so the next CR gets a full grace period of its own.
     cr_since: Option<Instant>,
 }
 
@@ -582,12 +594,12 @@ impl Frame {
         }
     }
 
-    /// Output that ends a line waits while a block is showing, so that
-    /// [`Frame::present`] or [`Frame::draw`] can erase, print and repaint it
-    /// in one update. A CR waits too: the PTY's CRLF arrives as two chunks, and
-    /// nothing may be written between them. Anything else (a prompt, a partial
-    /// line) is shown at once, without the block, which stays away until the
-    /// line is complete.
+    /// Small complete-line bursts wait while a block is showing so the next
+    /// [`Frame::draw`] can erase, print, and redraw in one synchronized update
+    /// without blinking. Once held output reaches [`HELD_LIMIT`] (or on a
+    /// partial line such as a prompt), the block is erased once and subsequent
+    /// mid-frame output passes straight through without redrawing the panel
+    /// until the next frame interval.
     fn write(&mut self, bytes: &[u8]) -> Vec<u8> {
         let bytes = match bytes {
             [b'\n', rest @ ..] if self.lf_owed => rest,
@@ -598,29 +610,29 @@ impl Frame {
             return Vec::new();
         }
         self.held.extend_from_slice(bytes);
-        if self.drawn > 0 && matches!(bytes.last(), Some(b'\n' | b'\r')) {
+        let line_ended = matches!(bytes.last(), Some(b'\n' | b'\r'));
+        if self.drawn > 0 && line_ended {
+            if self.held.len() >= HELD_LIMIT && !self.held.ends_with(b"\r") {
+                return self.present_passthrough();
+            }
+            if self.held.len() >= HELD_HARD_LIMIT {
+                return self.clear();
+            }
             Vec::new()
         } else {
-            self.present(false)
+            self.present_passthrough()
         }
     }
 
-    /// Show held output, and put the last block back below it if `repaint`.
-    /// Output that ends in a CR keeps waiting for a repaint: its LF may be in
-    /// the next read, and a bare CR would have the block overwrite the line it
-    /// returned to. The next [`Frame::draw`] shows it, on a line of its own.
-    fn present(&mut self, repaint: bool) -> Vec<u8> {
-        let repaint = repaint && self.drawn > 0;
-        if repaint && (self.held.is_empty() || self.trailing_cr()) {
-            return Vec::new();
-        }
+    /// Erase any drawn block and emit held output without redrawing the panel.
+    fn present_passthrough(&mut self) -> Vec<u8> {
         let mut out = Vec::with_capacity(self.held.len());
         self.erase(&mut out);
+        let trailing_cr = self.held.ends_with(b"\r");
         out.append(&mut self.held);
-        self.cr_since = None;
-        if repaint {
-            out.extend_from_slice(self.block.as_bytes());
-            self.drawn = self.rows;
+        self.unterminated_cr = trailing_cr;
+        if !trailing_cr {
+            self.cr_since = None;
         }
         out
     }
@@ -630,6 +642,7 @@ impl Frame {
     fn flush_held(&mut self, out: &mut Vec<u8>) {
         let unterminated = self.trailing_cr();
         out.append(&mut self.held);
+        self.unterminated_cr = false;
         self.cr_since = None;
         if unterminated {
             out.push(b'\n');
@@ -658,9 +671,9 @@ impl Frame {
         now.saturating_duration_since(since) < CR_GRACE
     }
 
-    /// Held output ends in a CR: either half a CRLF or a line that rewrites itself.
+    /// Output ends in a CR: either half a CRLF or a line that rewrites itself.
     fn trailing_cr(&self) -> bool {
-        self.held.ends_with(b"\r")
+        self.held.ends_with(b"\r") || (self.held.is_empty() && self.unterminated_cr)
     }
 
     /// Replace the block: erase the old one, then held output, diagnostics
@@ -676,8 +689,6 @@ impl Frame {
                 .as_bytes(),
         );
         out.extend_from_slice(block.as_bytes());
-        self.block = block;
-        self.rows = rows;
         self.drawn = rows;
         out
     }
@@ -686,6 +697,8 @@ impl Frame {
     fn commit(&mut self) {
         debug_assert!(self.held.is_empty(), "held output would be lost");
         self.drawn = 0;
+        self.unterminated_cr = false;
+        self.cr_since = None;
     }
 }
 
@@ -699,6 +712,15 @@ const POLL_INTERVAL: Duration = Duration::from_millis(20);
 /// How long a trailing CR may wait for its LF before it is taken as a line
 /// that rewrites itself. A CRLF split by a read boundary completes far sooner.
 const CR_GRACE: Duration = Duration::from_millis(250);
+
+/// Maximum complete-line output held while the panel stays on screen between
+/// frames. Above this threshold the panel is erased once and mid-frame output
+/// passes straight through until the next [`FRAME_INTERVAL`].
+const HELD_LIMIT: usize = 8 * 1024;
+
+/// Upper bound on held bytes even when output ends in a bare CR, so a flood of
+/// carriage-return progress lines cannot grow memory without bound.
+const HELD_HARD_LIMIT: usize = 1024 * 1024;
 
 /// Output sink for [`Screen`], allowing unit tests to capture the exact bytes
 /// (including DEC 2026 synchronized update sequences) written to the terminal.
@@ -828,12 +850,6 @@ impl<O: Output> Screen<O> {
         self.emit(&bytes, true)
     }
 
-    /// Show output held since the last frame, with the block repainted below it.
-    fn repaint(&mut self) -> io::Result<()> {
-        let bytes = self.frame.present(true);
-        self.emit(&bytes, true)
-    }
-
     fn write(&mut self, bytes: &[u8]) -> io::Result<()> {
         let synchronized = self.frame.drawn > 0;
         let bytes = self.frame.write(bytes);
@@ -909,23 +925,34 @@ impl<O: Output> Renderer<O> {
             .flush_partial(&mut self.screen, self.model.build_finished)
     }
 
+    fn can_draw(&mut self, now: Instant) -> bool {
+        !self.proxy && !self.decoder.partial && !self.screen.awaiting_lf(now)
+    }
+
+    fn frame_due(&self, now: Instant) -> bool {
+        self.last_frame
+            .is_none_or(|last| now.saturating_duration_since(last) >= FRAME_INTERVAL)
+    }
+
+    /// Bounds the channel wait to the next frame deadline without spinning.
+    fn poll_timeout(&mut self, now: Instant) -> Duration {
+        if !self.can_draw(now) {
+            return POLL_INTERVAL;
+        }
+        let Some(last) = self.last_frame else {
+            return POLL_INTERVAL;
+        };
+        FRAME_INTERVAL
+            .saturating_sub(now.saturating_duration_since(last))
+            .min(POLL_INTERVAL)
+    }
+
     fn present(&mut self, now: Instant, stats: &impl Fn() -> AgentStats) -> io::Result<()> {
-        let awaiting_lf = self.screen.awaiting_lf(now);
-        let frame_due = self
-            .last_frame
-            .is_none_or(|last| now.saturating_duration_since(last) >= FRAME_INTERVAL);
-        if !self.proxy
-            && self.decoder.pending.is_empty()
-            && !self.decoder.partial
-            && !awaiting_lf
-            && frame_due
-        {
+        if self.can_draw(now) && self.frame_due(now) {
             self.model.update_stats(stats());
             self.screen
                 .draw(view::render(&mut self.model, None, self.width, self.height))?;
             self.last_frame = Some(now);
-        } else {
-            self.screen.repaint()?;
         }
         Ok(())
     }
