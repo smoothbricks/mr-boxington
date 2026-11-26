@@ -159,7 +159,12 @@ key to look up yet. mbx still stores it after compiling, so it can warm the
 next build.
 
 Predictions are grouped by the `Cargo.lock` digest into a task manifest, which
-remains the unit for prefetching and remote publication. When a dependency
+remains the unit for prefetching and remote publication. A manifest's
+serialized-size budget applies to what is published remotely so remote readers
+can always load it back; when a single run's predictions exceed that budget,
+mbx retires unprotected history first and still keeps the run's predictions in
+the local manifest (skipping remote publication) so its cached results stay
+predicted and reachable from the checkout for `mbx gc`. When a dependency
 update creates a new group, mbx looks for earlier predictions in up to eight
 lockfile states from Git history, then in recent local store records.
 

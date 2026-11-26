@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- *(cache-core)* keep task action manifests over the remote publication budget locally so their predictions and GC roots are preserved
+
 ## [0.21.0](https://github.com/jdx/mr-boxington/compare/mbx-cache-core-v0.20.8...mbx-cache-core-v0.21.0) - 2026-11-09
 
 ### Added

@@ -6756,6 +6756,78 @@ fn task_predictions_protected_beyond_the_byte_budget_are_refused() {
 }
 
 #[test]
+fn local_task_predictions_retire_unprotected_history_and_keep_protected_beyond_byte_budget() {
+    let make_prediction = |tag: &[u8], payload: String| {
+        let invocation = CacheDigest::blake3(tag);
+        ActionPrediction {
+            action: CacheDigest::blake3(invocation.hash.as_bytes()),
+            invocation,
+            adapter: "rustc".into(),
+            payload,
+        }
+    };
+    let history = vec![
+        make_prediction(b"unprotected-old-1", "{}".into()),
+        make_prediction(b"unprotected-old-2", "{}".into()),
+    ];
+    let protected_predictions: Vec<_> = (0..5000usize)
+        .map(|index| make_prediction(&index.to_le_bytes(), format!("\"{}\"", "x".repeat(4096))))
+        .collect();
+    let updates: BTreeMap<_, _> = protected_predictions
+        .iter()
+        .map(|prediction| (prediction.invocation.clone(), prediction.clone()))
+        .collect();
+    let protected: BTreeSet<_> = updates.keys().cloned().collect();
+
+    let kept = update_task_predictions(history.clone(), &updates, &protected).unwrap();
+
+    assert_eq!(kept.len(), protected_predictions.len());
+    for retired in &history {
+        assert!(
+            !kept
+                .iter()
+                .any(|prediction| prediction.invocation == retired.invocation),
+            "unprotected history should be retired before keeping over-budget protected entries"
+        );
+    }
+    let kept_invocations: BTreeSet<_> = kept
+        .iter()
+        .map(|prediction| prediction.invocation.clone())
+        .collect();
+    assert_eq!(kept_invocations, protected);
+
+    // The public ordered merge (used by remote merges and store imports) still
+    // refuses protected sets that exceed the byte budget.
+    let error =
+        merge_task_action_predictions(history, protected_predictions, &protected).unwrap_err();
+    assert!(
+        matches!(
+            error.downcast_ref::<TaskManifestOverflow>(),
+            Some(TaskManifestOverflow::Bytes {
+                protected: 5000,
+                bytes,
+                limit: MAX_TASK_MANIFEST_BYTES,
+            }) if *bytes > MAX_TASK_MANIFEST_BYTES
+        ),
+        "{error}"
+    );
+
+    // The entry-count cap still refuses on the local path as well.
+    let too_many: BTreeSet<_> = (0..=MAX_TASK_ACTION_PREDICTIONS)
+        .map(|index| CacheDigest::blake3(&index.to_le_bytes()))
+        .collect();
+    let error = update_task_predictions(Vec::new(), &BTreeMap::new(), &too_many).unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<TaskManifestOverflow>(),
+        Some(&TaskManifestOverflow::Count {
+            protected: MAX_TASK_ACTION_PREDICTIONS + 1,
+            limit: MAX_TASK_ACTION_PREDICTIONS,
+        }),
+        "{error}"
+    );
+}
+
+#[test]
 fn task_predictions_protected_beyond_the_entry_limit_are_refused() {
     let protected: BTreeSet<_> = (0..=MAX_TASK_ACTION_PREDICTIONS)
         .map(|index| CacheDigest::blake3(&index.to_le_bytes()))
@@ -8246,4 +8318,169 @@ async fn local_prediction_index_hit_does_not_trigger_adapter_prefetch() {
 
     manifest.assert_async().await;
     assert_eq!(agent.stats().prefetch_runs, 0);
+}
+
+#[tokio::test]
+async fn a_run_over_the_manifest_byte_budget_is_recorded_and_indexed_locally() {
+    let directory = tempfile::tempdir().unwrap();
+    let cache = directory.path().join("cache");
+    let task = "a".repeat(64);
+    let other_task = "b".repeat(64);
+    let predictions: Vec<_> = (0..5000usize)
+        .map(|index| {
+            let invocation = CacheDigest::blake3(&index.to_le_bytes());
+            ActionPrediction {
+                action: CacheDigest::blake3(invocation.hash.as_bytes()),
+                invocation,
+                adapter: "rustc".into(),
+                payload: format!("\"{}\"", "x".repeat(4096)),
+            }
+        })
+        .collect();
+    let serialized_bytes = canonical_json(&TaskActionManifest {
+        version: TASK_ACTION_MANIFEST_VERSION,
+        task: task.clone(),
+        predictions: predictions.clone(),
+    })
+    .unwrap()
+    .len();
+    assert!(
+        serialized_bytes > usize::try_from(crate::MAX_REMOTE_JSON_BYTES).unwrap(),
+        "fixture must exceed the remote JSON reader limit"
+    );
+
+    let agent = CacheAgent::new(&cache, "test-version");
+    let run = agent.begin_task(&task).await.unwrap();
+    for prediction in &predictions {
+        assert!(matches!(
+            agent
+                .respond(AgentRequest::RecordActionPrediction {
+                    task: run.clone(),
+                    prediction: prediction.clone(),
+                })
+                .await,
+            AgentResponse::ActionPredictionRecorded
+        ));
+    }
+
+    let completed = agent.commit_task_actions(&run).await.unwrap();
+    assert_eq!(completed.len(), predictions.len());
+
+    let expected_actions: BTreeSet<_> = predictions
+        .iter()
+        .map(|prediction| prediction.action.clone())
+        .collect();
+    let persisted_actions = task_manifest_actions(&cache, &task).unwrap();
+    assert_eq!(persisted_actions.len(), predictions.len());
+    assert_eq!(
+        persisted_actions.into_iter().collect::<BTreeSet<_>>(),
+        expected_actions
+    );
+
+    // A fresh agent answers a lookup for one of the recorded predictions under
+    // a different task identity via the local per-invocation prediction index.
+    let probe = &predictions[0];
+    let fresh = CacheAgent::new(&cache, "test-version");
+    let other_run = fresh.begin_task(&other_task).await.unwrap();
+    let found = fresh
+        .respond(AgentRequest::FindActionPrediction {
+            task: other_run,
+            invocation: probe.invocation.clone(),
+        })
+        .await;
+    assert!(
+        matches!(
+            &found,
+            AgentResponse::ActionPrediction {
+                prediction: Some(prediction)
+            } if prediction == probe
+        ),
+        "expected fresh agent to find prediction in local index, got {found:?}"
+    );
+
+    // A write-only remote agent does not publish an over-budget manifest when
+    // no remote manifest exists yet, and does not count it as a remote failure.
+    let mut server = mockito::Server::new_async().await;
+    let (_, selector) = CacheAgent::task_manifest_selector(&task).unwrap();
+    let missing_remote = server
+        .mock("GET", action_manifest_path(&selector).as_str())
+        .with_status(404)
+        .expect(1)
+        .create_async()
+        .await;
+    let skipped_put = server
+        .mock("PUT", action_manifest_path(&selector).as_str())
+        .expect(0)
+        .create_async()
+        .await;
+    let remote_writer = remote_agent(&server, cache.clone(), RemoteCacheMode::WriteOnly);
+    let remote_run = remote_writer.begin_task_on_prediction(&task).await.unwrap();
+    for prediction in &predictions {
+        assert!(matches!(
+            remote_writer
+                .respond(AgentRequest::RecordActionPrediction {
+                    task: remote_run.clone(),
+                    prediction: prediction.clone(),
+                })
+                .await,
+            AgentResponse::ActionPredictionRecorded
+        ));
+    }
+    let remote_completed = remote_writer
+        .commit_task_actions(&remote_run)
+        .await
+        .unwrap();
+    assert_eq!(remote_completed.len(), predictions.len());
+    missing_remote.assert_async().await;
+    skipped_put.assert_async().await;
+    assert_eq!(remote_writer.stats().remote_failures, 0);
+
+    // A remote base merge that would overflow the byte budget also stays local
+    // without publishing or counting a remote failure.
+    let mut base_server = mockito::Server::new_async().await;
+    let remote_base_manifest = TaskActionManifest {
+        version: TASK_ACTION_MANIFEST_VERSION,
+        task: task.clone(),
+        predictions: seeded_predictions(&["remote base"]),
+    };
+    let remote_base_bytes = canonical_json(&remote_base_manifest).unwrap();
+    let remote_base_etag = blake3::hash(&remote_base_bytes).to_hex().to_string();
+    let existing_remote = base_server
+        .mock("GET", action_manifest_path(&selector).as_str())
+        .with_status(200)
+        .with_header("etag", &format!("\"{remote_base_etag}\""))
+        .with_body(remote_base_bytes)
+        .expect(1)
+        .create_async()
+        .await;
+    let skipped_merge_put = base_server
+        .mock("PUT", action_manifest_path(&selector).as_str())
+        .expect(0)
+        .create_async()
+        .await;
+    let merge_writer = remote_agent(&base_server, cache.clone(), RemoteCacheMode::WriteOnly);
+    let merge_run = merge_writer.begin_task_on_prediction(&task).await.unwrap();
+    for prediction in &predictions {
+        assert!(matches!(
+            merge_writer
+                .respond(AgentRequest::RecordActionPrediction {
+                    task: merge_run.clone(),
+                    prediction: prediction.clone(),
+                })
+                .await,
+            AgentResponse::ActionPredictionRecorded
+        ));
+    }
+    let merge_completed = merge_writer.commit_task_actions(&merge_run).await.unwrap();
+    assert_eq!(merge_completed.len(), predictions.len());
+    existing_remote.assert_async().await;
+    skipped_merge_put.assert_async().await;
+    assert_eq!(merge_writer.stats().remote_failures, 0);
+    assert_eq!(
+        task_manifest_actions(&cache, &task)
+            .unwrap()
+            .into_iter()
+            .collect::<BTreeSet<_>>(),
+        expected_actions
+    );
 }

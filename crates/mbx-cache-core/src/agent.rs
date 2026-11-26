@@ -1638,13 +1638,15 @@ impl CacheAgent {
             .values()
             .cloned()
             .collect::<Vec<_>>();
+        // Index every completed prediction before the manifest update can fail
+        // so no local manifest error ever skips the per-invocation fallback.
+        self.index_predictions(&completed);
         if write_only
             && state.changed_predictions.is_empty()
             && !should_refresh_task_prediction_order(&state.exposed, &state.pending_predictions)
             && !state.remote_publication_needed
         {
             self.task_actions.lock().unwrap().remove(run);
-            self.index_predictions(&completed);
             return Ok(completed);
         }
         let (manifest, concurrent_updates) = {
@@ -1672,7 +1674,6 @@ impl CacheAgent {
             (manifest, concurrent_updates)
         };
         self.task_actions.lock().unwrap().remove(run);
-        self.index_predictions(&completed);
         if self.remote_mode.writes() {
             // A manifest advertises the actions it predicts, so it must not
             // reach the remote cache before the results a reader would then go
@@ -1755,13 +1756,27 @@ impl CacheAgent {
                 &withheld,
             );
             let publication_base = write_only_remote.or(state.remote_manifest);
-            if let Some(remote) = publication_base {
-                manifest = merge_task_manifests(&task, remote, manifest, &required, &fallbacks)?;
-            }
-            match self
-                .put_remote_task_manifest(&task, manifest, state.remote_etag, &required, &fallbacks)
-                .await
-            {
+            let merged = match publication_base {
+                Some(remote) => {
+                    merge_task_manifests(&task, remote, manifest, &required, &fallbacks)
+                }
+                None => Ok(manifest),
+            };
+            let publish_result = match merged {
+                Ok(manifest) => {
+                    self.put_remote_task_manifest(
+                        &task,
+                        manifest,
+                        state.remote_etag,
+                        &required,
+                        &fallbacks,
+                    )
+                    .await
+                }
+                Err(error) if error.downcast_ref::<TaskManifestOverflow>().is_some() => Err(error),
+                Err(error) => return Err(error),
+            };
+            match publish_result {
                 Ok(remote_manifest) => {
                     let _write_guard = self.manifest_write_lock.lock().unwrap();
                     let reconciliation = (|| {
@@ -1800,8 +1815,26 @@ impl CacheAgent {
                     }
                 }
                 Err(error) => {
-                    self.note_remote_failure();
-                    warn!("remote task action manifest upload failed for {task}: {error}");
+                    if let Some(overflow) = error.downcast_ref::<TaskManifestOverflow>() {
+                        // A manifest over the remote reader's budget stays local
+                        // rather than failing publication or counting as a remote
+                        // transport error.
+                        match overflow {
+                            TaskManifestOverflow::Bytes { bytes, limit, .. } => {
+                                warn!(
+                                    "keeping task action manifest local for {task}: {bytes} bytes exceeds the {limit}-byte remote publication budget"
+                                );
+                            }
+                            TaskManifestOverflow::Count { protected, limit } => {
+                                warn!(
+                                    "keeping task action manifest local for {task}: {protected} protected predictions exceed the {limit}-prediction remote publication budget"
+                                );
+                            }
+                        }
+                    } else {
+                        self.note_remote_failure();
+                        warn!("remote task action manifest upload failed for {task}: {error}");
+                    }
                 }
             }
         }
@@ -1901,6 +1934,13 @@ impl CacheAgent {
         let (_, selector) = Self::task_manifest_selector(task)?;
         for _ in 0..4 {
             let bytes = canonical_json(&manifest)?;
+            if bytes.len() > MAX_TASK_MANIFEST_BYTES {
+                bail!(TaskManifestOverflow::Bytes {
+                    protected: manifest.predictions.len(),
+                    bytes: bytes.len(),
+                    limit: MAX_TASK_MANIFEST_BYTES,
+                });
+            }
             let outcome = {
                 let _permit = self.remote_transfers.acquire().await?;
                 remote

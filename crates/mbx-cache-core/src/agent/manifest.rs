@@ -121,8 +121,10 @@ pub(super) fn validate_task_manifest(manifest: &TaskActionManifest, task: &str) 
 
 /// A task run whose protected predictions do not fit one task manifest.
 ///
-/// Every prediction a run records is protected from pruning, so a run that
-/// records more than a manifest holds publishes none of them.
+/// Every prediction a run records is protected from pruning. Reaching the entry
+/// cap refuses the update everywhere; exceeding the serialized byte budget
+/// refuses merges destined for remote publication or cross-store import, while
+/// local commits keep the run's predictions on disk.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TaskManifestOverflow {
     /// More predictions are protected than a manifest may list.
@@ -163,14 +165,39 @@ impl fmt::Display for TaskManifestOverflow {
 }
 
 impl std::error::Error for TaskManifestOverflow {}
+
+/// How [`update_task_predictions_with_policy`] handles protected predictions
+/// whose serialized manifest still exceeds [`MAX_TASK_MANIFEST_BYTES`] after
+/// every unprotected entry has been retired.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ByteBudgetOverflow {
+    /// Refuse with [`TaskManifestOverflow::Bytes`]. Used for manifests being
+    /// merged for remote publication or cross-store import.
+    Refuse,
+    /// Keep the protected entries locally so the run's predictions and GC roots
+    /// are preserved even when the manifest cannot be published remotely.
+    Keep,
+}
+
 /// Refresh preferred values at the back of the durable LRU, then retire the
 /// oldest unprotected history needed to keep the manifest bounded.
+///
+/// Unprotected history is retired first under both the entry cap and
+/// [`MAX_TASK_MANIFEST_BYTES`]. If what remains is all protected and still
+/// exceeds the byte budget, the local manifest keeps it rather than refusing,
+/// while exceeding [`MAX_TASK_ACTION_PREDICTIONS`] still returns
+/// [`TaskManifestOverflow::Count`].
 pub(super) fn update_task_predictions(
     predictions: Vec<ActionPrediction>,
     updates: &BTreeMap<CacheDigest, ActionPrediction>,
     protected: &BTreeSet<CacheDigest>,
 ) -> Result<Vec<ActionPrediction>> {
-    update_task_predictions_in_order(predictions, updates.values().cloned().collect(), protected)
+    update_task_predictions_with_policy(
+        predictions,
+        updates.values().cloned().collect(),
+        protected,
+        ByteBudgetOverflow::Keep,
+    )
 }
 
 /// Append ordered task prediction updates and keep the manifest bounded.
@@ -183,8 +210,22 @@ pub(super) fn update_task_predictions(
 /// [`MAX_TASK_MANIFEST_BYTES`], returns [`TaskManifestOverflow`].
 pub fn update_task_predictions_in_order(
     predictions: Vec<ActionPrediction>,
+    updates: Vec<ActionPrediction>,
+    protected: &BTreeSet<CacheDigest>,
+) -> Result<Vec<ActionPrediction>> {
+    update_task_predictions_with_policy(
+        predictions,
+        updates,
+        protected,
+        ByteBudgetOverflow::Refuse,
+    )
+}
+
+fn update_task_predictions_with_policy(
+    predictions: Vec<ActionPrediction>,
     mut updates: Vec<ActionPrediction>,
     protected: &BTreeSet<CacheDigest>,
+    on_byte_overflow: ByteBudgetOverflow,
 ) -> Result<Vec<ActionPrediction>> {
     if protected.len() > MAX_TASK_ACTION_PREDICTIONS {
         bail!(TaskManifestOverflow::Count {
@@ -217,8 +258,10 @@ pub fn update_task_predictions_in_order(
     }
     // The count bound alone does not bound the serialized size, because a
     // payload is adapter-defined. The remote reader refuses anything over its
-    // own byte limit, so retire the oldest unprotected entries until what is
-    // published fits.
+    // own byte limit, so retire the oldest unprotected entries until the
+    // manifest fits. When only protected entries remain and still exceed the
+    // budget, `on_byte_overflow` decides whether to refuse (for publication or
+    // import) or keep them locally.
     let sizes = prediction_sizes(&kept)?;
     let mut total: usize = TASK_MANIFEST_OVERHEAD_BYTES + sizes.iter().sum::<usize>();
     if total > MAX_TASK_MANIFEST_BYTES {
@@ -231,11 +274,14 @@ pub fn update_task_predictions_in_order(
             }
         }
         if total > MAX_TASK_MANIFEST_BYTES {
-            bail!(TaskManifestOverflow::Bytes {
-                protected: retained.len(),
-                bytes: total,
-                limit: MAX_TASK_MANIFEST_BYTES,
-            });
+            match on_byte_overflow {
+                ByteBudgetOverflow::Refuse => bail!(TaskManifestOverflow::Bytes {
+                    protected: retained.len(),
+                    bytes: total,
+                    limit: MAX_TASK_MANIFEST_BYTES,
+                }),
+                ByteBudgetOverflow::Keep => {}
+            }
         }
         kept = retained;
     }
