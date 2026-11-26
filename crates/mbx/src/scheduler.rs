@@ -2329,6 +2329,9 @@ pub(crate) struct Pool {
     lease_nonce: fn() -> u64,
     /// The party its requests publish (`Waiting::party`).
     party: Option<String>,
+    /// Timed recheck interval override, injectable for tests.
+    #[cfg(test)]
+    recheck: Option<Duration>,
 }
 
 /// The pool this process schedules against, or `None` when scheduling is off.
@@ -2672,6 +2675,8 @@ impl Pool {
             clock: crate::pressure::now_ms,
             lease_nonce: next_lease_nonce,
             party: None,
+            #[cfg(test)]
+            recheck: None,
         }
     }
 
@@ -2764,6 +2769,14 @@ impl Pool {
             pool.job_started_ms = scheduler.job_started_ms;
             pool
         })
+    }
+
+    fn new_wait(&self) -> wait::Wait {
+        #[cfg(test)]
+        if let Some(recheck) = self.recheck {
+            return wait::Wait::with_recheck(&self.dir, recheck);
+        }
+        wait::Wait::new(&self.dir)
     }
 
     /// Wait for capacity to run one real compilation.
@@ -2872,7 +2885,7 @@ impl Pool {
             } else {
                 // Register before the next scan, so a release between the
                 // refused attempt and registration cannot be lost.
-                wake = Some(wait::Wait::new(&self.dir));
+                wake = Some(self.new_wait());
             }
         }
     }
@@ -2972,7 +2985,7 @@ impl Pool {
             if let Some(wake) = &mut wake {
                 state.periodic = wake.pause();
             } else {
-                wake = Some(wait::Wait::new(&self.dir));
+                wake = Some(self.new_wait());
             }
         }
     }

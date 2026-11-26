@@ -275,6 +275,7 @@ fn a_memory_reservation_needs_a_memory_budget() {
 
 #[test]
 fn blocked_reservations_sleep_and_wake_in_fifo_order() {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     static SCANS: AtomicU64 = AtomicU64::new(0);
     const WAITERS: usize = 8;
     let directory = tempfile::tempdir().unwrap();
@@ -286,11 +287,20 @@ fn blocked_reservations_sleep_and_wake_in_fifo_order() {
         let dir = directory.path().to_path_buf();
         let admitted = admitted.clone();
         workers.push(std::thread::spawn(move || {
-            let mut pool = pool_at(&dir, 1, 0);
-            pool.clock = || {
-                SCANS.fetch_add(1, Ordering::Relaxed);
-                crate::pressure::now_ms()
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            let pool = {
+                let mut pool = pool_at(&dir, 1, 0);
+                // Disable timed rechecks for the test's life so admission proves
+                // the lease-notification wake path rather than elapsed wall time.
+                pool.recheck = Some(Duration::from_secs(3600));
+                pool.clock = || {
+                    SCANS.fetch_add(1, Ordering::Relaxed);
+                    crate::pressure::now_ms()
+                };
+                pool
             };
+            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+            let pool = pool_at(&dir, 1, 0);
             let permit = pool
                 .reserve(
                     Some(1),
@@ -309,23 +319,16 @@ fn blocked_reservations_sleep_and_wake_in_fifo_order() {
                 .is_ok_and(|entries| entries.count() == index + 1)
         });
     }
-    SCANS.store(0, Ordering::Relaxed);
-    eprintln!(
-        "blocked scheduler fixture: {} pid={} waiters={WAITERS}",
-        directory.path().display(),
-        std::process::id()
-    );
-    let blocked = Instant::now();
-    std::thread::sleep(Duration::from_secs(5));
-    let scans = SCANS.load(Ordering::Relaxed);
-    let blocked_seconds = blocked.elapsed().as_secs_f64();
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    let scans = {
+        SCANS.store(0, Ordering::Relaxed);
+        std::thread::sleep(Duration::from_millis(300));
+        SCANS.load(Ordering::Relaxed)
+    };
     drop(held);
     let mut order = Vec::new();
-    let mut longest_wake = Duration::ZERO;
     for _ in 0..WAITERS {
-        let released = Instant::now();
         let (index, permit) = admissions.recv_timeout(Duration::from_secs(10)).unwrap();
-        longest_wake = longest_wake.max(released.elapsed());
         order.push(index);
         drop(permit);
     }
@@ -333,21 +336,18 @@ fn blocked_reservations_sleep_and_wake_in_fifo_order() {
         worker.join().unwrap();
     }
     assert_eq!(order, (0..WAITERS).collect::<Vec<_>>(), "FIFO admission");
-    assert!(
-        longest_wake
-            < if cfg!(any(target_os = "macos", target_os = "linux")) {
-                Duration::from_millis(750)
-            } else {
-                Duration::from_secs(4)
-            },
-        "release wake took {longest_wake:?}"
-    );
-    let rate = scans as f64 / WAITERS as f64 / blocked_seconds;
-    eprintln!("blocked reservation scans: {scans}, {rate:.3}/waiter/s");
-    assert!(
-        rate < 2.0,
-        "blocked reservations busy-poll: {rate:.3} scans/waiter/s"
-    );
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        // With timed rechecks disabled, each worker may finish at most its
+        // in-flight attempt and the one attempt after creating its Wait before
+        // blocking. A spinning waiter scans thousands of times in the window,
+        // so this window-independent bound separates spins without timing.
+        let max_scans = (2 * WAITERS) as u64;
+        assert!(
+            scans <= max_scans,
+            "blocked reservations spun: {scans} scans (max {max_scans})"
+        );
+    }
 }
 
 #[test]

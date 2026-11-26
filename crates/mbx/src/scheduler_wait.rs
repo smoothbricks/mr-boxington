@@ -10,6 +10,8 @@ const RECHECK: Duration = Duration::from_secs(1);
 
 pub(super) struct Wait {
     watch: Option<Watch>,
+    #[cfg(test)]
+    recheck: Duration,
 }
 
 impl Wait {
@@ -19,12 +21,28 @@ impl Wait {
                 log::debug!("scheduler notifications unavailable; using timed rechecks: {error}")
             })
             .ok();
-        Self { watch }
+        Self {
+            watch,
+            #[cfg(test)]
+            recheck: RECHECK,
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn with_recheck(dir: &Path, recheck: Duration) -> Self {
+        Self {
+            recheck,
+            ..Self::new(dir)
+        }
     }
 
     /// Whether this was a periodic recheck rather than a lease change.
     pub(super) fn pause(&mut self) -> bool {
-        let timeout = jittered(RECHECK);
+        #[cfg(test)]
+        let recheck = self.recheck;
+        #[cfg(not(test))]
+        let recheck = RECHECK;
+        let timeout = jittered(recheck);
         if let Some(watch) = &mut self.watch {
             match watch.changed(timeout) {
                 Ok(changed) => return !changed,
@@ -250,7 +268,10 @@ mod tests {
 
     #[test]
     fn unavailable_notifications_use_a_bounded_sleep() {
-        let mut wait = Wait { watch: None };
+        let mut wait = Wait {
+            watch: None,
+            recheck: RECHECK,
+        };
         let started = std::time::Instant::now();
         assert!(wait.pause(), "without a watch the wake is periodic");
         assert!(started.elapsed() >= RECHECK, "fallback must not spin");
