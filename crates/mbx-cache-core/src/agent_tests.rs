@@ -8484,3 +8484,127 @@ async fn a_run_over_the_manifest_byte_budget_is_recorded_and_indexed_locally() {
         expected_actions
     );
 }
+
+#[tokio::test]
+async fn a_prediction_the_manifest_retires_stays_findable_in_the_index() {
+    let directory = tempfile::tempdir().unwrap();
+    let cache = directory.path().join("cache");
+    let task_a = "a".repeat(64);
+    let task_b = "b".repeat(64);
+
+    let p_action_bytes = b"retired action p";
+    let p = ActionPrediction {
+        invocation: CacheDigest::blake3(b"retired invocation p"),
+        action: CacheDigest::blake3(p_action_bytes),
+        adapter: "rustc".into(),
+        payload: "{}".into(),
+    };
+    let q = ActionPrediction {
+        invocation: CacheDigest::blake3(b"retired invocation q"),
+        action: CacheDigest::blake3(b"retired action q without result"),
+        adapter: "rustc".into(),
+        payload: "{}".into(),
+    };
+
+    let filler_payload = format!("\"{}\"", "x".repeat(200_000));
+    let mut initial_predictions = vec![p.clone(), q.clone()];
+    for index in 0..77usize {
+        let invocation = CacheDigest::blake3(format!("filler-{index}").as_bytes());
+        initial_predictions.push(ActionPrediction {
+            action: CacheDigest::blake3(invocation.hash.as_bytes()),
+            invocation,
+            adapter: "rustc".into(),
+            payload: filler_payload.clone(),
+        });
+    }
+
+    // Persist a near-full manifest directly so neither P nor Q has ever been
+    // indexed, and store a local action result only for P.
+    let legacy = CacheAgent::new(&cache, "test-version");
+    let initial_manifest = TaskActionManifest {
+        version: TASK_ACTION_MANIFEST_VERSION,
+        task: task_a.clone(),
+        predictions: initial_predictions,
+    };
+    assert!(
+        canonical_json(&initial_manifest).unwrap().len() <= MAX_TASK_MANIFEST_BYTES,
+        "initial manifest must fit within the byte budget"
+    );
+    legacy.persist_task_manifest(&initial_manifest).unwrap();
+    legacy.cas.store_bytes(&p.action, p_action_bytes).unwrap();
+    legacy
+        .actions
+        .store(&RemoteActionResult {
+            version: 1,
+            action: p.action.clone(),
+            metadata: None,
+            output_root: None,
+        })
+        .unwrap();
+
+    let index = LocalPredictionIndex::new(&cache);
+    assert!(!index.path_for(&p.invocation).unwrap().exists());
+    assert!(!index.path_for(&q.invocation).unwrap().exists());
+
+    // Record enough new predictions to push P and Q past the manifest byte
+    // budget and retire them during commit.
+    let writer = CacheAgent::new(&cache, "test-version");
+    let run = writer.begin_task(&task_a).await.unwrap();
+    for index in 0..3usize {
+        let invocation = CacheDigest::blake3(format!("new-{index}").as_bytes());
+        let prediction = ActionPrediction {
+            action: CacheDigest::blake3(invocation.hash.as_bytes()),
+            invocation,
+            adapter: "rustc".into(),
+            payload: filler_payload.clone(),
+        };
+        assert!(matches!(
+            writer
+                .respond(AgentRequest::RecordActionPrediction {
+                    task: run.clone(),
+                    prediction,
+                })
+                .await,
+            AgentResponse::ActionPredictionRecorded
+        ));
+    }
+    writer.commit_task(&run).await.unwrap();
+
+    let persisted = writer.load_task_manifest(&task_a).unwrap().unwrap();
+    assert!(
+        !persisted
+            .predictions
+            .iter()
+            .any(|prediction| prediction.invocation == p.invocation),
+        "manifest must retire P once new predictions push it past the byte budget"
+    );
+    assert!(
+        !persisted
+            .predictions
+            .iter()
+            .any(|prediction| prediction.invocation == q.invocation),
+        "manifest must retire Q once new predictions push it past the byte budget"
+    );
+
+    let fresh = CacheAgent::new(&cache, "test-version");
+    let other_run = fresh.begin_task(&task_b).await.unwrap();
+    let response = fresh
+        .respond(AgentRequest::FindActionPrediction {
+            task: other_run,
+            invocation: p.invocation.clone(),
+        })
+        .await;
+    assert!(
+        matches!(
+            &response,
+            AgentResponse::ActionPrediction {
+                prediction: Some(found)
+            } if *found == p
+        ),
+        "expected fresh agent to find retired prediction P in local index, got {response:?}"
+    );
+    assert!(
+        !index.path_for(&q.invocation).unwrap().exists(),
+        "retired prediction Q without a local action result must not be indexed"
+    );
+}

@@ -1649,7 +1649,7 @@ impl CacheAgent {
             self.task_actions.lock().unwrap().remove(run);
             return Ok(completed);
         }
-        let (manifest, concurrent_updates) = {
+        let (manifest, concurrent_updates, retired) = {
             let _write_guard = self.manifest_write_lock.lock().unwrap();
             let _file_guard = self.lock_task_manifest(&task)?;
             let current_manifest = self.load_task_manifest(&task)?;
@@ -1668,12 +1668,42 @@ impl CacheAgent {
                 predictions,
             };
             validate_task_manifest(&manifest, &task)?;
-            if current_manifest.as_ref() != Some(&manifest) {
+            let retired: Vec<ActionPrediction> = if current_manifest.as_ref() != Some(&manifest) {
                 self.persist_task_manifest(&manifest)?;
-            }
-            (manifest, concurrent_updates)
+                current_manifest
+                    .map(|previous| {
+                        let kept: BTreeSet<&CacheDigest> = manifest
+                            .predictions
+                            .iter()
+                            .map(|prediction| &prediction.invocation)
+                            .collect();
+                        previous
+                            .predictions
+                            .into_iter()
+                            .filter(|prediction| !kept.contains(&prediction.invocation))
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            (manifest, concurrent_updates, retired)
         };
         self.task_actions.lock().unwrap().remove(run);
+        if !retired.is_empty() {
+            // Keep retired predictions whose action results still exist in the
+            // local per-invocation index; skip dangling entries so gc does not
+            // have to clean them up later.
+            let live_retired: Vec<ActionPrediction> = retired
+                .into_iter()
+                .filter(|prediction| {
+                    self.actions
+                        .path_for(&prediction.action)
+                        .is_ok_and(|path| path.exists())
+                })
+                .collect();
+            self.index_predictions(&live_retired);
+        }
         if self.remote_mode.writes() {
             // A manifest advertises the actions it predicts, so it must not
             // reach the remote cache before the results a reader would then go

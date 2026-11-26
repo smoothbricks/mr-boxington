@@ -164,9 +164,12 @@ serialized-size budget applies to what is published remotely so remote readers
 can always load it back; when a single run's predictions exceed that budget,
 mbx retires unprotected history first and still keeps the run's predictions in
 the local manifest (skipping remote publication) so its cached results stay
-predicted and reachable from the checkout for `mbx gc`. When a dependency
-update creates a new group, mbx looks for earlier predictions in up to eight
-lockfile states from Git history, then in recent local store records.
+predicted and reachable from the checkout for `mbx gc`. Predictions that a full
+manifest retires are kept in the local prediction index while their action
+results exist locally, so rarely run units stay findable without creating
+dangling entries. When a dependency update creates a new group, mbx looks for
+earlier predictions in up to eight lockfile states from Git history, then in
+recent local store records.
 
 Locally, mbx also maintains a per-invocation prediction index as a fallback
 when the active task manifest misses an invocation. That covers predictions
